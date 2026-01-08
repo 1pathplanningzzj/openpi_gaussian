@@ -52,10 +52,17 @@ python examples/libero/main.py
 
 # To run with glx for Mujoco instead (use this if you have egl errors):
 MUJOCO_GL=glx python examples/libero/main.py
+xvfb-run -a python examples/libero/main.py
+
 ```
+<!-- uv venv ~/openpi/uv_venv --python 3.11 # 创建虚拟环境 uv 3.11 
+source ~/openpi/uv_venv/bin/activate  # 激活虚拟环境
+uv pip install -e .              #安装pi相关的一些库 在openpi的根目录下 
+CUDA_VISIBLE_DEVICES=7 uv run --active scripts/serve_policy.py --env LIBERO
+uv run --active scripts/serve_policy.py --env LIBERO  # uv 系统会有一个默认的 --active 这个是必须的 指定当前这个环境
 
-Terminal window 2:
-
+uv run --active scripts/serve_policy.py policy:checkpoint --policy.config=pi0_libero_low_mem_finetune --policy.dir=/data1/zhangzj26/pi0_model/checkpoints/pi0_libero_low_mem_finetune/my_experiment/1000
+Terminal window 2: -->
 ```bash
 # Run the server
 uv run scripts/serve_policy.py --env LIBERO
@@ -69,3 +76,23 @@ checkpoint was trained in openpi with the `pi05_libero` config.
 | Model | Libero Spatial | Libero Object | Libero Goal | Libero 10 | Average |
 |-------|---------------|---------------|-------------|-----------|---------|
 | π0.5 @ 30k (finetuned) | 98.8 | 98.2 | 98.0 | 92.4 | 96.85
+
+有关渲染的配置
+# 1. 更新源（确保能下载到对应版本）
+sudo apt update
+
+# 2. 补装所有缺失的核心依赖（和能运行服务器对齐）
+sudo apt install -y \
+  xvfb \
+  libegl-dev \
+  libegl-mesa0 \
+  libegl1 \
+  libgl1-mesa-dev \
+  libglu1-mesa \
+  libglu1-mesa-dev \
+  libglx-dev \
+  mesa-common-dev \
+  mesa-utils \
+  mesa-utils-bin
+
+

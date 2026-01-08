@@ -14,7 +14,7 @@ import openpi.shared.nnx_utils as nnx_utils
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
 
-
+#
 @dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
