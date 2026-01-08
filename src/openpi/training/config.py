@@ -931,6 +931,48 @@ _CONFIGS = [
         num_train_steps=20_000,
     ),
     #
+    # Robocasa Config
+    #
+    TrainConfig(
+        name="pi0_robocasa",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            max_token_len=128,
+            action_dim=12, # Matches dataset action dim
+        ),
+        data=SimpleDataConfig(
+            repo_id="your_username/robocasa_converted",
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image": "image",
+                                "observation/wrist_image": "wrist_image",
+                                "observation/state": "state",
+                                "actions": "actions",
+                                "prompt": "task",
+                            }
+                        )
+                    ]
+                ),
+            ),
+            data_transforms=lambda model_config: _transforms.Group(
+                inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+                outputs=[libero_policy.LiberoOutputs(action_dim=12)],
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/zijianzhang/.cache/openpi/openpi-assets/checkpoints/pi05_libero/params",
+            ignore_shape_mismatches=True,
+        ),
+        optimizer=_optimizer.AdamW(),
+        lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=1e-4),
+        batch_size=4,
+        num_train_steps=20_000,
+        fsdp_devices=4,
+    ),
+    #
     # Debugging configs.
     #
     TrainConfig(

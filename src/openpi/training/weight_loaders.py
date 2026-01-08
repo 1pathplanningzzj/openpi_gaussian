@@ -46,12 +46,29 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    ignore_shape_mismatches: bool = False
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
         # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        merged_params = _merge_params(loaded_params, params, missing_regex=".*lora.*")
+
+        if self.ignore_shape_mismatches:
+            flat_merged = flax.traverse_util.flatten_dict(merged_params, sep="/")
+            flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+
+            for k, v in flat_merged.items():
+                if k in flat_ref:
+                    if v.shape != flat_ref[k].shape:
+                        logger.warning(
+                            f"Shape mismatch for {k}: loaded {v.shape}, expected {flat_ref[k].shape}. Using initialized value."
+                        )
+                        flat_merged[k] = flat_ref[k]
+
+            merged_params = flax.traverse_util.unflatten_dict(flat_merged, sep="/")
+
+        return merged_params
 
 
 @dataclasses.dataclass(frozen=True)
