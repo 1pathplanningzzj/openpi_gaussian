@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 import numpy as np
+import imageio
 import robosuite
 import robocasa
 from robosuite.controllers import load_composite_controller_config
@@ -36,7 +37,7 @@ def main(args: Args):
         has_renderer=False, # Set to True if you want to see the simulation window
         has_offscreen_renderer=True,
         use_camera_obs=True,
-        camera_names=["agentview", "robot0_eye_in_hand"],
+        camera_names=["robot0_agentview_center", "robot0_eye_in_hand"],
         camera_heights=256,
         camera_widths=256,
         reward_shaping=False,
@@ -46,15 +47,26 @@ def main(args: Args):
     obs = env.reset()
     logging.info("Environment reset. Starting inference loop...")
     
+    frames = []
+
     for step in range(args.max_steps):
         # 1. Process observation data to match model input
         # Note: OpenPI usually expects images to be uint8 [0, 255]
         # Robosuite returns images in [0, 255] uint8 usually, but check if they are flipped.
         # Robosuite images are often flipped vertically compared to standard CV2/PIL.
         
-        agentview_img = obs["agentview_image"]
+        agentview_img = obs["robot0_agentview_center_image"]
         wrist_img = obs["robot0_eye_in_hand_image"]
         
+        if step % 2 == 0:
+            # Robosuite images are upside down, verify if flipping is needed
+            # Usually for saving to video we might want to flip them to look correct
+            # if the raw output is inverted. Based on experience, robosuite offscreen
+            # render might need `np.flipud`.
+            # Let's try saving as is first, or flip if it looks upside down.
+            # agentview_img is (H, W, 3)
+            frames.append(np.flipud(agentview_img))
+
         # Flip images if necessary (Robosuite renders upside down by default in some versions)
         # agentview_img = np.flipud(agentview_img)
         # wrist_img = np.flipud(wrist_img)
@@ -72,7 +84,9 @@ def main(args: Args):
 
         # 2. Get action from policy
         # The client handles serialization/deserialization
-        action = client.infer(request)
+        # action is typically [chunk_size, action_dim], we need the first action [action_dim]
+        response = client.infer(request)
+        action = np.array(response["actions"][0])  # Take the first action and make writable
         # logging.info(f"Received action shape: {action.shape}")
         
         # 3. Execute action
@@ -89,6 +103,13 @@ def main(args: Args):
         if done:
             logging.info("Episode finished.")
             break
+
+    logging.info(f"Saving video with {len(frames)} frames to output.mp4...")
+    try:
+        imageio.mimsave("output.mp4", frames, fps=10)
+        logging.info("Video saved successfully.")
+    except Exception as e:
+        logging.error(f"Failed to save video: {e}")
 
     env.close()
 
