@@ -46,7 +46,7 @@ uv pip sync examples/libero/requirements.txt third_party/libero/requirements.txt
 uv pip install -e packages/openpi-client
 uv pip install -e third_party/libero
 export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero
-
+uv run --active examples/libero/verify_spatial_alignment.py
 # Run the simulation
 python examples/libero/main.py
 
@@ -58,7 +58,7 @@ xvfb-run -a python examples/libero/main.py
 <!-- uv venv ~/openpi/uv_venv --python 3.11 # 创建虚拟环境 uv 3.11 
 source ~/openpi/uv_venv/bin/activate  # 激活虚拟环境
 uv pip install -e .              #安装pi相关的一些库 在openpi的根目录下 
-CUDA_VISIBLE_DEVICES=7 uv run --active scripts/serve_policy.py --env LIBERO
+CUDA_VISIBLE_DEVICES=0 uv run --active scripts/serve_policy.py --env LIBERO
 uv run --active scripts/serve_policy.py --env LIBERO  # uv 系统会有一个默认的 --active 这个是必须的 指定当前这个环境
 
 uv run --active scripts/serve_policy.py policy:checkpoint --policy.config=pi0_libero_low_mem_finetune --policy.dir=/data1/zhangzj26/pi0_model/checkpoints/pi0_libero_low_mem_finetune/my_experiment/1000
