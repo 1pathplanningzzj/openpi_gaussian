@@ -26,4 +26,7 @@ def robot_base_factory(name: Optional[str], idn=0) -> RobotBaseModel:
     # Import MOUNT_MAPPING at runtime so we avoid circular imports
     from robosuite.models.bases import BASE_MAPPING
 
-    return BASE_MAPPING.get(name, "Unknown base name: {}".format(name))(idn=idn)
+    if name not in BASE_MAPPING:
+        raise ValueError(f"Unknown base name: '{name}'. Available bases: {list(BASE_MAPPING.keys())}")
+
+    return BASE_MAPPING[name](idn=idn)
