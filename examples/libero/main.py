@@ -14,6 +14,11 @@ from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
 
+import csv
+import statistics
+import os
+import datetime
+
 # [Hypothesis Analysis] Imports for 3D Guard Logic
 import cv2
 import robosuite.utils.camera_utils as camera_utils
@@ -91,6 +96,10 @@ class Args:
     use_3d_guard: bool = False # Enable to test Hypothesis 3 (3D Aware) - LOGGING ONLY if False
     active_3d_takeover: bool = False # Enable to ACTUALLY OVERRIDE policy with 3D logic
 
+    # Experiment control
+    max_tasks: int = 0  # 0 means all tasks, set to small number (e.g. 3) for quick experiments
+    csv_filename: str = "eval_metrics.csv"  # per-run metrics filename
+
 
 def _get_target_object_pos(env, task_description):
 
@@ -103,12 +112,58 @@ def _get_target_object_pos(env, task_description):
     # Mapping task description keywords to likely object names in Sim
     # This is a simplification for the verification experiment.
     # Libero Spatial Task 0: "pick up the black bowl..." -> "akita_black_bowl_1_main"
-    if "black bowl" in task_description:
-         target_name = "akita_black_bowl_1_main"
-    elif "plate" in task_description: # Example fallback
-         target_name = "plate_1_main"
-    else:
-         return None
+    target_name = None
+    task_lower = task_description.lower()
+    
+    # 扩展对象名称映射
+    if "black bowl" in task_lower:
+        target_name = "akita_black_bowl_1_main"
+    elif "plate" in task_lower:
+        target_name = "plate_1_main"
+    elif "ramekin" in task_lower:
+        target_name = "ramekin_1_main"
+    elif "cookie box" in task_lower:
+        target_name = "cookie_box_1_main"
+    elif "alphabet soup" in task_lower:
+        target_name = "alphabet_soup_1_main"
+    elif "cream cheese" in task_lower:
+        target_name = "cream_cheese_1_main"
+    elif "salad dressing" in task_lower:
+        target_name = "salad_dressing_1_main"
+    elif "bbq sauce" in task_lower:
+        target_name = "bbq_sauce_1_main"
+    elif "ketchup" in task_lower:
+        target_name = "ketchup_1_main"
+    elif "tomato sauce" in task_lower:
+        target_name = "tomato_sauce_1_main"
+    elif "butter" in task_lower:
+        target_name = "butter_1_main"
+    elif "milk" in task_lower:
+        target_name = "milk_1_main"
+    elif "chocolate pudding" in task_lower:
+        target_name = "chocolate_pudding_1_main"
+    elif "orange juice" in task_lower:
+        target_name = "orange_juice_1_main"
+    elif "wine bottle" in task_lower:
+        target_name = "wine_bottle_1_main"
+    elif "bowl" in task_lower and "black" not in task_lower:
+        # 通用 bowl，尝试查找
+        target_name = "bowl_1_main"
+    
+    if target_name is None:
+        # 如果找不到，尝试查找所有 body 名称中包含关键词的
+        try:
+            keywords = task_lower.split()
+            for body_name in sim.model.body_names:
+                if any(keyword in body_name.lower() for keyword in keywords if len(keyword) > 3):
+                    try:
+                        obj_id = sim.model.body_name2id(body_name)
+                        return sim.data.body_xpos[obj_id]
+                    except:
+                        continue
+        except:
+            pass
+        return None
 
     try:
         obj_id = sim.model.body_name2id(target_name)
@@ -124,7 +179,11 @@ def eval_libero(args: Args) -> None:
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
-    logging.info(f"Task suite: {args.task_suite_name}")
+    if args.max_tasks > 0:
+        num_tasks = min(num_tasks_in_suite, args.max_tasks)
+    else:
+        num_tasks = num_tasks_in_suite
+    logging.info(f"Task suite: {args.task_suite_name} (using {num_tasks} tasks)")
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
@@ -145,7 +204,7 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    for task_id in tqdm.tqdm(range(num_tasks)):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -163,6 +222,20 @@ def eval_libero(args: Args) -> None:
             # Reset environment
             env.reset()
             action_plan = collections.deque()
+            # Per-episode analytics
+            num_takeovers = 0
+            misalignment_warnings = 0
+            alignment_list = []
+            policy_action_norms = []
+            takeover_action_norms = []
+            
+            # [Enhanced Analysis] Initialize per-episode metrics
+            angle_errors = []
+            distance_errors = []
+            target_in_view_list = []
+            true_distances = []
+            predicted_distances = []
+            alignment_at_distance = []
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
@@ -218,12 +291,52 @@ def eval_libero(args: Args) -> None:
                         # Query model to get action
                         action_chunk = client.infer(element)["actions"]
                         
+                        # [Enhanced Analysis] 2D-3D Projection Error Analysis
                         # [Hypothesis Analysis] 3D Guard Logic
                         if args.use_3d_guard:
                             target_pos_3d = _get_target_object_pos(env, task_description)
                             
                             if target_pos_3d is not None:
                                 current_eef_pos = obs["robot0_eef_pos"]
+                                
+                                # 1. 计算 policy 预测的轨迹终点（累积 action_chunk）
+                                predicted_end_pos = current_eef_pos.copy()
+                                for action in action_chunk[:10]:  # 只看前 10 步
+                                    predicted_end_pos = predicted_end_pos + action[:3]
+                                
+                                # 2. 计算真实目标方向
+                                true_direction = target_pos_3d - current_eef_pos
+                                true_distance = np.linalg.norm(true_direction)
+                                
+                                # 3. 计算 policy 预测方向
+                                predicted_direction = predicted_end_pos - current_eef_pos
+                                predicted_distance = np.linalg.norm(predicted_direction)
+                                
+                                # 4. 计算方向误差（角度，度）
+                                if true_distance > 1e-6 and predicted_distance > 1e-6:
+                                    cos_sim = np.dot(true_direction, predicted_direction) / (true_distance * predicted_distance)
+                                    cos_sim = np.clip(cos_sim, -1, 1)
+                                    angle_error = np.arccos(cos_sim) * 180 / np.pi
+                                else:
+                                    angle_error = 0.0
+                                
+                                # 5. 计算距离误差
+                                distance_error = abs(predicted_distance - true_distance)
+                                
+                                # 6. 将 3D 目标投影到 2D 图像，看是否在视野内
+                                u_target, v_target = project_point_to_image(
+                                    env.sim, target_pos_3d, "agentview",
+                                    LIBERO_ENV_RESOLUTION, LIBERO_ENV_RESOLUTION,
+                                    args.resize_size, args.resize_size
+                                )
+                                in_view = (0 <= u_target < args.resize_size and 0 <= v_target < args.resize_size)
+                                
+                                # 7. 记录指标
+                                angle_errors.append(float(angle_error))
+                                distance_errors.append(float(distance_error))
+                                target_in_view_list.append(int(in_view))
+                                true_distances.append(float(true_distance))
+                                predicted_distances.append(float(predicted_distance))
                                 
                                 # Visualization Logic
                                 if len(replay_images) > 0:
@@ -296,16 +409,26 @@ def eval_libero(args: Args) -> None:
                                 policy_action = action_chunk[0][:3]
                                 
                                 if np.linalg.norm(policy_action) > 1e-3:
+                                    # record policy action magnitude
+                                    policy_action_norms.append(np.linalg.norm(policy_action))
                                     policy_dir = policy_action / np.linalg.norm(policy_action)
                                     perfect_dir = vec_to_obj / (dist_to_obj + 1e-6)
                                     
                                     # Cosine similarity
                                     alignment = np.dot(policy_dir, perfect_dir)
+                                    alignment_list.append(float(alignment))
+                                    
+                                    # [Enhanced Analysis] 记录对齐度和距离的关系
+                                    alignment_at_distance.append({
+                                        'distance': float(dist_to_obj),
+                                        'alignment': float(alignment)
+                                    })
                                     
                                     # Condition for Takeover: Close enough (<10cm) AND Misaligned (<0.5 cos sim)
                                     if alignment < 0.5 and dist_to_obj < 0.10: 
                                          msg = f"3D GUARD: Misalignment detected! Dist={dist_to_obj:.3f}, CosSim={alignment:.3f}. Policy might miss."
                                          logging.warning(msg)
+                                         misalignment_warnings += 1
                                          
                                          if args.active_3d_takeover:
                                              logging.info(">>> ACTIVATING 3D TAKEOVER >>> Overriding Action!")
@@ -318,6 +441,8 @@ def eval_libero(args: Args) -> None:
                                              speed = max(speed, 0.02) 
                                              
                                              new_action_vec = perfect_dir * speed
+                                             takeover_action_norms.append(np.linalg.norm(new_action_vec))
+                                             num_takeovers += 1
                                              
                                              # Overwrite the first step of the chunk (since we replan often)
                                              # Keep the gripper action (index 6, which is -1 for open usually)
@@ -386,6 +511,54 @@ def eval_libero(args: Args) -> None:
                 [np.asarray(x) for x in replay_images],
                 fps=10,
             )
+
+            # Save per-episode metrics to CSV
+            avg_alignment = float(np.mean(alignment_list)) if alignment_list else float('nan')
+            avg_correction = float(np.mean(corrections)) if corrections else float('nan')
+            avg_policy_action_norm = float(np.mean(policy_action_norms)) if policy_action_norms else float('nan')
+            avg_takeover_action_norm = float(np.mean(takeover_action_norms)) if takeover_action_norms else float('nan')
+            
+            # [Enhanced Analysis] 计算新增指标的平均值
+            avg_angle_error = float(np.mean(angle_errors)) if angle_errors else float('nan')
+            avg_distance_error = float(np.mean(distance_errors)) if distance_errors else float('nan')
+            target_in_view_ratio = float(np.mean(target_in_view_list)) if target_in_view_list else float('nan')
+            avg_true_distance = float(np.mean(true_distances)) if true_distances else float('nan')
+            avg_predicted_distance = float(np.mean(predicted_distances)) if predicted_distances else float('nan')
+            
+            # 计算接近目标时的对齐度（距离 < 10cm）
+            close_alignments = [a['alignment'] for a in alignment_at_distance 
+                              if a['distance'] < 0.10 and not np.isnan(a['alignment'])]
+            avg_alignment_close = float(np.mean(close_alignments)) if close_alignments else float('nan')
+
+            episode_metrics = {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "task_id": int(task_id),
+                "task_description": task_description,
+                "seed": int(args.seed),
+                "use_3d_guard": int(args.use_3d_guard),
+                "active_3d_takeover": int(args.active_3d_takeover),
+                "success": int(done),
+                "steps": int(t),
+                "num_takeovers": int(num_takeovers),
+                "num_misalignment_warnings": int(misalignment_warnings),
+                "avg_alignment": avg_alignment,
+                "avg_alignment_close": avg_alignment_close,  # 新增：接近目标时的对齐度
+                "avg_correction": avg_correction,
+                "avg_policy_action_norm": avg_policy_action_norm,
+                "avg_takeover_action_norm": avg_takeover_action_norm,
+                "avg_angle_error_deg": avg_angle_error,  # 新增：平均角度误差（度）
+                "avg_distance_error": avg_distance_error,  # 新增：平均距离误差
+                "target_in_view_ratio": target_in_view_ratio,  # 新增：目标在视野内的比例
+                "avg_true_distance": avg_true_distance,  # 新增：平均真实距离
+                "avg_predicted_distance": avg_predicted_distance,  # 新增：平均预测距离
+            }
+            csvpath = pathlib.Path(args.video_out_path) / args.csv_filename
+            write_header = not csvpath.exists()
+            with open(csvpath, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(episode_metrics.keys()))
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(episode_metrics)
 
             # Log current results
             if corrections:
