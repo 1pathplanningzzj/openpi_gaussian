@@ -3,6 +3,7 @@ import dataclasses
 import logging
 import math
 import pathlib
+import os
 
 import imageio
 from libero.libero import benchmark
@@ -16,8 +17,20 @@ import tyro
 
 import csv
 import statistics
-import os
 import datetime
+
+# [Headless Rendering] Set up MuJoCo rendering backend for headless servers
+# Try EGL first (GPU-accelerated), fall back to OSMesa (CPU software rendering)
+if "MUJOCO_GL" not in os.environ:
+    # Check if we're in a headless environment (no DISPLAY or DISPLAY is invalid)
+    display = os.environ.get("DISPLAY", "")
+    if not display or ":" not in display:
+        # Try EGL first (requires GPU with EGL support)
+        # If EGL fails, it will fall back or raise an error
+        # User can manually set MUJOCO_GL=osmesa for CPU rendering
+        os.environ["MUJOCO_GL"] = "egl"
+        logging.info("Headless environment detected. Setting MUJOCO_GL=egl for GPU rendering.")
+        logging.info("If EGL fails, set MUJOCO_GL=osmesa for CPU software rendering.")
 
 # [Hypothesis Analysis] Imports for 3D Guard Logic
 import cv2
@@ -74,7 +87,7 @@ class Args:
     # Reducing replan_steps from 2 (or 5) to 1 means we query the expert policy at every single step.
     # This maximizes the response frequency to ~20Hz (Libero native), allowing the robot to react 
     # immediately if the object enters the field of view or slips.
-    replan_steps: int = 1 
+    replan_steps: int = 5 
 
     #################################################################################################################
     # LIBERO environment-specific parameters
