@@ -101,16 +101,24 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/libero_spatial_vis_3d_aware/videos"  # Path to save videos
+    video_out_path: str = "data/libero_spatial_active_vis_3d_aware/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
     
     # [Hypothesis Analysis] Toggle for 3D Hybrid Policy
     use_3d_guard: bool = False # Enable to test Hypothesis 3 (3D Aware) - LOGGING ONLY if False
     active_3d_takeover: bool = False # Enable to ACTUALLY OVERRIDE policy with 3D logic
+    use_abs_alignment: bool = False # If True, use absolute value of alignment (angle-only, ignore direction)
 
+    # Performance optimization
+    save_videos: bool = True  # Save video replays (set False to speed up evaluation significantly)
+    save_videos_only_failures: bool = False  # If True, only save videos for failed episodes
+    verbose: bool = True  # If False, reduce logging (WARNING/INFO -> ERROR only)
+    
     # Experiment control
     max_tasks: int = 0  # 0 means all tasks, set to small number (e.g. 3) for quick experiments
+    task_id: int = -1  # -1 means all tasks, set to specific task_id to run only that task
+    task_description_filter: str = ""  # If set, only run tasks matching this description (partial match)
     csv_filename: str = "eval_metrics.csv"  # per-run metrics filename
 
 
@@ -215,9 +223,36 @@ def eval_libero(args: Args) -> None:
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
 
+    # Determine which tasks to run
+    if args.task_id >= 0:
+        # Run only specific task_id
+        if args.task_id >= num_tasks_in_suite:
+            logging.error(f"Task ID {args.task_id} is out of range (0-{num_tasks_in_suite-1})")
+            return
+        task_ids_to_run = [args.task_id]
+        logging.info(f"Running only task_id={args.task_id}")
+    elif args.task_description_filter:
+        # Find tasks matching description
+        task_ids_to_run = []
+        for tid in range(num_tasks_in_suite):
+            task = task_suite.get_task(tid)
+            if args.task_description_filter.lower() in task.language.lower():
+                task_ids_to_run.append(tid)
+                logging.info(f"Found matching task_id={tid}: {task.language}")
+        if not task_ids_to_run:
+            logging.error(f"No tasks found matching description: {args.task_description_filter}")
+            logging.info("Available tasks:")
+            for tid in range(num_tasks_in_suite):
+                task = task_suite.get_task(tid)
+                logging.info(f"  Task {tid}: {task.language}")
+            return
+    else:
+        # Run all tasks (or up to max_tasks)
+        task_ids_to_run = list(range(num_tasks))
+    
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks)):
+    for task_id in tqdm.tqdm(task_ids_to_run):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -255,13 +290,16 @@ def eval_libero(args: Args) -> None:
 
             # Setup
             t = 0
-            replay_images = []
+            # Only collect images if we need to save videos
+            # Note: If save_videos_only_failures=True, we still need to collect images to know if it failed
+            replay_images = [] if args.save_videos else None
             
             # [Plan C Analysis] Metrics for High Frequency Utility
             prev_full_chunk = None
             corrections = []
             
-            logging.info(f"Starting episode {task_episodes+1}...")
+            if args.verbose:
+                logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -282,8 +320,9 @@ def eval_libero(args: Args) -> None:
                         image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
                     )
 
-                    # Save preprocessed image for replay video
-                    replay_images.append(img)
+                    # Save preprocessed image for replay video (only if needed)
+                    if replay_images is not None:
+                        replay_images.append(img)
 
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
@@ -351,8 +390,8 @@ def eval_libero(args: Args) -> None:
                                 true_distances.append(float(true_distance))
                                 predicted_distances.append(float(predicted_distance))
                                 
-                                # Visualization Logic
-                                if len(replay_images) > 0:
+                                # Visualization Logic (only if saving videos)
+                                if replay_images is not None and len(replay_images) > 0:
                                     # Get the current frame (mutable copy reference from list? No, numpy array in list is mutable)
                                     # We modify the last image added to replay_images directly
                                     vis_img = replay_images[-1].copy() # Copy to avoid messing up history if ref used elsewhere?
@@ -427,8 +466,13 @@ def eval_libero(args: Args) -> None:
                                     policy_dir = policy_action / np.linalg.norm(policy_action)
                                     perfect_dir = vec_to_obj / (dist_to_obj + 1e-6)
                                     
-                                    # Cosine similarity
+                                    # Cosine similarity (ranges from -1 to 1)
+                                    # 1 = perfectly aligned, 0 = perpendicular, -1 = opposite direction
                                     alignment = np.dot(policy_dir, perfect_dir)
+                                    
+                                    # Optional: use absolute value (angle-only, ignores direction)
+                                    # This might be useful if policy actions have inconsistent sign conventions
+                                    alignment_for_check = abs(alignment) if args.use_abs_alignment else alignment
                                     alignment_list.append(float(alignment))
                                     
                                     # [Enhanced Analysis] 记录对齐度和距离的关系
@@ -437,21 +481,47 @@ def eval_libero(args: Args) -> None:
                                         'alignment': float(alignment)
                                     })
                                     
-                                    # Condition for Takeover: Close enough (<10cm) AND Misaligned (<0.5 cos sim)
-                                    if alignment < 0.5 and dist_to_obj < 0.10: 
-                                         msg = f"3D GUARD: Misalignment detected! Dist={dist_to_obj:.3f}, CosSim={alignment:.3f}. Policy might miss."
-                                         logging.warning(msg)
+                                    # Improved Takeover Condition:
+                                    # 1. If alignment < 0 (moving away from target), always trigger if close
+                                    # 2. If alignment < 0.7 (significant misalignment), trigger if close
+                                    # 3. Use larger distance threshold (15cm) to catch issues earlier
+                                    # 4. Use alignment_for_check which may be absolute value if requested
+                                    alignment_threshold = 0.7  # More strict: require better alignment
+                                    distance_threshold = 0.15  # Larger: catch issues earlier (15cm instead of 10cm)
+                                    
+                                    # Check if policy is moving away (negative alignment) or significantly misaligned
+                                    # Note: if use_abs_alignment=True, is_moving_away will always be False
+                                    is_moving_away = (not args.use_abs_alignment) and (alignment < 0)
+                                    is_misaligned = alignment_for_check < alignment_threshold
+                                    
+                                    # Trigger if: (moving away OR misaligned) AND close enough
+                                    if (is_moving_away or is_misaligned) and dist_to_obj < distance_threshold: 
+                                         direction_str = "moving AWAY" if is_moving_away else "misaligned"
+                                         if args.verbose:
+                                             msg = f"3D GUARD: {direction_str} detected! Dist={dist_to_obj:.3f}, CosSim={alignment:.3f}. Policy might miss."
+                                             logging.warning(msg)
                                          misalignment_warnings += 1
                                          
                                          if args.active_3d_takeover:
-                                             logging.info(">>> ACTIVATING 3D TAKEOVER >>> Overriding Action!")
+                                             if args.verbose:
+                                                 logging.info(">>> ACTIVATING 3D TAKEOVER >>> Overriding Action!")
                                              
-                                             # Construct the Perfect Action (P-Controller)
-                                             # Move towards object with a safe speed (similar to policy's usual magnitude)
-                                             # Usually around 0.05 speed? Let's take norm of policy action to match speed
-                                             speed = np.linalg.norm(policy_action)
-                                             # Or fixed small speed to be safe
-                                             speed = max(speed, 0.02) 
+                                             # Improved speed control:
+                                             # 1. Use distance-proportional speed when close (smoother approach)
+                                             # 2. Cap maximum speed to avoid overshooting
+                                             # 3. Use minimum speed to ensure progress
+                                             base_speed = np.linalg.norm(policy_action)
+                                             
+                                             # When very close (<5cm), use smaller proportional speed
+                                             if dist_to_obj < 0.05:
+                                                 # Proportional control: speed decreases as we get closer
+                                                 speed = min(base_speed, dist_to_obj * 2.0)  # Max 0.1 m/s when at 5cm
+                                             else:
+                                                 # Use policy's speed but cap it
+                                                 speed = min(base_speed, 0.08)  # Cap at 8cm per step
+                                             
+                                             # Ensure minimum speed for progress
+                                             speed = max(speed, 0.01)  # At least 1cm per step 
                                              
                                              new_action_vec = perfect_dir * speed
                                              takeover_action_norms.append(np.linalg.norm(new_action_vec))
@@ -476,9 +546,10 @@ def eval_libero(args: Args) -> None:
                                              
                                              action_chunk[0] = fix_action
                                              
-                                             # Visual confirmation in video
-                                             cv2.putText(replay_images[-1], "3D TAKEOVER ACTIVE", (50, 50), 
-                                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                                             # Visual confirmation in video (only if saving videos)
+                                             if replay_images is not None and len(replay_images) > 0:
+                                                 cv2.putText(replay_images[-1], "3D TAKEOVER ACTIVE", (50, 50), 
+                                                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
                         
                         # [Plan C Analysis] Compute Correction Magnitude
@@ -516,14 +587,18 @@ def eval_libero(args: Args) -> None:
             task_episodes += 1
             total_episodes += 1
 
-            # Save a replay video of the episode
-            suffix = "success" if done else "failure"
-            task_segment = task_description.replace(" ", "_")
-            imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=10,
+            # Save a replay video of the episode (if enabled)
+            should_save_this_video = args.save_videos and (
+                not args.save_videos_only_failures or not done
             )
+            if should_save_this_video and replay_images is not None and len(replay_images) > 0:
+                suffix = "success" if done else "failure"
+                task_segment = task_description.replace(" ", "_")
+                imageio.mimwrite(
+                    pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                    [np.asarray(x) for x in replay_images],
+                    fps=10,
+                )
 
             # Save per-episode metrics to CSV
             avg_alignment = float(np.mean(alignment_list)) if alignment_list else float('nan')
@@ -550,6 +625,7 @@ def eval_libero(args: Args) -> None:
                 "seed": int(args.seed),
                 "use_3d_guard": int(args.use_3d_guard),
                 "active_3d_takeover": int(args.active_3d_takeover),
+                "use_abs_alignment": int(args.use_abs_alignment),
                 "success": int(done),
                 "steps": int(t),
                 "num_takeovers": int(num_takeovers),
@@ -573,23 +649,29 @@ def eval_libero(args: Args) -> None:
                     writer.writeheader()
                 writer.writerow(episode_metrics)
 
-            # Log current results
-            if corrections:
-                avg_correction = np.mean(corrections)
-                max_correction = np.max(corrections)
-                logging.info(f"Episode Analysis - Avg Correction: {avg_correction:.4f}, Max Correction: {max_correction:.4f}")
-                if avg_correction > 0.1: # Threshold depends on action scale, typically actions are normalized or small deltas
-                    logging.info("=> HIGH FREQUENCY IMPACT: Large corrections detected. The policy is actively reacting to deviations.")
-                else:
-                    logging.info("=> LOW IMPACT: Corrections are small. The trajectory is stable.")
-            
-            logging.info(f"Success: {done}")
-            logging.info(f"# episodes completed so far: {total_episodes}")
-            logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+            # Log current results (only if verbose)
+            if args.verbose:
+                if corrections:
+                    avg_correction = np.mean(corrections)
+                    max_correction = np.max(corrections)
+                    logging.info(f"Episode Analysis - Avg Correction: {avg_correction:.4f}, Max Correction: {max_correction:.4f}")
+                    if avg_correction > 0.1: # Threshold depends on action scale, typically actions are normalized or small deltas
+                        logging.info("=> HIGH FREQUENCY IMPACT: Large corrections detected. The policy is actively reacting to deviations.")
+                    else:
+                        logging.info("=> LOW IMPACT: Corrections are small. The trajectory is stable.")
+                
+                logging.info(f"Success: {done}")
+                logging.info(f"# episodes completed so far: {total_episodes}")
+                logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+            else:
+                # Minimal logging: only show progress every 10 episodes
+                if total_episodes % 10 == 0:
+                    logging.info(f"Progress: {total_episodes} episodes, {total_successes} successes ({total_successes / total_episodes * 100:.1f}%)")
 
         # Log final results
-        logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-        logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        if args.verbose:
+            logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+            logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
