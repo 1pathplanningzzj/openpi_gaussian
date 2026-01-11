@@ -14,6 +14,7 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
+import time
 
 import csv
 import statistics
@@ -110,11 +111,6 @@ class Args:
     active_3d_takeover: bool = False # Enable to ACTUALLY OVERRIDE policy with 3D logic
     use_abs_alignment: bool = False # If True, use absolute value of alignment (angle-only, ignore direction)
 
-    # Performance optimization
-    save_videos: bool = True  # Save video replays (set False to speed up evaluation significantly)
-    save_videos_only_failures: bool = False  # If True, only save videos for failed episodes
-    verbose: bool = True  # If False, reduce logging (WARNING/INFO -> ERROR only)
-    
     # Experiment control
     max_tasks: int = 0  # 0 means all tasks, set to small number (e.g. 3) for quick experiments
     task_id: int = -1  # -1 means all tasks, set to specific task_id to run only that task
@@ -223,6 +219,10 @@ def eval_libero(args: Args) -> None:
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
 
+    # Inference timing collection (seconds)
+    inference_times = []
+    inference_calls = 0
+
     # Determine which tasks to run
     if args.task_id >= 0:
         # Run only specific task_id
@@ -290,16 +290,13 @@ def eval_libero(args: Args) -> None:
 
             # Setup
             t = 0
-            # Only collect images if we need to save videos
-            # Note: If save_videos_only_failures=True, we still need to collect images to know if it failed
-            replay_images = [] if args.save_videos else None
+            replay_images = []
             
             # [Plan C Analysis] Metrics for High Frequency Utility
             prev_full_chunk = None
             corrections = []
             
-            if args.verbose:
-                logging.info(f"Starting episode {task_episodes+1}...")
+            logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -320,9 +317,8 @@ def eval_libero(args: Args) -> None:
                         image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
                     )
 
-                    # Save preprocessed image for replay video (only if needed)
-                    if replay_images is not None:
-                        replay_images.append(img)
+                    # Save preprocessed image for replay video
+                    replay_images.append(img)
 
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
@@ -340,8 +336,16 @@ def eval_libero(args: Args) -> None:
                             "prompt": str(task_description),
                         }
 
-                        # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        # Query model to get action (measure latency)
+                        t0 = time.time()
+                        response = client.infer(element)
+                        latency = time.time() - t0
+                        inference_times.append(latency)
+                        inference_calls += 1
+                        action_chunk = response["actions"]
+                        # Optionally log occasional latency samples
+                        if inference_calls % 100 == 0:
+                            logging.info(f"Inference sample #{inference_calls}: latency={latency:.4f}s")
                         
                         # [Enhanced Analysis] 2D-3D Projection Error Analysis
                         # [Hypothesis Analysis] 3D Guard Logic
@@ -390,8 +394,8 @@ def eval_libero(args: Args) -> None:
                                 true_distances.append(float(true_distance))
                                 predicted_distances.append(float(predicted_distance))
                                 
-                                # Visualization Logic (only if saving videos)
-                                if replay_images is not None and len(replay_images) > 0:
+                                # Visualization Logic
+                                if len(replay_images) > 0:
                                     # Get the current frame (mutable copy reference from list? No, numpy array in list is mutable)
                                     # We modify the last image added to replay_images directly
                                     vis_img = replay_images[-1].copy() # Copy to avoid messing up history if ref used elsewhere?
@@ -497,14 +501,12 @@ def eval_libero(args: Args) -> None:
                                     # Trigger if: (moving away OR misaligned) AND close enough
                                     if (is_moving_away or is_misaligned) and dist_to_obj < distance_threshold: 
                                          direction_str = "moving AWAY" if is_moving_away else "misaligned"
-                                         if args.verbose:
-                                             msg = f"3D GUARD: {direction_str} detected! Dist={dist_to_obj:.3f}, CosSim={alignment:.3f}. Policy might miss."
-                                             logging.warning(msg)
+                                         msg = f"3D GUARD: {direction_str} detected! Dist={dist_to_obj:.3f}, CosSim={alignment:.3f}. Policy might miss."
+                                         logging.warning(msg)
                                          misalignment_warnings += 1
                                          
                                          if args.active_3d_takeover:
-                                             if args.verbose:
-                                                 logging.info(">>> ACTIVATING 3D TAKEOVER >>> Overriding Action!")
+                                             logging.info(">>> ACTIVATING 3D TAKEOVER >>> Overriding Action!")
                                              
                                              # Improved speed control:
                                              # 1. Use distance-proportional speed when close (smoother approach)
@@ -546,10 +548,9 @@ def eval_libero(args: Args) -> None:
                                              
                                              action_chunk[0] = fix_action
                                              
-                                             # Visual confirmation in video (only if saving videos)
-                                             if replay_images is not None and len(replay_images) > 0:
-                                                 cv2.putText(replay_images[-1], "3D TAKEOVER ACTIVE", (50, 50), 
-                                                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                                             # Visual confirmation in video
+                                             cv2.putText(replay_images[-1], "3D TAKEOVER ACTIVE", (50, 50), 
+                                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
                         
                         # [Plan C Analysis] Compute Correction Magnitude
@@ -587,18 +588,14 @@ def eval_libero(args: Args) -> None:
             task_episodes += 1
             total_episodes += 1
 
-            # Save a replay video of the episode (if enabled)
-            should_save_this_video = args.save_videos and (
-                not args.save_videos_only_failures or not done
+            # Save a replay video of the episode
+            suffix = "success" if done else "failure"
+            task_segment = task_description.replace(" ", "_")
+            imageio.mimwrite(
+                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                [np.asarray(x) for x in replay_images],
+                fps=10,
             )
-            if should_save_this_video and replay_images is not None and len(replay_images) > 0:
-                suffix = "success" if done else "failure"
-                task_segment = task_description.replace(" ", "_")
-                imageio.mimwrite(
-                    pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
-                    [np.asarray(x) for x in replay_images],
-                    fps=10,
-                )
 
             # Save per-episode metrics to CSV
             avg_alignment = float(np.mean(alignment_list)) if alignment_list else float('nan')
@@ -649,32 +646,42 @@ def eval_libero(args: Args) -> None:
                     writer.writeheader()
                 writer.writerow(episode_metrics)
 
-            # Log current results (only if verbose)
-            if args.verbose:
-                if corrections:
-                    avg_correction = np.mean(corrections)
-                    max_correction = np.max(corrections)
-                    logging.info(f"Episode Analysis - Avg Correction: {avg_correction:.4f}, Max Correction: {max_correction:.4f}")
-                    if avg_correction > 0.1: # Threshold depends on action scale, typically actions are normalized or small deltas
-                        logging.info("=> HIGH FREQUENCY IMPACT: Large corrections detected. The policy is actively reacting to deviations.")
-                    else:
-                        logging.info("=> LOW IMPACT: Corrections are small. The trajectory is stable.")
-                
-                logging.info(f"Success: {done}")
-                logging.info(f"# episodes completed so far: {total_episodes}")
-                logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
-            else:
-                # Minimal logging: only show progress every 10 episodes
-                if total_episodes % 10 == 0:
-                    logging.info(f"Progress: {total_episodes} episodes, {total_successes} successes ({total_successes / total_episodes * 100:.1f}%)")
+            # Log current results
+            if corrections:
+                avg_correction = np.mean(corrections)
+                max_correction = np.max(corrections)
+                logging.info(f"Episode Analysis - Avg Correction: {avg_correction:.4f}, Max Correction: {max_correction:.4f}")
+                if avg_correction > 0.1: # Threshold depends on action scale, typically actions are normalized or small deltas
+                    logging.info("=> HIGH FREQUENCY IMPACT: Large corrections detected. The policy is actively reacting to deviations.")
+                else:
+                    logging.info("=> LOW IMPACT: Corrections are small. The trajectory is stable.")
+            
+            logging.info(f"Success: {done}")
+            logging.info(f"# episodes completed so far: {total_episodes}")
+            logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
         # Log final results
-        if args.verbose:
-            logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-            logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+        logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+
+    # Inference timing summary
+    if len(inference_times) > 0:
+        mean_latency = float(np.mean(inference_times))
+        median_latency = float(np.median(inference_times))
+        std_latency = float(np.std(inference_times))
+        calls = len(inference_times)
+        recommended_max_freq = 1.0 / mean_latency if mean_latency > 0 else float('inf')
+        # Suggest replan_steps so that control freq <= recommended_max_freq
+        suggested_replan_steps = max(1, int(math.ceil(20 * mean_latency)))
+        logging.info(
+            f"Inference timing (n={calls}): mean={mean_latency:.4f}s, median={median_latency:.4f}s, std={std_latency:.4f}s"
+        )
+        logging.info(
+            f"Estimated max control freq ≈ {recommended_max_freq:.2f} Hz. Suggest using replan_steps >= {suggested_replan_steps} (i.e., control freq <= {20.0/suggested_replan_steps:.2f} Hz)"
+        )
 
 
 def _get_libero_env(task, resolution, seed):

@@ -90,4 +90,7 @@ You can set up the environment locally using `uv` or `conda`.
    ```bash
    python examples/robocasa/check_env.py
    ```
+
+source ~/openpi/uv_venv/bin/activate  # 激活虚拟环境
+
 CUDA_VISIBLE_DEVICES=2 uv run scripts/serve_policy.py     policy:checkpoint     --policy.config=pi0_robocasa     --policy.dir=checkpoints/pi0_robocasa/robocasa_test_01/2000

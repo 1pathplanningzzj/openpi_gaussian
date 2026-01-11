@@ -1,6 +1,7 @@
 """Analysis script: Verify hypothesis that 2D images cause inaccurate 3D spatial information
 
-Usage: python examples/libero/analyze_spatial_hypothesis.py --csv data/libero_spatial_vis_3d_aware/eval_metrics.csv
+Usage: 
+python examples/libero/analyze_spatial_hypothesis.py --csv data/libero_spatial_vis_3d_aware/eval_metrics.csv
 """
 import argparse
 import pandas as pd
