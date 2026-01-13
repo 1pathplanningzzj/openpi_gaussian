@@ -193,6 +193,7 @@ def train_step(
 
 def main(config: _config.TrainConfig):
     import os
+
     print(f"DEBUG: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
     print(f"DEBUG: jax.device_count()={jax.device_count()}")
     init_logging()

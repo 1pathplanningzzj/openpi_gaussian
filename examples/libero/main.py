@@ -1,9 +1,12 @@
 import collections
+import csv
 import dataclasses
+import datetime
 import logging
 import math
-import pathlib
 import os
+import pathlib
+import time
 
 import imageio
 from libero.libero import benchmark
@@ -14,11 +17,6 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
-import time
-
-import csv
-import statistics
-import datetime
 
 # [Headless Rendering] Set up MuJoCo rendering backend for headless servers
 # Try EGL first (GPU-accelerated), fall back to OSMesa (CPU software rendering)
@@ -36,9 +34,9 @@ if "MUJOCO_GL" not in os.environ:
 # [Hypothesis Analysis] Imports for 3D Guard Logic
 import cv2
 import robosuite.utils.camera_utils as camera_utils
-import robosuite.utils.transform_utils as T
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
+
 
 def project_point_to_image(sim, point_3d, camera_name, width, height, final_width, final_height):
     """Projects 3D point to the processed image coordinates (Flipped + Scaled)."""
@@ -47,30 +45,31 @@ def project_point_to_image(sim, point_3d, camera_name, width, height, final_widt
     )
     point_homogeneous = np.append(point_3d, 1.0)
     point_pixel_homogeneous = P @ point_homogeneous
-    
+
     if point_pixel_homogeneous[2] == 0:
         return 0, 0
-        
+
     u = point_pixel_homogeneous[0] / point_pixel_homogeneous[2]
     v_raw = point_pixel_homogeneous[1] / point_pixel_homogeneous[2]
-    
+
     # Transformation: Raw(bottom-up) -> Flipped(H+V) -> Scaled
     # 1. Libero Main logic implies: Img_New[y, x] = Img_Raw[H-1-y, W-1-x]
     #    Since Raw is bottom-up (y=0 bottom), y_raw is from top? No, usually pinhole is top-down.
     #    Let's assume standard Pinhole (v_raw is top-down).
-    #    Robosuite Raw Image corresponds to OpenGL (bottom-up). 
+    #    Robosuite Raw Image corresponds to OpenGL (bottom-up).
     #    So visual feature at v_raw (top-down) is at pixel y_gl = H-v_raw.
     #    Flipping V: y_new = H - 1 - y_gl = H - 1 - (H - v_raw) ~= v_raw.
     #    Flipping H: x_new = W - 1 - u.
-    
+
     u_new = width - 1 - u
     v_new = v_raw
-    
+
     # Scaling
     scale_x = final_width / width
     scale_y = final_height / height
-    
+
     return int(u_new * scale_x), int(v_new * scale_y)
+
 
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
@@ -83,12 +82,12 @@ class Args:
     host: str = "0.0.0.0"
     port: int = 8000
     resize_size: int = 224
-    
+
     # [Plan C] Modified for High Frequency Inference (Closed-Loop)
     # Reducing replan_steps from 2 (or 5) to 1 means we query the expert policy at every single step.
-    # This maximizes the response frequency to ~20Hz (Libero native), allowing the robot to react 
+    # This maximizes the response frequency to ~20Hz (Libero native), allowing the robot to react
     # immediately if the object enters the field of view or slips.
-    replan_steps: int = 5 
+    replan_steps: int = 5
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -105,11 +104,11 @@ class Args:
     video_out_path: str = "data/libero_spatial_active_vis_3d_aware/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
-    
+
     # [Hypothesis Analysis] Toggle for 3D Hybrid Policy
-    use_3d_guard: bool = False # Enable to test Hypothesis 3 (3D Aware) - LOGGING ONLY if False
-    active_3d_takeover: bool = False # Enable to ACTUALLY OVERRIDE policy with 3D logic
-    use_abs_alignment: bool = False # If True, use absolute value of alignment (angle-only, ignore direction)
+    use_3d_guard: bool = False  # Enable to test Hypothesis 3 (3D Aware) - LOGGING ONLY if False
+    active_3d_takeover: bool = False  # Enable to ACTUALLY OVERRIDE policy with 3D logic
+    use_abs_alignment: bool = False  # If True, use absolute value of alignment (angle-only, ignore direction)
 
     # Experiment control
     max_tasks: int = 0  # 0 means all tasks, set to small number (e.g. 3) for quick experiments
@@ -119,7 +118,6 @@ class Args:
 
 
 def _get_target_object_pos(env, task_description):
-
     """
     Heuristic to find the target object position from simulation ground truth.
     In a real system, this would come from a proper 3D perception module (Detect -> Depth).
@@ -131,7 +129,7 @@ def _get_target_object_pos(env, task_description):
     # Libero Spatial Task 0: "pick up the black bowl..." -> "akita_black_bowl_1_main"
     target_name = None
     task_lower = task_description.lower()
-    
+
     # 扩展对象名称映射
     if "black bowl" in task_lower:
         target_name = "akita_black_bowl_1_main"
@@ -166,7 +164,7 @@ def _get_target_object_pos(env, task_description):
     elif "bowl" in task_lower and "black" not in task_lower:
         # 通用 bowl，尝试查找
         target_name = "bowl_1_main"
-    
+
     if target_name is None:
         # 如果找不到，尝试查找所有 body 名称中包含关键词的
         try:
@@ -187,6 +185,7 @@ def _get_target_object_pos(env, task_description):
         return sim.data.body_xpos[obj_id]
     except ValueError:
         return None
+
 
 def eval_libero(args: Args) -> None:
     # Set random seed
@@ -249,7 +248,7 @@ def eval_libero(args: Args) -> None:
     else:
         # Run all tasks (or up to max_tasks)
         task_ids_to_run = list(range(num_tasks))
-    
+
     # Start evaluation
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(task_ids_to_run):
@@ -276,7 +275,7 @@ def eval_libero(args: Args) -> None:
             alignment_list = []
             policy_action_norms = []
             takeover_action_norms = []
-            
+
             # [Enhanced Analysis] Initialize per-episode metrics
             angle_errors = []
             distance_errors = []
@@ -291,11 +290,11 @@ def eval_libero(args: Args) -> None:
             # Setup
             t = 0
             replay_images = []
-            
+
             # [Plan C Analysis] Metrics for High Frequency Utility
             prev_full_chunk = None
             corrections = []
-            
+
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
@@ -346,112 +345,148 @@ def eval_libero(args: Args) -> None:
                         # Optionally log occasional latency samples
                         if inference_calls % 100 == 0:
                             logging.info(f"Inference sample #{inference_calls}: latency={latency:.4f}s")
-                        
+
                         # [Enhanced Analysis] 2D-3D Projection Error Analysis
                         # [Hypothesis Analysis] 3D Guard Logic
                         if args.use_3d_guard:
                             target_pos_3d = _get_target_object_pos(env, task_description)
-                            
+
                             if target_pos_3d is not None:
                                 current_eef_pos = obs["robot0_eef_pos"]
-                                
+
                                 # 1. 计算 policy 预测的轨迹终点（累积 action_chunk）
                                 predicted_end_pos = current_eef_pos.copy()
                                 for action in action_chunk[:10]:  # 只看前 10 步
                                     predicted_end_pos = predicted_end_pos + action[:3]
-                                
+
                                 # 2. 计算真实目标方向
                                 true_direction = target_pos_3d - current_eef_pos
                                 true_distance = np.linalg.norm(true_direction)
-                                
+
                                 # 3. 计算 policy 预测方向
                                 predicted_direction = predicted_end_pos - current_eef_pos
                                 predicted_distance = np.linalg.norm(predicted_direction)
-                                
+
                                 # 4. 计算方向误差（角度，度）
                                 if true_distance > 1e-6 and predicted_distance > 1e-6:
-                                    cos_sim = np.dot(true_direction, predicted_direction) / (true_distance * predicted_distance)
+                                    cos_sim = np.dot(true_direction, predicted_direction) / (
+                                        true_distance * predicted_distance
+                                    )
                                     cos_sim = np.clip(cos_sim, -1, 1)
                                     angle_error = np.arccos(cos_sim) * 180 / np.pi
                                 else:
                                     angle_error = 0.0
-                                
+
                                 # 5. 计算距离误差
                                 distance_error = abs(predicted_distance - true_distance)
-                                
+
                                 # 6. 将 3D 目标投影到 2D 图像，看是否在视野内
                                 u_target, v_target = project_point_to_image(
-                                    env.sim, target_pos_3d, "agentview",
-                                    LIBERO_ENV_RESOLUTION, LIBERO_ENV_RESOLUTION,
-                                    args.resize_size, args.resize_size
+                                    env.sim,
+                                    target_pos_3d,
+                                    "agentview",
+                                    LIBERO_ENV_RESOLUTION,
+                                    LIBERO_ENV_RESOLUTION,
+                                    args.resize_size,
+                                    args.resize_size,
                                 )
-                                in_view = (0 <= u_target < args.resize_size and 0 <= v_target < args.resize_size)
-                                
+                                in_view = 0 <= u_target < args.resize_size and 0 <= v_target < args.resize_size
+
                                 # 7. 记录指标
                                 angle_errors.append(float(angle_error))
                                 distance_errors.append(float(distance_error))
                                 target_in_view_list.append(int(in_view))
                                 true_distances.append(float(true_distance))
                                 predicted_distances.append(float(predicted_distance))
-                                
+
                                 # Visualization Logic
                                 if len(replay_images) > 0:
                                     # Get the current frame (mutable copy reference from list? No, numpy array in list is mutable)
                                     # We modify the last image added to replay_images directly
-                                    vis_img = replay_images[-1].copy() # Copy to avoid messing up history if ref used elsewhere?
+                                    vis_img = replay_images[
+                                        -1
+                                    ].copy()  # Copy to avoid messing up history if ref used elsewhere?
                                     # Actually replay_images IS the history. We want the video to have arrows.
                                     # So we modify replay_images[-1] in place or replace it.
-                                    
+
                                     # Visualization - "Red Tentacle" (Predicted Trajectory)
                                     # We simulate the future path the policy wants to take
                                     predicted_path_pixels = []
                                     sim_eef_pos = current_eef_pos.copy()
-                                    
+
                                     # Start point
-                                    u_start, v_start = project_point_to_image(env.sim, sim_eef_pos, "agentview", 
-                                                                  LIBERO_ENV_RESOLUTION, LIBERO_ENV_RESOLUTION, 
-                                                                  args.resize_size, args.resize_size)
+                                    u_start, v_start = project_point_to_image(
+                                        env.sim,
+                                        sim_eef_pos,
+                                        "agentview",
+                                        LIBERO_ENV_RESOLUTION,
+                                        LIBERO_ENV_RESOLUTION,
+                                        args.resize_size,
+                                        args.resize_size,
+                                    )
                                     predicted_path_pixels.append((u_start, v_start))
 
                                     # Project future N steps (e.g. 20 steps to avoid clutter, or all)
                                     # Assuming standard Libero action space (x,y,z delta in world frame)
                                     # And assuming scale=1.0 for simplicity (Libero env actions usually roughly correspond to units)
                                     # If actions are normalized, this might look short, but let's try.
-                                    vis_steps = min(len(action_chunk), 20) 
-                                    vis_scale_factor = 10.0 # Exaggerate the movement for visualization clarity if needed
-                                    
+                                    vis_steps = min(len(action_chunk), 20)
+                                    vis_scale_factor = (
+                                        10.0  # Exaggerate the movement for visualization clarity if needed
+                                    )
+
                                     for i in range(vis_steps):
                                         action_vec = action_chunk[i][:3]
                                         # Update sim_eef_pos cumulatively
                                         # Note: This ignores physics/collisions, just visualizing 'intent'
-                                        sim_eef_pos = sim_eef_pos + action_vec * vis_scale_factor 
-                                        
-                                        u_next, v_next = project_point_to_image(env.sim, sim_eef_pos, "agentview", 
-                                                                      LIBERO_ENV_RESOLUTION, LIBERO_ENV_RESOLUTION, 
-                                                                      args.resize_size, args.resize_size)
+                                        sim_eef_pos = sim_eef_pos + action_vec * vis_scale_factor
+
+                                        u_next, v_next = project_point_to_image(
+                                            env.sim,
+                                            sim_eef_pos,
+                                            "agentview",
+                                            LIBERO_ENV_RESOLUTION,
+                                            LIBERO_ENV_RESOLUTION,
+                                            args.resize_size,
+                                            args.resize_size,
+                                        )
                                         predicted_path_pixels.append((u_next, v_next))
-                                    
+
                                     # Draw Red Trajectory (Policy Intent)
                                     for i in range(len(predicted_path_pixels) - 1):
                                         pt1 = predicted_path_pixels[i]
-                                        pt2 = predicted_path_pixels[i+1]
-                                        cv2.line(vis_img, pt1, pt2, (255, 0, 0), 1) # Red line, thickness 1
-                                    
+                                        pt2 = predicted_path_pixels[i + 1]
+                                        cv2.line(vis_img, pt1, pt2, (255, 0, 0), 1)  # Red line, thickness 1
+
                                     # Draw Green Arrow (True Target Direction) - Keep this as reference
                                     vec_to_obj = target_pos_3d - current_eef_pos
                                     if np.linalg.norm(vec_to_obj) > 1e-6:
                                         # Draw a simpler green line to object center
-                                        u_obj, v_obj = project_point_to_image(env.sim, target_pos_3d, "agentview",
-                                                                            LIBERO_ENV_RESOLUTION, LIBERO_ENV_RESOLUTION,
-                                                                            args.resize_size, args.resize_size)
-                                        cv2.arrowedLine(vis_img, (u_start, v_start), (u_obj, v_obj), (0, 255, 0), 2, tipLength=0.1)
+                                        u_obj, v_obj = project_point_to_image(
+                                            env.sim,
+                                            target_pos_3d,
+                                            "agentview",
+                                            LIBERO_ENV_RESOLUTION,
+                                            LIBERO_ENV_RESOLUTION,
+                                            args.resize_size,
+                                            args.resize_size,
+                                        )
+                                        cv2.arrowedLine(
+                                            vis_img, (u_start, v_start), (u_obj, v_obj), (0, 255, 0), 2, tipLength=0.1
+                                        )
 
                                         # Add Text Info
                                         dist_val = np.linalg.norm(vec_to_obj)
-                                        cv2.putText(vis_img, f"Dist: {dist_val:.3f}", (10, 210), 
-                                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-                                        
-                                    
+                                        cv2.putText(
+                                            vis_img,
+                                            f"Dist: {dist_val:.3f}",
+                                            (10, 210),
+                                            cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.4,
+                                            (0, 255, 0),
+                                            1,
+                                        )
+
                                     # Replace the image in replay buffer
                                     replay_images[-1] = vis_img
 
@@ -460,31 +495,30 @@ def eval_libero(args: Args) -> None:
                                 # Calculate simple vector to object
                                 vec_to_obj = target_pos_3d - current_eef_pos
                                 dist_to_obj = np.linalg.norm(vec_to_obj)
-                                
+
                                 # Policy proposed action (delta pos)
                                 policy_action = action_chunk[0][:3]
-                                
+
                                 if np.linalg.norm(policy_action) > 1e-3:
                                     # record policy action magnitude
                                     policy_action_norms.append(np.linalg.norm(policy_action))
                                     policy_dir = policy_action / np.linalg.norm(policy_action)
                                     perfect_dir = vec_to_obj / (dist_to_obj + 1e-6)
-                                    
+
                                     # Cosine similarity (ranges from -1 to 1)
                                     # 1 = perfectly aligned, 0 = perpendicular, -1 = opposite direction
                                     alignment = np.dot(policy_dir, perfect_dir)
-                                    
+
                                     # Optional: use absolute value (angle-only, ignores direction)
                                     # This might be useful if policy actions have inconsistent sign conventions
                                     alignment_for_check = abs(alignment) if args.use_abs_alignment else alignment
                                     alignment_list.append(float(alignment))
-                                    
+
                                     # [Enhanced Analysis] 记录对齐度和距离的关系
-                                    alignment_at_distance.append({
-                                        'distance': float(dist_to_obj),
-                                        'alignment': float(alignment)
-                                    })
-                                    
+                                    alignment_at_distance.append(
+                                        {"distance": float(dist_to_obj), "alignment": float(alignment)}
+                                    )
+
                                     # Improved Takeover Condition:
                                     # 1. If alignment < 0 (moving away from target), always trigger if close
                                     # 2. If alignment < 0.7 (significant misalignment), trigger if close
@@ -492,69 +526,77 @@ def eval_libero(args: Args) -> None:
                                     # 4. Use alignment_for_check which may be absolute value if requested
                                     alignment_threshold = 0.7  # More strict: require better alignment
                                     distance_threshold = 0.15  # Larger: catch issues earlier (15cm instead of 10cm)
-                                    
+
                                     # Check if policy is moving away (negative alignment) or significantly misaligned
                                     # Note: if use_abs_alignment=True, is_moving_away will always be False
                                     is_moving_away = (not args.use_abs_alignment) and (alignment < 0)
                                     is_misaligned = alignment_for_check < alignment_threshold
-                                    
-                                    # Trigger if: (moving away OR misaligned) AND close enough
-                                    if (is_moving_away or is_misaligned) and dist_to_obj < distance_threshold: 
-                                         direction_str = "moving AWAY" if is_moving_away else "misaligned"
-                                         msg = f"3D GUARD: {direction_str} detected! Dist={dist_to_obj:.3f}, CosSim={alignment:.3f}. Policy might miss."
-                                         logging.warning(msg)
-                                         misalignment_warnings += 1
-                                         
-                                         if args.active_3d_takeover:
-                                             logging.info(">>> ACTIVATING 3D TAKEOVER >>> Overriding Action!")
-                                             
-                                             # Improved speed control:
-                                             # 1. Use distance-proportional speed when close (smoother approach)
-                                             # 2. Cap maximum speed to avoid overshooting
-                                             # 3. Use minimum speed to ensure progress
-                                             base_speed = np.linalg.norm(policy_action)
-                                             
-                                             # When very close (<5cm), use smaller proportional speed
-                                             if dist_to_obj < 0.05:
-                                                 # Proportional control: speed decreases as we get closer
-                                                 speed = min(base_speed, dist_to_obj * 2.0)  # Max 0.1 m/s when at 5cm
-                                             else:
-                                                 # Use policy's speed but cap it
-                                                 speed = min(base_speed, 0.08)  # Cap at 8cm per step
-                                             
-                                             # Ensure minimum speed for progress
-                                             speed = max(speed, 0.01)  # At least 1cm per step 
-                                             
-                                             new_action_vec = perfect_dir * speed
-                                             takeover_action_norms.append(np.linalg.norm(new_action_vec))
-                                             num_takeovers += 1
-                                             
-                                             # Overwrite the first step of the chunk (since we replan often)
-                                             # Keep the gripper action (index 6, which is -1 for open usually)
-                                             original_gripper = action_chunk[0][6]
-                                             
-                                             # We need to construct a full 7-dim action
-                                             # Rotation: Keep policy's rotation (indices 3,4,5)? Or zero it?
-                                             # Let's trust policy for rotation, only fix translation.
-                                             fix_action = np.concatenate([new_action_vec, action_chunk[0][3:6], [original_gripper]])
-                                             
-                                             # OVERRIDE
-                                             # action_chunk[0] might be immutable (tuple/read-only numpy), convert to list of numpy arrays if needed
-                                             # or just update the list element.
-                                             # The error "assignment destination is read-only" suggests action_chunk is a read-only numpy array.
-                                             # Make it writable copy first.
-                                             if not action_chunk.flags.writeable:
-                                                action_chunk = action_chunk.copy()
-                                             
-                                             action_chunk[0] = fix_action
-                                             
-                                             # Visual confirmation in video
-                                             cv2.putText(replay_images[-1], "3D TAKEOVER ACTIVE", (50, 50), 
-                                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
-                        
+                                    # Trigger if: (moving away OR misaligned) AND close enough
+                                    if (is_moving_away or is_misaligned) and dist_to_obj < distance_threshold:
+                                        direction_str = "moving AWAY" if is_moving_away else "misaligned"
+                                        msg = f"3D GUARD: {direction_str} detected! Dist={dist_to_obj:.3f}, CosSim={alignment:.3f}. Policy might miss."
+                                        logging.warning(msg)
+                                        misalignment_warnings += 1
+
+                                        if args.active_3d_takeover:
+                                            logging.info(">>> ACTIVATING 3D TAKEOVER >>> Overriding Action!")
+
+                                            # Improved speed control:
+                                            # 1. Use distance-proportional speed when close (smoother approach)
+                                            # 2. Cap maximum speed to avoid overshooting
+                                            # 3. Use minimum speed to ensure progress
+                                            base_speed = np.linalg.norm(policy_action)
+
+                                            # When very close (<5cm), use smaller proportional speed
+                                            if dist_to_obj < 0.05:
+                                                # Proportional control: speed decreases as we get closer
+                                                speed = min(base_speed, dist_to_obj * 2.0)  # Max 0.1 m/s when at 5cm
+                                            else:
+                                                # Use policy's speed but cap it
+                                                speed = min(base_speed, 0.08)  # Cap at 8cm per step
+
+                                            # Ensure minimum speed for progress
+                                            speed = max(speed, 0.01)  # At least 1cm per step
+
+                                            new_action_vec = perfect_dir * speed
+                                            takeover_action_norms.append(np.linalg.norm(new_action_vec))
+                                            num_takeovers += 1
+
+                                            # Overwrite the first step of the chunk (since we replan often)
+                                            # Keep the gripper action (index 6, which is -1 for open usually)
+                                            original_gripper = action_chunk[0][6]
+
+                                            # We need to construct a full 7-dim action
+                                            # Rotation: Keep policy's rotation (indices 3,4,5)? Or zero it?
+                                            # Let's trust policy for rotation, only fix translation.
+                                            fix_action = np.concatenate(
+                                                [new_action_vec, action_chunk[0][3:6], [original_gripper]]
+                                            )
+
+                                            # OVERRIDE
+                                            # action_chunk[0] might be immutable (tuple/read-only numpy), convert to list of numpy arrays if needed
+                                            # or just update the list element.
+                                            # The error "assignment destination is read-only" suggests action_chunk is a read-only numpy array.
+                                            # Make it writable copy first.
+                                            if not action_chunk.flags.writeable:
+                                                action_chunk = action_chunk.copy()
+
+                                            action_chunk[0] = fix_action
+
+                                            # Visual confirmation in video
+                                            cv2.putText(
+                                                replay_images[-1],
+                                                "3D TAKEOVER ACTIVE",
+                                                (50, 50),
+                                                cv2.FONT_HERSHEY_SIMPLEX,
+                                                1.0,
+                                                (0, 255, 255),
+                                                2,
+                                            )
+
                         # [Plan C Analysis] Compute Correction Magnitude
-                        # We compare the action we are about to take (action_chunk[0]) 
+                        # We compare the action we are about to take (action_chunk[0])
                         # with what we *planned* to take at this timestamp in the previous step (prev_full_chunk[1])
                         # This tells us if replanning actually changed the decision.
                         if prev_full_chunk is not None and len(prev_full_chunk) > 1:
@@ -563,7 +605,7 @@ def eval_libero(args: Args) -> None:
                             new_action = np.array(action_chunk[0][:6])
                             diff = np.linalg.norm(new_action - planned_action)
                             corrections.append(diff)
-                        
+
                         prev_full_chunk = action_chunk
 
                         assert (
@@ -598,22 +640,23 @@ def eval_libero(args: Args) -> None:
             )
 
             # Save per-episode metrics to CSV
-            avg_alignment = float(np.mean(alignment_list)) if alignment_list else float('nan')
-            avg_correction = float(np.mean(corrections)) if corrections else float('nan')
-            avg_policy_action_norm = float(np.mean(policy_action_norms)) if policy_action_norms else float('nan')
-            avg_takeover_action_norm = float(np.mean(takeover_action_norms)) if takeover_action_norms else float('nan')
-            
+            avg_alignment = float(np.mean(alignment_list)) if alignment_list else float("nan")
+            avg_correction = float(np.mean(corrections)) if corrections else float("nan")
+            avg_policy_action_norm = float(np.mean(policy_action_norms)) if policy_action_norms else float("nan")
+            avg_takeover_action_norm = float(np.mean(takeover_action_norms)) if takeover_action_norms else float("nan")
+
             # [Enhanced Analysis] 计算新增指标的平均值
-            avg_angle_error = float(np.mean(angle_errors)) if angle_errors else float('nan')
-            avg_distance_error = float(np.mean(distance_errors)) if distance_errors else float('nan')
-            target_in_view_ratio = float(np.mean(target_in_view_list)) if target_in_view_list else float('nan')
-            avg_true_distance = float(np.mean(true_distances)) if true_distances else float('nan')
-            avg_predicted_distance = float(np.mean(predicted_distances)) if predicted_distances else float('nan')
-            
+            avg_angle_error = float(np.mean(angle_errors)) if angle_errors else float("nan")
+            avg_distance_error = float(np.mean(distance_errors)) if distance_errors else float("nan")
+            target_in_view_ratio = float(np.mean(target_in_view_list)) if target_in_view_list else float("nan")
+            avg_true_distance = float(np.mean(true_distances)) if true_distances else float("nan")
+            avg_predicted_distance = float(np.mean(predicted_distances)) if predicted_distances else float("nan")
+
             # 计算接近目标时的对齐度（距离 < 10cm）
-            close_alignments = [a['alignment'] for a in alignment_at_distance 
-                              if a['distance'] < 0.10 and not np.isnan(a['alignment'])]
-            avg_alignment_close = float(np.mean(close_alignments)) if close_alignments else float('nan')
+            close_alignments = [
+                a["alignment"] for a in alignment_at_distance if a["distance"] < 0.10 and not np.isnan(a["alignment"])
+            ]
+            avg_alignment_close = float(np.mean(close_alignments)) if close_alignments else float("nan")
 
             episode_metrics = {
                 "timestamp": datetime.datetime.now().isoformat(),
@@ -650,12 +693,18 @@ def eval_libero(args: Args) -> None:
             if corrections:
                 avg_correction = np.mean(corrections)
                 max_correction = np.max(corrections)
-                logging.info(f"Episode Analysis - Avg Correction: {avg_correction:.4f}, Max Correction: {max_correction:.4f}")
-                if avg_correction > 0.1: # Threshold depends on action scale, typically actions are normalized or small deltas
-                    logging.info("=> HIGH FREQUENCY IMPACT: Large corrections detected. The policy is actively reacting to deviations.")
+                logging.info(
+                    f"Episode Analysis - Avg Correction: {avg_correction:.4f}, Max Correction: {max_correction:.4f}"
+                )
+                if (
+                    avg_correction > 0.1
+                ):  # Threshold depends on action scale, typically actions are normalized or small deltas
+                    logging.info(
+                        "=> HIGH FREQUENCY IMPACT: Large corrections detected. The policy is actively reacting to deviations."
+                    )
                 else:
                     logging.info("=> LOW IMPACT: Corrections are small. The trajectory is stable.")
-            
+
             logging.info(f"Success: {done}")
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
@@ -673,7 +722,7 @@ def eval_libero(args: Args) -> None:
         median_latency = float(np.median(inference_times))
         std_latency = float(np.std(inference_times))
         calls = len(inference_times)
-        recommended_max_freq = 1.0 / mean_latency if mean_latency > 0 else float('inf')
+        recommended_max_freq = 1.0 / mean_latency if mean_latency > 0 else float("inf")
         # Suggest replan_steps so that control freq <= recommended_max_freq
         suggested_replan_steps = max(1, int(math.ceil(20 * mean_latency)))
         logging.info(

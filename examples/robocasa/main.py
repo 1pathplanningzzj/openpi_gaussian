@@ -1,12 +1,13 @@
 import dataclasses
 import logging
-import numpy as np
+
 import imageio
-import robosuite
-import robocasa
-from robosuite.controllers import load_composite_controller_config
+import numpy as np
 from openpi_client import websocket_client_policy as _websocket_client_policy
+import robosuite
+from robosuite.controllers import load_composite_controller_config
 import tyro
+
 
 @dataclasses.dataclass
 class Args:
@@ -16,9 +17,10 @@ class Args:
     max_steps: int = 500
     # Add other arguments as needed
 
+
 def main(args: Args):
     logging.basicConfig(level=logging.INFO)
-    
+
     # Initialize Policy Client
     logging.info(f"Connecting to policy server at {args.host}:{args.port}")
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
@@ -34,7 +36,7 @@ def main(args: Args):
     logging.info(f"Creating environment: {args.env_name}")
     env = robosuite.make(
         **config,
-        has_renderer=False, # Set to True if you want to see the simulation window
+        has_renderer=False,  # Set to True if you want to see the simulation window
         has_offscreen_renderer=True,
         use_camera_obs=True,
         camera_names=["robot0_agentview_center", "robot0_eye_in_hand"],
@@ -46,7 +48,7 @@ def main(args: Args):
 
     obs = env.reset()
     logging.info("Environment reset. Starting inference loop...")
-    
+
     frames = []
 
     for step in range(args.max_steps):
@@ -54,10 +56,10 @@ def main(args: Args):
         # Note: OpenPI usually expects images to be uint8 [0, 255]
         # Robosuite returns images in [0, 255] uint8 usually, but check if they are flipped.
         # Robosuite images are often flipped vertically compared to standard CV2/PIL.
-        
+
         agentview_img = obs["robot0_agentview_center_image"]
         wrist_img = obs["robot0_eye_in_hand_image"]
-        
+
         if step % 2 == 0:
             # Robosuite images are upside down, verify if flipping is needed
             # Usually for saving to video we might want to flip them to look correct
@@ -72,14 +74,14 @@ def main(args: Args):
         # wrist_img = np.flipud(wrist_img)
 
         state = np.concatenate([obs["robot0_joint_pos"], obs["robot0_gripper_qpos"]])
-        
+
         # Construct request for Policy Server
         request = {
             "observation/image": agentview_img,
             "observation/wrist_image": wrist_img,
             "observation/state": state,
             # Instruction should ideally come from the task definition or user input
-            "prompt": "put the object in the cabinet" 
+            "prompt": "put the object in the cabinet",
         }
 
         # 2. Get action from policy
@@ -88,15 +90,15 @@ def main(args: Args):
         response = client.infer(request)
         action = np.array(response["actions"][0])  # Take the first action and make writable
         # logging.info(f"Received action shape: {action.shape}")
-        
+
         # 3. Execute action
         # Note: OpenPI output actions might need denormalization if the model outputs normalized actions.
         # However, if the policy server handles denormalization (which it often does if configured correctly),
         # we can use the action directly.
         # Also check if the action format (delta pos vs absolute pos) matches the controller config.
-        
+
         obs, reward, done, info = env.step(action)
-        
+
         if step % 10 == 0:
             logging.info(f"Step {step}: Reward={reward}")
 
@@ -112,6 +114,7 @@ def main(args: Args):
         logging.error(f"Failed to save video: {e}")
 
     env.close()
+
 
 if __name__ == "__main__":
     main(tyro.cli(Args))

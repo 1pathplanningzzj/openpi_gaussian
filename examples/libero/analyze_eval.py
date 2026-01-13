@@ -2,6 +2,7 @@
 Usage: python examples/libero/analyze_eval.py --dir data/libero_spatial_vis_3d_aware/videos
 It will read any CSV files in the directory, combine them, and print/group simple statistics by takeover flag.
 """
+
 import argparse
 import csv
 import pathlib
@@ -17,7 +18,7 @@ except Exception:
 def read_csvs_in_dir(d: pathlib.Path):
     rows = []
     for p in d.glob("*.csv"):
-        with open(p, "r") as f:
+        with open(p) as f:
             reader = csv.DictReader(f)
             for r in reader:
                 rows.append({k: (float(v) if v not in ("", "nan") and is_number(v) else v) for k, v in r.items()})
@@ -47,7 +48,17 @@ def summarize(rows):
         successes = [int(v.get("success", 0)) for v in vals]
         success_rate = sum(successes) / len(successes)
         avg_takeovers = statistics.mean([float(v.get("num_takeovers", 0)) for v in vals])
-        avg_alignment = statistics.mean([float(v.get("avg_alignment", float('nan'))) for v in vals if v.get("avg_alignment") not in (None, '', 'nan')]) if any(v.get("avg_alignment") not in (None, '', 'nan') for v in vals) else float('nan')
+        avg_alignment = (
+            statistics.mean(
+                [
+                    float(v.get("avg_alignment", float("nan")))
+                    for v in vals
+                    if v.get("avg_alignment") not in (None, "", "nan")
+                ]
+            )
+            if any(v.get("avg_alignment") not in (None, "", "nan") for v in vals)
+            else float("nan")
+        )
         summary[k] = {
             "n": len(vals),
             "success_rate": success_rate,
@@ -62,7 +73,10 @@ def plot_summary(summary, out_path: pathlib.Path):
         print("matplotlib not available, skipping plots")
         return
     labels = ["baseline", "takeover"]
-    rates = [summary.get(0, {}).get("success_rate", 0) if summary.get(0) else 0, summary.get(1, {}).get("success_rate", 0) if summary.get(1) else 0]
+    rates = [
+        summary.get(0, {}).get("success_rate", 0) if summary.get(0) else 0,
+        summary.get(1, {}).get("success_rate", 0) if summary.get(1) else 0,
+    ]
     plt.figure(figsize=(4, 3))
     plt.bar(labels, rates, color=["#2b8cbe", "#7b3294"])
     plt.ylim(0, 1)
@@ -96,9 +110,12 @@ def main():
         if s is None:
             print("  no data")
         else:
-            print(f"  n={s['n']}, success_rate={s['success_rate']:.3f}, avg_takeovers={s['avg_takeovers']:.2f}, avg_alignment={s['avg_alignment']:.3f}")
+            print(
+                f"  n={s['n']}, success_rate={s['success_rate']:.3f}, avg_takeovers={s['avg_takeovers']:.2f}, avg_alignment={s['avg_alignment']:.3f}"
+            )
 
     plot_summary(summary, d)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
