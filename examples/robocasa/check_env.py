@@ -1,7 +1,7 @@
-import robosuite
-import robocasa
-from robosuite.controllers import load_composite_controller_config
 import numpy as np
+import robosuite
+from robosuite.controllers import load_composite_controller_config
+
 
 def main():
     config = {
@@ -24,12 +24,13 @@ def main():
 
     obs = env.reset()
     print("Observation keys:", obs.keys())
-    
+
     for k, v in obs.items():
         if isinstance(v, np.ndarray):
             print(f"{k}: {v.shape}")
         else:
             print(f"{k}: {type(v)}")
+
 
 if __name__ == "__main__":
     main()

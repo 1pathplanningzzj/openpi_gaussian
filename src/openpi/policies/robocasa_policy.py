@@ -70,7 +70,7 @@ class RobocasaOutputs(transforms.DataTransformFn):
     """
     Transforms model outputs back to Robocasa format.
     """
-    
+
     # Robocasa action dim (e.g. 12 for mobile manipulation)
     action_dim: int = 12
 
