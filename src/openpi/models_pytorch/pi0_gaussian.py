@@ -101,7 +101,7 @@ class GaussianAdapter(nn.Module):
         self.proj = None
         self.pool = None
         self.predictor = None # Future Predictor
-        
+    
         if self.use_gaussian and DF3DGS_LITModelModule is not None:
             logging.info("Initializing 3DGS Components in Adapter...")
             # Config based on AD-FFgsStudio requirements
@@ -247,7 +247,13 @@ class GaussianAdapter(nn.Module):
 
             mask = masks_dict.get(name)
             # If mask is None, assume valid. If mask is present, check first element.
-            if mask is None or mask[0].item():
+            # Avoid .item() to minimize graph break noise, though control flow on tensor is still a break.
+            if mask is None or (mask[0] > 0.5):
+                # [Fix] Normalize if input is uint8 (0-255) to float [-1, 1]
+                # This ensures compatibility with Backbones/Pre-trained models that expect normalized floats.
+                if img.dtype == torch.uint8:
+                    img = img.to(torch.float32) / 127.5 - 1.0
+                
                 valid_imgs.append(img)
                 
         # Fallback: If filtering removed everything (unlikely), try to use whatever is available
