@@ -56,7 +56,8 @@ class GaussianPredictor(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, gaussian_dim) # Output vector field
         )
-
+        # linear + Silu v1 for model test
+        # todo zijian 0121 fix and enhance it #
     def forward(self, x_t, transformer_features, actions, t):
         """
         x_t: [B, N, D] - Noisy Future Gaussian Tokens (or flattened)
@@ -192,173 +193,21 @@ class GaussianAdapter(nn.Module):
         else:
             self.use_gaussian = False
 
-    def encode(self, observation, device, batch_size):
-        """Pure encoding step to get Gaussian features (no projection/adapter logic)."""
-        valid_imgs = self.prepare_inputs(observation, device, batch_size)
-        if valid_imgs is None:
-            return None
-            
-        with torch.no_grad():
-            # Stack: [B, N_views, C, H, W]
-            # prepare_inputs returns list of [B, C, H, W] tensors
-            # We need to stack them.
-            # Assuming batch size 1 for now based on prepare_inputs
-            imgs_stack = torch.stack(valid_imgs, dim=1) # [B, N, C, H, W]
-            
-            # Encoder Expects: inputs, K, E
-            # We create dummy K and E if needed or rely on internal defaults
-            # The prepared inputs are already valid AgentView images.
-            # We need to construct the input dictionary expected by DepthNetwork
-            
-            # NOTE: Simplified for brevity. Logic assumes `encoder` handles this structure.
-            # In update we filtered intrinsics.
-            # We call encoder directly
-            encoded_feats = self.encoder(imgs_stack, None, None) # Pass None for K/E if using fixed internals
-            
-            # Encoded feats is likely a voxel grid or feature map
-            # Use pool to reduce
-            return self.pool(encoded_feats) # [B, Dim, 4, 4] -> Flatten later
-
-
-
-    def prepare_inputs(self, observation, device, batch_size):
-        """Helper to prepare inputs for 3DGS encoder from observation.
-        
-        NOTE: Modified to ONLY use AgentView cameras to avoid extrinsic mismatch issues.
-        Wrist cameras are filtered out because we lack dynamic extrinsics for them.
-        """
-        if not self.use_gaussian:
-            return None
-            
-        # Extract images from observation
-        images_dict = observation.images
-        masks_dict = observation.image_masks
-        
-        valid_imgs = []
-        
-        # Filter valid images based on masks AND camera type (AgentView only)
-        # We explicitly skip wrist/eye-in-hand cameras for the Gaussian Encoder
-        # because we don't have their real-time extrinsics.
-        for name, img in images_dict.items():
-            # Check if this is a wrist camera
-            is_wrist = "wrist" in name or "eye" in name or "hand" in name
-            if is_wrist:
-                continue
-
-            mask = masks_dict.get(name)
-            # If mask is None, assume valid. If mask is present, check first element.
-            # Avoid .item() to minimize graph break noise, though control flow on tensor is still a break.
-            if mask is None or (mask[0] > 0.5):
-                # [Fix] Normalize if input is uint8 (0-255) to float [-1, 1]
-                # This ensures compatibility with Backbones/Pre-trained models that expect normalized floats.
-                if img.dtype == torch.uint8:
-                    img = img.to(torch.float32) / 127.5 - 1.0
-                
-                valid_imgs.append(img)
-                
-        # Fallback: If filtering removed everything (unlikely), try to use whatever is available
-        # But prefer crashing or using empty to avoiding bad geometry. 
-        # For now, let's fallback to first available if empty, but log warning.
-        if not valid_imgs:
-            logging.warning("GaussianAdapter: No AgentView images found! Falling back to all images.")
-            valid_imgs = list(images_dict.values())
-
-        if not valid_imgs:
-            return None
-
-        # Determine target size dynamically from data
-        if valid_imgs:
-             target_h, target_w = valid_imgs[0].shape[-2:]
-        else:
-             target_h, target_w = 224, 224
-        
-        processed_imgs = []
-        for img in valid_imgs:
-             if img.shape[-2:] != (target_h, target_w):
-                 img = F.interpolate(img, size=(target_h, target_w), mode='bilinear', align_corners=False)
-             processed_imgs.append(img)
-             
-        # Pad to 3 cameras if needed (DF3DGS expects fixed num_cams usually)
-        # Since we likely only have 1 AgentView, this will replicate it 3 times.
-        # This is valid: it's like having 3 cameras at exactly the same spot.
-        num_cams = 3
-        current_count = len(processed_imgs)
-        if current_count < num_cams:
-            infinite_imgs = itertools.cycle(processed_imgs)
-            processed_imgs_padded = [next(infinite_imgs) for _ in range(num_cams)]
-            processed_imgs = processed_imgs_padded
-        elif current_count > num_cams:
-            processed_imgs = processed_imgs[:num_cams]
-            
-        # Stack: [B, N, 3, H, W]
-        img_stack = torch.stack(processed_imgs, dim=1)
-        
-        # Prepare other inputs
-        masks = torch.ones(batch_size, num_cams, 1, target_h, target_w, device=device)
-        
-        # Hardcode Intrinsics
-        # Since we filtered out wrist cameras, we only use AgentView intrinsics.
-        # Agentview (45 deg FoV) -> f=309.0 for 256x256
-        
-        scale = target_h / 256.0
-        f_agent = 309.0 * scale
-        cx = target_w / 2.0
-        cy = target_h / 2.0
-        
-        # Consistent K for all inputs (since they are all AgentView)
-        K_agent_t = torch.tensor([
-            [f_agent, 0, cx],
-            [0, f_agent, cy],
-            [0, 0, 1]
-        ], device=device)
-        
-        # Replicate K for all 'cameras' (including padded ones)
-        K = K_agent_t.unsqueeze(0).unsqueeze(0).repeat(batch_size, num_cams, 1, 1) # [B, N, 3, 3]
-
-        # Extrinsics: Identity is now CORRECT because we define the single AgentView 
-        # to be the origin of our reconstruction coordinate system.
-        extr = torch.eye(4, device=device).view(1, 1, 4, 4).repeat(batch_size, num_cams, 1, 1)
-        
-        inputs = {
-            ('color_aug', 0): img_stack,
-            ('color_aug', -1): img_stack,
-            ('color_aug', 1): img_stack,
-            'mask': masks,
-            'K': K,
-            'c2e_extr': extr,
-            'e2c_extr': extr, 
-        }
-        return inputs
-
-    def forward(self, gaussian_inputs):
-        """
-        Processes gaussian inputs and returns embeddings and attention masks.
-        Returns:
-            embs: [B, N_tokens, Dim]
-            mask: [B, N_tokens]
-        """
-        if not self.use_gaussian or gaussian_inputs is None:
-            return None, None
-
-        with torch.no_grad():
-             # Run frozen encoder
-             outputs = self.encoder(gaussian_inputs)
-             
-             # Extract features
-             feats_list = []
-             # Assuming 3 cameras
-             for cam_idx in range(3): 
-                 key = ('cam', cam_idx)
-                 if key in outputs:
-                     feat_maps = outputs[key].get(('img_feat', 0, 0))
-                     if feat_maps:
-                         feat = feat_maps[-1] # [B, C, H, W]
-                         feats_list.append(feat)
+    def _extract_features(self, outputs):
+        feats_list = []
+        # Assuming 3 cameras (same logic as before)
+        for cam_idx in range(3): 
+            key = ('cam', cam_idx)
+            if key in outputs:
+                # Use scale 0 for highest res features 
+                feat_maps = outputs[key].get(('img_feat', 0, 0))
+                if feat_maps is not None:
+                     feat = feat_maps[-1]
+                     feats_list.append(feat)
 
         if not feats_list:
-            logging.warning("No features extracted from Gaussian Encoder.")
-            return None, None
-
+            return None
+            
         feats_stacked = torch.stack(feats_list, dim=1) # [B, N, C, H, W]
         B_val, N, C, H, W = feats_stacked.shape
         
@@ -374,7 +223,232 @@ class GaussianAdapter(nn.Module):
         # Reshape back: [B, N*K, C]
         gaussian_raw_embs = feats_tokens.contiguous().view(B_val, -1, C)
         
-        # Project (Learnbale)
+        return gaussian_raw_embs
+
+    def encode(self, observation, device, batch_size):
+        """Pure encoding step to get Gaussian features (no projection)."""
+        inputs = self.prepare_inputs(observation, device, batch_size)
+        if inputs is None:
+            return None
+            
+        with torch.no_grad():
+            outputs = self.encoder(inputs, MF_frames=[-1, 1])
+            return self._extract_features(outputs)
+
+
+
+    def _compute_camera_extrinsics(self, state):
+        """Computes World-to-Camera extrinsics (C2W) from robot state (EE Pose)."""
+        device = state.device
+        dtype = state.dtype
+        B = state.shape[0]
+        
+        # State: [B, 8] -> [x, y, z, euler_x, euler_y, euler_z, gripper...]
+        pos = state[:, :3] # [B, 3] Position (meters)
+        euler = state[:, 3:6] # [B, 3] Euler Angles (XYZ order, radians)
+        
+        # Pure PyTorch Euler XYZ -> Rotation Matrix
+        # R = R_z @ R_y @ R_x (Extrinsic XYZ)
+        x = euler[:, 0]
+        y = euler[:, 1]
+        z = euler[:, 2]
+        
+        cx, sx = torch.cos(x), torch.sin(x)
+        cy, sy = torch.cos(y), torch.sin(y)
+        cz, sz = torch.cos(z), torch.sin(z)
+        
+        # R_x:
+        # [1, 0, 0]
+        # [0, cx, -sx]
+        # [0, sx, cx]
+        rx = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
+        rx[:, 1, 1] = cx
+        rx[:, 1, 2] = -sx
+        rx[:, 2, 1] = sx
+        rx[:, 2, 2] = cx
+        
+        # R_y:
+        # [cy, 0, sy]
+        # [0, 1, 0]
+        # [-sy, 0, cy]
+        ry = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
+        ry[:, 0, 0] = cy
+        ry[:, 0, 2] = sy
+        ry[:, 2, 0] = -sy
+        ry[:, 2, 2] = cy
+        
+        # R_z:
+        # [cz, -sz, 0]
+        # [sz, cz, 0]
+        # [0, 0, 1]
+        rz = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
+        rz[:, 0, 0] = cz
+        rz[:, 0, 1] = -sz
+        rz[:, 1, 0] = sz
+        rz[:, 1, 1] = cz
+        
+        # R = R_z @ R_y @ R_x
+        rot_mat = rz @ ry @ rx
+
+        # C2W Pose (World-to-Camera Transform IS the Pose of Camera in World)
+        # So T_c2w = [R|t]
+        T_c2w = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
+        T_c2w[:, :3, :3] = rot_mat
+        T_c2w[:, :3, 3] = pos
+        
+        return T_c2w
+
+    def prepare_inputs(self, observation, device, batch_size):
+        """Helper to prepare inputs for 3DGS encoder from observation.
+        
+        Modified for Temporal 3DGS:
+        - Accepts wrist camera images at t-1, t, t+1.
+        - Computes extrinsics from robot state.
+        """
+        if not self.use_gaussian:
+            return None
+            
+        images_dict = observation.images
+        masks_dict = observation.image_masks
+        
+        # Find wrist camera
+        wrist_key = None
+        for name in images_dict.keys():
+            if "wrist" in name or "eye" in name or "hand" in name:
+                wrist_key = name
+                break
+                
+        if wrist_key is None:
+            logging.warning("GaussianAdapter: No Wrist camera found! Skipping 3DGS.")
+            return None
+            
+        # Get Images: Expected [B, T=3, C, H, W]
+        # If T dim is missing (B, C, H, W) -> unsqueeze to (B, 1, C, H, W) and handle gracefully
+        imgs = images_dict[wrist_key]
+        if imgs.ndim == 5:
+            # [B, T, C, H, W]
+            pass
+        elif imgs.ndim == 4:
+            # [B, C, H, W] -> [B, 1, C, H, W]
+            imgs = imgs.unsqueeze(1)
+        else:
+             logging.error(f"Unexpected image shape: {imgs.shape}")
+             return None
+             
+        # Normalize if uint8
+        if imgs.dtype == torch.uint8:
+            imgs = imgs.to(torch.float32) / 127.5 - 1.0
+
+        # Resize if needed
+        # Assuming we need 224x224
+        target_h, target_w = 224, 224
+        if imgs.shape[-2:] != (target_h, target_w):
+             B, T, C, H, W = imgs.shape
+             imgs_flat = imgs.view(B*T, C, H, W)
+             imgs_flat = F.interpolate(imgs_flat, size=(target_h, target_w), mode='bilinear', align_corners=False)
+             imgs = imgs_flat.view(B, T, C, target_h, target_w)
+             
+        # Extract slices
+        # Data Loader returns [-1, 0, 1]. Size 3.
+        # If size < 3, we replicate.
+        T = imgs.shape[1]
+        if T == 3:
+            img_prev = imgs[:, 0]
+            img_curr = imgs[:, 1]
+            img_next = imgs[:, 2]
+        else:
+            # Fallback
+            img_curr = imgs[:, 0]
+            img_prev = img_curr
+            img_next = img_curr
+            
+        # Extrinsics
+        # Expect state: [B, T, 8]
+        if not hasattr(observation, "state"):
+             logging.warning("No state found for extrinsics!")
+             return None
+        
+        state = observation.state # [B, T, 8] or [B, 8]
+        # Force float32 for compatibility with AD-FFgsStudio (avoid Double vs Float matmul error)
+        if state.dtype != torch.float32:
+            state = state.to(dtype=torch.float32)
+
+        if state.ndim == 2:
+             state = state.unsqueeze(1)
+             
+        T_state = state.shape[1]
+        if T_state == 3:
+             state_prev = state[:, 0]
+             state_curr = state[:, 1]
+             state_next = state[:, 2]
+        else:
+             state_curr = state[:, 0]
+             state_prev = state_curr
+             state_next = state_curr
+             
+        ext_prev = self._compute_camera_extrinsics(state_prev)
+        ext_curr = self._compute_camera_extrinsics(state_curr)
+        ext_next = self._compute_camera_extrinsics(state_next)
+        
+        # Prepare Inputs Dict
+        # Need to replicate to num_cams=3 for DF3DGS compatibility
+        num_cams = 3
+        
+        def replicate(tensor, n):
+             # tensor: [B, ...] -> [B, N, ...]
+             return tensor.unsqueeze(1).repeat(1, n, *([1]*(tensor.ndim-1)))
+
+        # K intrinsics (Approximate or use placeholder)
+        # Wrist camera K. 
+        # TODO: Read from calibration if possible. For now, Use 45 deg FOV approx/Identity.
+        f = 0.5 * target_w / 0.41421356 # tan(22.5 deg)
+        K_mat = torch.eye(3, device=device, dtype=torch.float32)
+        K_mat[0, 0] = f
+        K_mat[1, 1] = f
+        K_mat[0, 2] = target_w / 2
+        K_mat[1, 2] = target_h / 2
+        K = replicate(K_mat.unsqueeze(0).repeat(batch_size, 1, 1), num_cams)
+        
+        # Masks
+        masks = torch.ones(batch_size, num_cams, 1, target_h, target_w, device=device)
+        
+        # Stack Temporal Frames as Spatial Views (Cam0=Prev, Cam1=Curr, Cam2=Next)
+        img_stack = torch.stack([img_prev, img_curr, img_next], dim=1)
+        extr_stack = torch.stack([ext_prev, ext_curr, ext_next], dim=1)
+        
+        inputs = {
+            # Provide the stacked temporal frames as the "current" observation
+            ('color_aug', 0): img_stack,
+            # Duplicate for temporal keys to avoid errors if MF mode is used
+            ('color_aug', -1): img_stack,
+            ('color_aug', 1): img_stack,
+            'mask': masks,
+            'K': K,
+            # Use real temporal extrinsics
+            'c2e_extr': extr_stack,
+            'e2c_extr': torch.linalg.inv(extr_stack)
+        }
+        
+        return inputs
+
+    def forward(self, gaussian_inputs):
+        """
+        Processes gaussian inputs (from prepare_inputs) and returns embeddings.
+        """
+        if not self.use_gaussian or gaussian_inputs is None:
+            return None, None
+
+        with torch.no_grad():
+             # Run frozen encoder with MF Frames
+             outputs = self.encoder(gaussian_inputs, MF_frames=[-1, 1])
+             
+             gaussian_raw_embs = self._extract_features(outputs)
+             
+        if gaussian_raw_embs is None:
+            logging.warning("No features extracted from Gaussian Encoder.")
+            return None, None
+        
+        # Project
         gaussian_embs = self.proj(gaussian_raw_embs)
         
         # Prepare masks

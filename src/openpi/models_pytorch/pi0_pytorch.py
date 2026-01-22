@@ -1,3 +1,6 @@
+# zijian
+# date 2026.01.19
+# Description: Main PI0 PyTorch model implementation with integrated 3D Gaussian Splatting (DF3DGS) support.
 import logging
 import math
 
@@ -9,6 +12,7 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.pi0_gaussian import GaussianAdapter
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -41,7 +45,7 @@ def create_sinusoidal_pos_embedding(
     sin_input = scaling_factor[None, :] * time[:, None]
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
 
-
+# Timestep Sampling Schedule
 def sample_beta(alpha, beta, bsize, device):
     alpha_t = torch.as_tensor(alpha, dtype=torch.float32, device=device)
     beta_t = torch.as_tensor(beta, dtype=torch.float32, device=device)
@@ -114,6 +118,12 @@ class PI0Pytorch(nn.Module):
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
+        # --- 3D Gaussian Integration ---
+        use_gaussian = getattr(config, "use_gaussian", False)
+        # Typically Gaussian features join the prefix, so they must match the VLM width
+        self.gaussian_adapter = GaussianAdapter(use_gaussian, paligemma_config.width)
+        # -------------------------------
+
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         try:
             from transformers.models.siglip import check
@@ -160,6 +170,22 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
+        
+        # --- Handle Future Split for 3DGS World Model ---
+        future_observation = None
+        # Check if first image has T=2 (ndim=5)
+        # Note: We access observation.images which is a dict of arrays
+        if observation.images and next(iter(observation.images.values())).ndim == 5:
+             curr_imgs, fut_imgs = {}, {}
+             for k, v in observation.images.items():
+                 curr_imgs[k] = v[:, 0]
+                 fut_imgs[k] = v[:, 1]
+                 
+             # Clone observation for future
+             future_observation = observation.replace(images=fut_imgs)
+             # Update current observation
+             observation = observation.replace(images=curr_imgs)
+
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
         return (
             list(observation.images.values()),
@@ -167,6 +193,7 @@ class PI0Pytorch(nn.Module):
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
             observation.state,
+            future_observation
         )
 
     def sample_noise(self, shape, device):
@@ -184,7 +211,7 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, gaussian_inputs=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -192,6 +219,17 @@ class PI0Pytorch(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+        
+        # --- 3D Gaussian Encoder ---
+        # Delegated to Adapter
+        gaussian_embs, g_mask = self.gaussian_adapter(gaussian_inputs)
+        
+        if gaussian_embs is not None:
+             embs.append(gaussian_embs)
+             pad_masks.append(g_mask)
+             # Attention: 3DGS tokens act as context
+             g_len = gaussian_embs.shape[1]
+             att_masks += [0] * g_len
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
@@ -313,9 +351,13 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
+    def _prepare_gaussian_inputs(self, observation, device, batch_size):
+        """Helper to prepare inputs for 3DGS encoder from observation."""
+        return self.gaussian_adapter.prepare_inputs(observation, device, batch_size)
+
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state, future_observation_unpacked = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -326,8 +368,16 @@ class PI0Pytorch(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
+        
+        # Prepare Gaussian Inputs
+        gaussian_inputs = None
+        # Check against adapter flag
+        if self.gaussian_adapter.use_gaussian:
+            gaussian_inputs = self._prepare_gaussian_inputs(observation, actions.device, actions.shape[0])
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, gaussian_inputs=gaussian_inputs
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -370,7 +420,72 @@ class PI0Pytorch(nn.Module):
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        loss = F.mse_loss(u_t, v_t, reduction="none")
+
+        # --- Future Prediction (World Model) ---
+        # If enabled and input provided, compute "Action Conditioned Prediction" loss
+        # We need next_step_observation which is now unpacked from preprocessing if available (from Dataloader t+1 sequence)
+        future_observation = future_observation_unpacked
+        
+        if self.gaussian_adapter.use_gaussian and future_observation is not None:
+            # 1. Encode Ground Truth Future
+            # Encode future observation to get Target Latents Z_{t+1}
+            target_latents = self.gaussian_adapter.encode(future_observation, actions.device, actions.shape[0])
+            
+            if target_latents is not None:
+                # target_latents: [B, D, 4, 4] -> Flatten to [B, N=16, D]
+                bsize, dim, h, w = target_latents.shape
+                target_latents = target_latents.view(bsize, dim, -1).transpose(1, 2) # [B, 16, D]
+                
+                # 2. Sample Flow Matching Noise
+                fm_noise = torch.randn_like(target_latents)
+                
+                # 3. Interpolate (Flow Matching)
+                # We use the same 'time' sampled for action (or sample new one, but same is fine for efficiency)
+                # x_t (future) = t * noise + (1-t) * data
+                t_expanded = time_expanded # [B, 1, 1]
+                noisy_future = t_expanded * fm_noise + (1 - t_expanded) * target_latents
+                target_flow = fm_noise - target_latents # Vector from Data to Noise
+                
+                # 4. Prepare Conditions
+                # Condition: Transformer Features (suffix_out) + Actions
+                # suffix_out: [B, Horizon, Width]
+                # actions: [B, Horizon, ActionDim]
+                # We flatten both to form a global context vector
+                flat_features = suffix_out.reshape(bsize, -1)
+                flat_actions = actions.reshape(bsize, -1)
+                
+                # 5. Predict
+                pred_flow = self.gaussian_adapter.predictor(
+                    x_t=noisy_future,
+                    transformer_features=flat_features,
+                    actions=flat_actions,
+                    t=time
+                )
+                
+                # 6. Loss
+                future_loss = F.mse_loss(pred_flow, target_flow, reduction="none")
+                # Combine losses (weighted sum or simple sum)
+                # future_loss might reduce differently, ensure broadcasting if needed
+                # loss is [B, T, D_a], future_loss is [B, N, D_g]
+                # We return mean scalars usually, or return dict. 
+                # PI0 returns loss tensor. We should probably add this to the total loss.
+                # However, F.mse_loss with reduction='none' returns tensor.
+                # The caller expects [B, T, D] or similar. 
+                # To avoid breaking shape expectations, we might need to handle this upstream.
+                # For now, let's assume we simply add the mean of future loss to the mean of action loss
+                # But `loss` here IS returned.
+                
+                # HACK: If we return a tuple, existing code might break.
+                # We can return (action_loss + future_loss_mean) if compatible.
+                # Or, attach it to the storage if needed.
+                # Since the user asked for design, let's return a Combined Loss if possible
+                # But the signature is `-> Tensor`.
+                # We will add the mean of future loss to every element of `loss` to propagate gradient.
+                future_loss_mean = future_loss.mean(dim=[1, 2]).view(bsize, 1, 1) # [B, 1, 1]
+                loss = loss + future_loss_mean
+
+        return loss
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
@@ -380,9 +495,16 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, _ = self._preprocess_observation(observation, train=False)
+        
+        gaussian_inputs = None
+        if self.gaussian_adapter.use_gaussian:
+            # For inference, observation images should be sufficient
+            gaussian_inputs = self._prepare_gaussian_inputs(observation, device, bsize)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, gaussian_inputs=gaussian_inputs
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -397,7 +519,7 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
-
+        
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
