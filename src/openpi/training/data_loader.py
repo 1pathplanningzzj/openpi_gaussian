@@ -137,12 +137,29 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.dataset_root)
+    
+    # Calculate delta timestamps
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+    
+    # Detect image keys from features
+    image_keys = [k for k, f in dataset_meta.features.items() if k.startswith("observation.images")]
+    # Request Previous (-1), Current (0.0) and Next (1) frame for images and state
+    # This enables Temporal 3DGS training with history and future context
+    for key in image_keys:
+        delta_timestamps[key] = [-1.0 / dataset_meta.fps, 0.0, 1.0 / dataset_meta.fps]
+        
+    # Also request temporal state
+    state_key = "observation.state"
+    if state_key in dataset_meta.features:
+         delta_timestamps[state_key] = [-1.0 / dataset_meta.fps, 0.0, 1.0 / dataset_meta.fps]
+
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+        root=data_config.dataset_root,
+        delta_timestamps=delta_timestamps,
     )
 
     if data_config.prompt_from_task:

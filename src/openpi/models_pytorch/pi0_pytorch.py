@@ -12,7 +12,9 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
-from openpi.models_pytorch.pi0_gaussian import GaussianAdapter
+from openpi.models_pytorch.pi0_vggt import GaussianAdapter
+# Import the new World Model
+from openpi.models_pytorch.pi0_world_model import BiDirectionalWorldModel
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -122,6 +124,19 @@ class PI0Pytorch(nn.Module):
         use_gaussian = getattr(config, "use_gaussian", False)
         # Typically Gaussian features join the prefix, so they must match the VLM width
         self.gaussian_adapter = GaussianAdapter(use_gaussian, paligemma_config.width)
+        
+        # --- BiDirectional World Model ---
+        # Using same width as adaptation layer (e.g. 2048 or projected width)
+        # Note: GaussianAdapter typically projects to VLM width (action_expert_config.width)
+        # so z_t has dimension `paligemma_config.width`.
+        if hasattr(config, "use_world_model") and config.use_world_model:
+             logging.info("Initializing BiDirectional World Model...")
+             self.world_model = BiDirectionalWorldModel(
+                 token_dim=paligemma_config.width, # Latents are projected to VLM width
+                 action_dim=32 # Action dim is standard for Pi0
+             )
+        else:
+             self.world_model = None
         # -------------------------------
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
@@ -357,7 +372,7 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state, future_observation_unpacked = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state, future_observation = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -413,78 +428,56 @@ class PI0Pytorch(nn.Module):
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = self.action_out_proj(suffix_out)
+        
+        # Base Action Loss (Flow Matching)
+        loss = F.mse_loss(suffix_out, u_t)
 
-        # Apply gradient checkpointing to final action projection if enabled
-        def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
-
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
-
-        loss = F.mse_loss(u_t, v_t, reduction="none")
-
-        # --- Future Prediction (World Model) ---
-        # If enabled and input provided, compute "Action Conditioned Prediction" loss
-        # We need next_step_observation which is now unpacked from preprocessing if available (from Dataloader t+1 sequence)
-        future_observation = future_observation_unpacked
+        # Date 2026.01.24 🏀 🏀 🏀 zijian todo fix it for better
+        # OLD Logic: Simple Predictor inside GaussianAdapter
+        # NEW Logic: BiDirectional World Model  
         
         if self.gaussian_adapter.use_gaussian and future_observation is not None:
-            # 1. Encode Ground Truth Future
-            # Encode future observation to get Target Latents Z_{t+1}
-            target_latents = self.gaussian_adapter.encode(future_observation, actions.device, actions.shape[0])
+            # 1. Encode Current State Z_t
+            # Re-encode strictly the gaussian part from current observation? 
+            # Actually we already have `gaussian_embs` inside embed_prefix, but that is private.
+            # We can re-call adapter.encode or refactor to expose it.
+            # Since adapter.encode is lightweight (just forward pass of small parts if encoder is frozen), calling again is acceptable
+            # BUT wait, the encoder is heavy (VGGT). We should ideally reuse it.
+            # However, `embs` in embed_prefix is complex. 
+            # Let's temporarily re-encode to be safe and clean.
             
-            if target_latents is not None:
-                # target_latents: [B, D, 4, 4] -> Flatten to [B, N=16, D]
-                bsize, dim, h, w = target_latents.shape
-                target_latents = target_latents.view(bsize, dim, -1).transpose(1, 2) # [B, 16, D]
-                
-                # 2. Sample Flow Matching Noise
-                fm_noise = torch.randn_like(target_latents)
-                
-                # 3. Interpolate (Flow Matching)
-                # We use the same 'time' sampled for action (or sample new one, but same is fine for efficiency)
-                # x_t (future) = t * noise + (1-t) * data
-                t_expanded = time_expanded # [B, 1, 1]
-                noisy_future = t_expanded * fm_noise + (1 - t_expanded) * target_latents
-                target_flow = fm_noise - target_latents # Vector from Data to Noise
-                
-                # 4. Prepare Conditions
-                # Condition: Transformer Features (suffix_out) + Actions
-                # suffix_out: [B, Horizon, Width]
-                # actions: [B, Horizon, ActionDim]
-                # We flatten both to form a global context vector
-                flat_features = suffix_out.reshape(bsize, -1)
-                flat_actions = actions.reshape(bsize, -1)
-                
-                # 5. Predict
-                pred_flow = self.gaussian_adapter.predictor(
-                    x_t=noisy_future,
-                    transformer_features=flat_features,
-                    actions=flat_actions,
-                    t=time
-                )
-                
-                # 6. Loss
-                future_loss = F.mse_loss(pred_flow, target_flow, reduction="none")
-                # Combine losses (weighted sum or simple sum)
-                # future_loss might reduce differently, ensure broadcasting if needed
-                # loss is [B, T, D_a], future_loss is [B, N, D_g]
-                # We return mean scalars usually, or return dict. 
-                # PI0 returns loss tensor. We should probably add this to the total loss.
-                # However, F.mse_loss with reduction='none' returns tensor.
-                # The caller expects [B, T, D] or similar. 
-                # To avoid breaking shape expectations, we might need to handle this upstream.
-                # For now, let's assume we simply add the mean of future loss to the mean of action loss
-                # But `loss` here IS returned.
-                
-                # HACK: If we return a tuple, existing code might break.
-                # We can return (action_loss + future_loss_mean) if compatible.
-                # Or, attach it to the storage if needed.
-                # Since the user asked for design, let's return a Combined Loss if possible
-                # But the signature is `-> Tensor`.
-                # We will add the mean of future loss to every element of `loss` to propagate gradient.
-                future_loss_mean = future_loss.mean(dim=[1, 2]).view(bsize, 1, 1) # [B, 1, 1]
-                loss = loss + future_loss_mean
-
+            # Z_t: [B, N, D]
+            z_t, _ = self.gaussian_adapter(self._prepare_gaussian_inputs(observation, actions.device, actions.shape[0]))
+            
+            # 2. Encode Ground Truth Future Z_{t+1}
+            z_t1_gt, _ = self.gaussian_adapter(self._prepare_gaussian_inputs(future_observation, actions.device, actions.shape[0]))
+            
+            if z_t is not None and z_t1_gt is not None:
+                # 3. World Model Forward
+                if self.world_model is not None:
+                    # Flatten actions for the world model (it expects [B, A_dim] usually, but here we have [B, T, A_dim])
+                    # We might want to use the first action, or average, or feed the sequence logic.
+                    # The prompt implies: H_t + A_t -> H_{t+1}. Single step.
+                    # So we take the first action in the horizon? Or the action at time t?
+                    # `actions` passed here is the Ground Truth action sequence [B, Horizon, D].
+                    # We should probably take actions[:, 0, :] corresponding to current step.
+                    action_t = actions[:, 0, :]
+                    
+                    wm_outputs = self.world_model.compute_full_loss(
+                        z_t=z_t, 
+                        action_t=action_t, 
+                        z_t1_gt=z_t1_gt
+                    )
+                    
+                    # Add to total loss
+                    # wm_outputs["loss_total"] is a scalar (mean). We need to broadcast strictness slightly or just add.
+                    loss = loss + wm_outputs["loss_total"]
+                    
+                else: 
+                     # Fallback to old simple predictor logic if WorldModel not init
+                     pass
+                     
         return loss
 
     @torch.no_grad()

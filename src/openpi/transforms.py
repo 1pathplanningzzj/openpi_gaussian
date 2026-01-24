@@ -187,7 +187,13 @@ class ResizeImages(DataTransformFn):
     width: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        def _resize(v):
+            # Handle sequence dimension if present (e.g. [Current, Future], H, W, C)
+            if v.ndim == 4:
+                return np.stack([image_tools.resize_with_pad(x, self.height, self.width) for x in v])
+            return image_tools.resize_with_pad(v, self.height, self.width)
+
+        data["image"] = {k: _resize(v) for k, v in data["image"].items()}
         return data
 
 

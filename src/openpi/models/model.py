@@ -243,7 +243,16 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+        missing, unexpected = safetensors.torch.load_model(model, weight_path, strict=False)
+        
+        if missing:
+            logger.warning(f"Missing keys during loading: {missing}")
+        if unexpected:
+            # Filter out num_batches_tracked which are often mismatched but benign
+            unexpected_real = [k for k in unexpected if "num_batches_tracked" not in k]
+            if unexpected_real:
+                 logger.warning(f"Unexpected keys during loading: {unexpected_real}")
+                 
         return model
 
     @abc.abstractmethod

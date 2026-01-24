@@ -66,6 +66,8 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Root directory for the dataset. If None, default LeRobot cache location is used.
+    dataset_root: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -796,13 +798,16 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False, use_gaussian=True),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
+            # zijian ‘s users data is located at /data/zijianzhang/LIBERA/physical-intelligence/libero
+            # If the data is directly at /data/zijianzhang/LIBERA, you might need to adjust the path or repo_id.
+            base_config=DataConfig(prompt_from_task=True, dataset_root="/data/zijianzhang/LIBERA"),
             extra_delta_transform=False,
         ),
-        batch_size=256,
+        # batch_size=256,
+        batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -812,7 +817,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
     ),
     #
