@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Train Pi05 Libero (World Model Test)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/train_pytorch.py",
+            "args": [
+                "pi05_libero",
+                "--exp-name=test_world_model_import",
+                "--overwrite"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "python": "${workspaceFolder}/uv_venv/bin/python",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}

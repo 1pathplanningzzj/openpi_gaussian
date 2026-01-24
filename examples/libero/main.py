@@ -101,7 +101,7 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/libero_spatial_active_vis_3d_aware/videos"  # Path to save videos
+    video_out_path: str = "data/gaussian_Model_test/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
 

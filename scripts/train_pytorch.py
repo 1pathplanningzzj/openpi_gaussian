@@ -444,7 +444,7 @@ def train_loop(config: _config.TrainConfig):
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
         safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path, strict=False
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
