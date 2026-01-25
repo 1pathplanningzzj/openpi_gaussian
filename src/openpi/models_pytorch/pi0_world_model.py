@@ -312,3 +312,100 @@ class BiDirectionalWorldModel(nn.Module):
             "z_t1_pred": z_t1_pred,
             "action_recovered": action_rec_from_gt
         }
+
+def visualize_world_model_prediction(model: BiDirectionalWorldModel, z_t, action, z_t1_gt, batch_idx=0, step=10):
+    """
+    Visualization helper to compare Predicted vs Ground Truth Next State in 3D space.
+    Saves the visualization to './visualizations' directory.
+    
+    since the latent tokens z represent 3D Gaussians, we can decode them to XYZ 
+    coordinates and visualize the point cloud dynamics.
+    
+    Args:
+        model: Trained/Loaded BiDirectionalWorldModel
+        z_t: Current latent state [B, N, D]
+        action: Action taken [B, A]
+        z_t1_gt: Ground Truth next latent state [B, N, D]
+        batch_idx: Which sample in the batch to visualize
+        step: Current training step (used for filename).
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import os
+        # Enable 3D plotting
+        from mpl_toolkits.mplot3d import Axes3D
+    except ImportError:
+        print("Matplotlib not found. Please install it to visualize: pip install matplotlib")
+        return
+
+    model.eval()
+    with torch.no_grad():
+        # 1. Run Forward Prediction
+        # z_t1_pred: Predicted latent state at t+1
+        z_t1_pred, details = model(z_t, action)
+        
+        # 2. Decode Latents to 3D Gaussian Attributes (XYZ, Opacity, etc.)
+        # We assume the decoder is trained to map z -> Gaussian Params
+        pred_decode = model.decoder(z_t1_pred)
+        gt_decode = model.decoder(z_t1_gt)
+        curr_decode = model.decoder(z_t) # Also visualize t for reference
+        
+        # Extract XYZ coordinates for the specific batch index
+        # [B, N, 3] -> [N, 3]
+        xyz_pred = pred_decode['xyz'][batch_idx].cpu().numpy()
+        xyz_gt = gt_decode['xyz'][batch_idx].cpu().numpy()
+        xyz_curr = curr_decode['xyz'][batch_idx].cpu().numpy()
+        
+        # Extract Opacity for filtering (optional, if opacity is learned)
+        # [B, N, 1] -> [N]
+        op_pred = pred_decode['opacity'][batch_idx].squeeze(-1).cpu().numpy()
+        op_gt = gt_decode['opacity'][batch_idx].squeeze(-1).cpu().numpy()
+        
+        # Extract predicted flow components if available
+        v_env = details['v_env'][batch_idx].norm(dim=-1).cpu().numpy() # Magnitude of env flow
+        v_int = details['v_int'][batch_idx].norm(dim=-1).cpu().numpy() # Magnitude of interaction flow
+
+    # 3. Create Visualization
+    fig = plt.figure(figsize=(18, 6))
+    
+    # Filter points with low opacity to reduce clutter (if opacity is meaningful)
+    # If opacity is not well trained yet, you might want to remove this mask.
+    mask_pred = op_pred > 0.05
+    mask_gt = op_gt > 0.05
+    
+    # --- Plot 1: Movement Overview (Current vs Pred) ---
+    ax1 = fig.add_subplot(131, projection='3d')
+    # Plot Current State (Blue)
+    ax1.scatter(xyz_curr[:, 0], xyz_curr[:, 1], xyz_curr[:, 2], c='b', s=1, alpha=0.1, label='t (Current)')
+    # Plot Prediction (Red)
+    ax1.scatter(xyz_pred[mask_pred, 0], xyz_pred[mask_pred, 1], xyz_pred[mask_pred, 2], c='r', s=2, alpha=0.5, label='t+1 (Pred)')
+    ax1.set_title(f"Step {step}: Dynamics (Blue->Red)")
+    ax1.legend()
+
+    # --- Plot 2: Prediction Accuracy (Pred vs GT) ---
+    ax2 = fig.add_subplot(132, projection='3d')
+    # Plot GT (Green)
+    ax2.scatter(xyz_gt[mask_gt, 0], xyz_gt[mask_gt, 1], xyz_gt[mask_gt, 2], c='g', s=2, alpha=0.3, label='t+1 (GT)')
+    # Plot Pred (Red)
+    ax2.scatter(xyz_pred[mask_pred, 0], xyz_pred[mask_pred, 1], xyz_pred[mask_pred, 2], c='r', s=2, alpha=0.3, label='t+1 (Pred)')
+    ax2.set_title(f"Step {step}: Accuracy (Green=GT, Red=Pred)")
+    ax2.legend()
+    
+    # --- Plot 3: Flow Heatmaps (Where is the action?) ---
+    # Visualize which parts of the scene are moving due to interaction
+    ax3 = fig.add_subplot(133, projection='3d')
+    p = ax3.scatter(xyz_curr[:, 0], xyz_curr[:, 1], xyz_curr[:, 2], c=v_int, cmap='plasma', s=2, alpha=0.8)
+    fig.colorbar(p, ax=ax3, label='Interaction Flow Magnitude')
+    ax3.set_title(f"Step {step}: Interaction Heatmap")
+
+    plt.tight_layout()
+    
+    # Save to ./visualizations
+    save_dir = "./visualizations"
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"world_model_viz_step_{step:06d}.png")
+    plt.savefig(save_path, dpi=100)
+    # Explicitly close to prevent memory leak
+    plt.close(fig)
+    print(f"Saved visualization to {save_path}")
+

@@ -32,6 +32,8 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # Whether to use 3D Gaussian Splatting Encoder as additional conditioning
     use_gaussian: bool = False
+    # Whether to use BiDirectional World Model for aux loss
+    use_world_model: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 

@@ -1,3 +1,6 @@
+# zijian
+# date 1.05 2026
+# main libero eval script with 3D guard logic for hypothesis analysis
 import collections
 import csv
 import dataclasses

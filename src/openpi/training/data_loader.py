@@ -145,16 +145,30 @@ def create_torch_dataset(
     }
     
     # Detect image keys from features
+    # robustly find any key containing "image" or "rgb" if the strict prefix check fails
     image_keys = [k for k, f in dataset_meta.features.items() if k.startswith("observation.images")]
-    # Request Previous (-1), Current (0.0) and Next (1) frame for images and state
-    # This enables Temporal 3DGS training with history and future context
-    for key in image_keys:
-        delta_timestamps[key] = [-1.0 / dataset_meta.fps, 0.0, 1.0 / dataset_meta.fps]
+    if not image_keys:
+        image_keys = [k for k in dataset_meta.features.keys() if "image" in k or "rgb" in k]
+        # Filter out depth or other things if necessary, but usually ok
         
-    # Also request temporal state
-    state_key = "observation.state"
-    if state_key in dataset_meta.features:
-         delta_timestamps[state_key] = [-1.0 / dataset_meta.fps, 0.0, 1.0 / dataset_meta.fps]
+    print(f"DEBUG: Found image keys: {image_keys} with FPS: {dataset_meta.fps}")
+
+    # Request Current (0.0) and Next (1) frame for images and state
+    # This enables World Model training: current state + action -> next state
+    for key in image_keys:
+        delta_timestamps[key] = [0.0, 1.0 / dataset_meta.fps]  # [current, next]
+
+    # Also request temporal state - try both possible key formats
+    state_keys_to_try = ["observation.state", "observation/state", "state"]
+    for state_key in state_keys_to_try:
+        if state_key in dataset_meta.features:
+            delta_timestamps[state_key] = [0.0, 1.0 / dataset_meta.fps]  # [current, next]
+            print(f"DEBUG: Added temporal state with key: {state_key}")
+            break
+    else:
+        print(f"WARNING: Could not find state key in dataset features. Available keys: {list(dataset_meta.features.keys())}")
+
+    print(f"DEBUG: delta_timestamps: {delta_timestamps}")
 
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,

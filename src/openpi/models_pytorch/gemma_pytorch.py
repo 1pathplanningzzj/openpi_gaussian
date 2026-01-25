@@ -83,6 +83,11 @@ class PaliGemmaWithExpertModel(nn.Module):
                 param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor):
+        # Image is typically [B, C, H, W] for PyTorch models
+        # But if we accidentally passed [B, H, W, C] (which is openpi default), we need to permute
+        if image.ndim == 4 and image.shape[-1] == 3 and image.shape[1] != 3:
+            # [B, H, W, C] -> [B, C, H, W]
+            image = image.permute(0, 3, 1, 2)
         return self.paligemma.model.get_image_features(image)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
