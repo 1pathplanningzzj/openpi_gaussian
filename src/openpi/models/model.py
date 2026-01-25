@@ -100,7 +100,6 @@ class Observation(Generic[ArrayT]):
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
     # pi0-fast model specific fields.
-
     # Token auto-regressive mask (for FAST autoregressive model).
     token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
     # Token loss mask (for FAST autoregressive model).
@@ -112,12 +111,101 @@ class Observation(Generic[ArrayT]):
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
-        # If images are uint8, convert them to [-1, 1] float32.
+        
+        # Determine batch dimensions from images if possible
+        # We need this to check against tokenized_prompt and expand if necessary
+        # Assuming all images have same batch shape
+        batch_dims_from_images = None
+        first_img_key = next(iter(data["image"]), None)
+        
+        # First pass: Process Images to fix dimensions
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+            elif hasattr(data["image"][key], "dtype") and isinstance(data["image"][key], torch.Tensor):
+                tensor = data["image"][key]
+
+                # Convert uint8 to float32
+                if tensor.dtype == torch.uint8:
+                    tensor = tensor.to(torch.float32) / 255.0 * 2.0 - 1.0
+
+                # PyTorch uses [B, C, H, W] but Observation expects [B, H, W, C]
+                # Detect if tensor is in channels-first format and convert to channels-last
+                if tensor.ndim == 5:
+                    if tensor.shape[2] == 3:
+                        # [B, T, C, H, W] -> [B, T, H, W, C]
+                        tensor = tensor.permute(0, 1, 3, 4, 2)
+                    # Else assume already [B, T, H, W, C]
+                elif tensor.ndim == 4:
+                    if tensor.shape[1] == 3:
+                        # [B, C, H, W] -> [B, H, W, C]
+                        tensor = tensor.permute(0, 2, 3, 1)
+                    # Else assume already [B, H, W, C]
+
+                data["image"][key] = tensor
+                
+                # Capture batch shape from first processed image tensor
+                # Excluding H,W,C, so take shape[:-3]
+                if batch_dims_from_images is None:
+                    batch_dims_from_images = tensor.shape[:-3]
+
+        # Ensure image_masks are proper boolean tensors and match image dimensions
+        for key in data["image_mask"]:
+            mask = data["image_mask"][key]
+
+            # Handle PyTorch tensors
+            if isinstance(mask, torch.Tensor):
+                # Convert to bool if needed
+                if mask.dtype != torch.bool:
+                    mask = mask.to(torch.bool)
+
+                # If images have temporal dimension [B, T, H, W, C] but masks are only [B],
+                # expand masks to [B, T] to match the batch dimensions
+                if key in data["image"]:
+                    img = data["image"][key]
+                    if isinstance(img, torch.Tensor) and img.ndim == 5 and mask.ndim == 1:
+                        # Image is [B, T, H, W, C], mask is [B] -> expand to [B, T]
+                        T = img.shape[1]
+                        mask = mask.unsqueeze(1).expand(-1, T)
+
+            # Handle JAX/numpy arrays
+            elif hasattr(mask, "ndim") and key in data["image"]:
+                img = data["image"][key]
+                if hasattr(img, "ndim") and img.ndim == 5 and mask.ndim == 1:
+                    # Image is [B, T, H, W, C], mask is [B] -> expand to [B, T]
+                    T = img.shape[1]
+                    if isinstance(mask, np.ndarray):
+                        mask = np.broadcast_to(mask[:, None], (mask.shape[0], T))
+                    else:  # JAX array
+                        mask = jnp.broadcast_to(mask[:, None], (mask.shape[0], T))
+
+            data["image_mask"][key] = mask
+            
+        # Fix tokenized_prompt batch dimensions if mismatched with images (e.g. strict time expansion)
+        # Jaxtyping complains that images have shape [16, 2, H, W, C] (*b = [16, 2])
+        # but prompt has shape [16, L] (*b = [16]), missing the time dimension [2].
+        # Prompts are static across the time horizon, so we should expand them.
+        
+        if batch_dims_from_images is not None and len(batch_dims_from_images) > 1:
+            # We have a time dimension in images: batch_dims_from_images is likely (B, T)
+            # Check prompt
+            prompt = data.get("tokenized_prompt")
+            if prompt is not None and isinstance(prompt, torch.Tensor):
+               # If prompt is [B, L], but we need [B, T, L]
+               if prompt.ndim == len(batch_dims_from_images): # e.g. 2 vs 2, means (B, L) vs (B, T) - mismatch indim semantics but rank eq
+                   # Actually simple check: compare shape prefix
+                   # If prompt is (B, L) and images are (B, T, ...)
+                   # We want prompt to be (B, T, L)
+                   T = batch_dims_from_images[1]
+                   if prompt.shape[0] == batch_dims_from_images[0] and prompt.ndim == 2:
+                       data["tokenized_prompt"] = prompt.unsqueeze(1).expand(-1, T, -1)
+                       
+            prompt_mask = data.get("tokenized_prompt_mask")
+            if prompt_mask is not None and isinstance(prompt_mask, torch.Tensor):
+               if prompt_mask.shape[0] == batch_dims_from_images[0] and prompt_mask.ndim == 2:
+                    T = batch_dims_from_images[1]
+                    data["tokenized_prompt_mask"] = prompt_mask.unsqueeze(1).expand(-1, T, -1)
+
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -251,8 +339,7 @@ class BaseModelConfig(abc.ABC):
             # Filter out num_batches_tracked which are often mismatched but benign
             unexpected_real = [k for k in unexpected if "num_batches_tracked" not in k]
             if unexpected_real:
-                 logger.warning(f"Unexpected keys during loading: {unexpected_real}")
-                 
+                logger.warning(f"Unexpected keys during loading: {unexpected_real}")
         return model
 
     @abc.abstractmethod

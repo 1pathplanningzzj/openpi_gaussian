@@ -14,7 +14,7 @@ from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 from openpi.models_pytorch.pi0_vggt import GaussianAdapter
 # Import the new World Model
-from openpi.models_pytorch.pi0_world_model import BiDirectionalWorldModel
+from openpi.models_pytorch.pi0_world_model import BiDirectionalWorldModel, visualize_world_model_prediction
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -115,7 +115,9 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        # self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        # Disable compile for now due to graph break issues in inference with VGGT
+        self.sample_actions = self.sample_actions
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -188,18 +190,83 @@ class PI0Pytorch(nn.Module):
         
         # --- Handle Future Split for 3DGS World Model ---
         future_observation = None
-        # Check if first image has T=2 (ndim=5)
-        # Note: We access observation.images which is a dict of arrays
-        if observation.images and next(iter(observation.images.values())).ndim == 5:
-             curr_imgs, fut_imgs = {}, {}
-             for k, v in observation.images.items():
-                 curr_imgs[k] = v[:, 0]
-                 fut_imgs[k] = v[:, 1]
-                 
-             # Clone observation for future
-             future_observation = observation.replace(images=fut_imgs)
-             # Update current observation
-             observation = observation.replace(images=curr_imgs)
+        # Check if first image has T dimension (ndim=5 for B,T,H,W,C now due to model.py fix)
+        if observation.images:
+            # Inspect first image to detect time dimension
+            img_val = next(iter(observation.images.values()))
+            if img_val.ndim == 5:
+                # [B, T, H, W, C]
+                time_dim = img_val.shape[1]
+                idx_curr, idx_fut = 0, 0
+
+                if time_dim == 2:  # Curr, Next (from delta_timestamps=[0, 1])
+                    idx_curr, idx_fut = 0, 1
+                elif time_dim == 3:  # Prev, Curr, Next (from delta_timestamps=[-1, 0, 1])
+                    idx_curr, idx_fut = 1, 2
+
+                if idx_fut > 0:
+                    curr_imgs, fut_imgs = {}, {}
+                    for k, v in observation.images.items():
+                        # Extract single frame [B, H, W, C]
+                        curr_imgs[k] = v[:, idx_curr]
+                        fut_imgs[k] = v[:, idx_fut]
+                    
+                    curr_state = observation.state
+                    fut_state = observation.state
+                    
+                    # Handle state [B, T, D]
+                    if observation.state is not None and observation.state.ndim == 3:
+                         if observation.state.shape[1] == time_dim:
+                             curr_state = observation.state[:, idx_curr]
+                             fut_state = observation.state[:, idx_fut]
+
+                    # Clone observation for future
+                    # Note: We must also slice the masks and prompts to match the single-step batch dimension,
+                    # otherwise jaxtyping will complain about mismatched *b dimensions (e.g. mask [B, T] vs image [B, H, W, C])
+                    
+                    # 1. Slice Image Masks
+                    fut_masks = {}
+                    curr_masks = {}
+                    for k, v in observation.image_masks.items():
+                        if v.ndim == 2: # [B, T]
+                            curr_masks[k] = v[:, idx_curr]
+                            fut_masks[k] = v[:, idx_fut]
+                        else: # [B] - assume valid for all steps
+                            curr_masks[k] = v
+                            fut_masks[k] = v
+                            
+                    # 2. Slice Prompts
+                    # Prompts might be expanded to [B, T, L] in model.py
+                    curr_prompt = observation.tokenized_prompt
+                    fut_prompt = observation.tokenized_prompt
+                    if curr_prompt is not None and curr_prompt.ndim == 3: # [B, T, L]
+                        curr_prompt = curr_prompt[:, idx_curr]
+                        fut_prompt = fut_prompt[:, idx_fut]
+                        
+                    curr_prompt_mask = observation.tokenized_prompt_mask
+                    fut_prompt_mask = observation.tokenized_prompt_mask
+                    if curr_prompt_mask is not None and curr_prompt_mask.ndim == 3: # [B, T, L]
+                        curr_prompt_mask = curr_prompt_mask[:, idx_curr]
+                        fut_prompt_mask = fut_prompt_mask[:, idx_fut]
+
+                    future_observation = observation.replace(
+                        images=fut_imgs, 
+                        state=fut_state,
+                        image_masks=fut_masks,
+                        tokenized_prompt=fut_prompt,
+                        tokenized_prompt_mask=fut_prompt_mask
+                    )
+                    # Update current observation
+                    observation = observation.replace(
+                        images=curr_imgs, 
+                        state=curr_state,
+                        image_masks=curr_masks,
+                        tokenized_prompt=curr_prompt,
+                        tokenized_prompt_mask=curr_prompt_mask
+                    )
+                    
+                    # Also preprocess future observation (normalization etc)
+                    future_observation = _preprocessing.preprocess_observation_pytorch(future_observation, train=False)
 
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
         return (
@@ -370,7 +437,7 @@ class PI0Pytorch(nn.Module):
         """Helper to prepare inputs for 3DGS encoder from observation."""
         return self.gaussian_adapter.prepare_inputs(observation, device, batch_size)
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
+    def forward(self, observation, actions, noise=None, time=None, step=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         images, img_masks, lang_tokens, lang_masks, state, future_observation = self._preprocess_observation(observation, train=True)
 
@@ -473,10 +540,37 @@ class PI0Pytorch(nn.Module):
                     # Add to total loss
                     # wm_outputs["loss_total"] is a scalar (mean). We need to broadcast strictness slightly or just add.
                     loss = loss + wm_outputs["loss_total"]
+
+                    # Visualization (every 10 steps)
+                    if step is not None and step % 10 == 0:
+                        print(f"DEBUG: Attempting visualization at step {step}")
+                        try:
+                            visualize_world_model_prediction(
+                                self.world_model,
+                                z_t, 
+                                action_t, 
+                                z_t1_gt,
+                                batch_idx=0,
+                                step=step
+                            )
+                        except Exception as e:
+                            print(f"Visualization failed: {e}")
                     
                 else: 
-                     # Fallback to old simple predictor logic if WorldModel not init
-                     pass
+                    if step is not None and step % 10 == 0:
+                         print(f"DEBUG: World Model is None at step {step}")
+        
+        elif step is not None and step % 10 == 0:
+            if not self.gaussian_adapter.use_gaussian:
+                print(f"DEBUG: Step {step} - use_gaussian is False")
+            if future_observation is None:
+                # Get shape for debug
+                shape_info = "No Images"
+                if observation.images:
+                    shape_info = str(next(iter(observation.images.values())).shape)
+                print(f"DEBUG: Step {step} - future_observation is None. Image Shape: {shape_info}") 
+                # Fallback to old simple predictor logic if WorldModel not init
+                pass
                      
         return loss
 

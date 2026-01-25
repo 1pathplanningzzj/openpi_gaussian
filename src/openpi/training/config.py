@@ -165,7 +165,6 @@ class ModelTransformFactory(GroupFactory):
                     ],
                 )
 
-
 @dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
@@ -798,7 +797,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False, use_gaussian=True),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False, use_gaussian=True, use_world_model=True),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             # zijian ‘s users data is located at /data/zijianzhang/LIBERA/physical-intelligence/libero

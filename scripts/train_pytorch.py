@@ -374,8 +374,30 @@ def train_loop(config: _config.TrainConfig):
         batch_size = next(iter(sample_batch["image"].values())).shape[0]
         for i in range(min(5, batch_size)):
             # Concatenate all camera views horizontally for this batch item
-            # Convert from NCHW to NHWC format for wandb
-            img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
+            imgs_list = []
+            for img in sample_batch["image"].values():
+                # img is [B, ..., H, W, C] (due to model.py Observation format)
+                # img[i] gets i-th batch element
+                single_img = img[i]
+                
+                # Handle Temporal Dimension [T, H, W, C]
+                if single_img.ndim == 4: 
+                    single_img = single_img[0] # Take first frame
+                
+                # Check dims. If [C, H, W] -> permute to [H, W, C].
+                # If [H, W, C], keep it. 
+                # Observation guarantees H,W,C, but let's be robust/explicit.
+                # Heuristic: C is usually 3.
+                if single_img.shape[0] == 3 and single_img.shape[-1] != 3:
+                     single_img = single_img.permute(1, 2, 0)
+                     
+                # Shift from [-1, 1] to [0, 1] for visualization
+                single_img = (single_img + 1.0) / 2.0
+                single_img = torch.clamp(single_img, 0, 1)
+                     
+                imgs_list.append(single_img)
+
+            img_concatenated = torch.cat(imgs_list, axis=1)
             img_concatenated = img_concatenated.cpu().numpy()
             images_to_log.append(wandb.Image(img_concatenated))
 
@@ -526,7 +548,7 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
-            losses = model(observation, actions)
+            losses = model(observation, actions, step=global_step)
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)

@@ -264,5 +264,5 @@ class GaussianAdapter(nn.Module):
         g_bs = gaussian_embs.shape[0]
         g_len = gaussian_embs.shape[1]
         g_mask = torch.ones(g_bs, g_len, dtype=torch.bool, device=gaussian_embs.device)
-        
+        # Todo zijian 0125 adapt to LDGB fix it.  
         return gaussian_embs, g_mask
