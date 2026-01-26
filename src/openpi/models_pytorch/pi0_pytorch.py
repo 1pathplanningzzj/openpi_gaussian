@@ -15,6 +15,8 @@ import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 from openpi.models_pytorch.pi0_vggt import GaussianAdapter
 # Import the new World Model
 from openpi.models_pytorch.pi0_world_model import BiDirectionalWorldModel, visualize_world_model_prediction
+# Import Gaussian Renderer
+from openpi.models_pytorch.gaussian_renderer import GaussianRenderer, compute_multi_view_rendering_loss
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -131,14 +133,29 @@ class PI0Pytorch(nn.Module):
         # Using same width as adaptation layer (e.g. 2048 or projected width)
         # Note: GaussianAdapter typically projects to VLM width (action_expert_config.width)
         # so z_t has dimension `paligemma_config.width`.
+        # Use world model config
         if hasattr(config, "use_world_model") and config.use_world_model:
              logging.info("Initializing BiDirectional World Model...")
+             print(f"DEBUG: Initializing World Model. Config has use_world_model={config.use_world_model}")
              self.world_model = BiDirectionalWorldModel(
                  token_dim=paligemma_config.width, # Latents are projected to VLM width
                  action_dim=32 # Action dim is standard for Pi0
              )
+             
+             # Initialize Gaussian Renderer (World Model Supervision)
+             try:
+                 print("DEBUG: Initializing Gaussian Renderer...")
+                 self.gaussian_renderer = GaussianRenderer(image_size=224, sh_degree=3)
+                 logging.info("Gaussian Renderer initialized for World Model supervision.")
+                 print("DEBUG: Gaussian Renderer initialized successfully.")
+             except ImportError:
+                 self.gaussian_renderer = None
+                 logging.warning("Gaussian Renderer not available. Skipping rendering loss.")
+                 print("DEBUG: Gaussian Renderer FAILED to initialize (ImportError).")
         else:
+             print(f"DEBUG: Skipping World Model initialization. config.use_world_model={getattr(config, 'use_world_model', 'MISSING')}")
              self.world_model = None
+             self.gaussian_renderer = None
         # -------------------------------
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
@@ -194,6 +211,10 @@ class PI0Pytorch(nn.Module):
         if observation.images:
             # Inspect first image to detect time dimension
             img_val = next(iter(observation.images.values()))
+            # DEBUG PRINT
+            if train and torch.rand(1).item() < 0.01:
+                 print(f"DEBUG: _preprocess_observation. img_val ndim={img_val.ndim}, shape={img_val.shape}")
+
             if img_val.ndim == 5:
                 # [B, T, H, W, C]
                 time_dim = img_val.shape[1]
@@ -203,6 +224,10 @@ class PI0Pytorch(nn.Module):
                     idx_curr, idx_fut = 0, 1
                 elif time_dim == 3:  # Prev, Curr, Next (from delta_timestamps=[-1, 0, 1])
                     idx_curr, idx_fut = 1, 2
+                
+                # DEBUG PRINT
+                if train and torch.rand(1).item() < 0.01:
+                     print(f"DEBUG: Found Time Dim {time_dim}. indices: curr={idx_curr}, fut={idx_fut}")
 
                 if idx_fut > 0:
                     curr_imgs, fut_imgs = {}, {}
@@ -450,6 +475,56 @@ class PI0Pytorch(nn.Module):
         """Helper to prepare inputs for 3DGS encoder from observation."""
         return self.gaussian_adapter.prepare_inputs(observation, device, batch_size)
 
+    def _get_default_camera_params(self, device, batch_size):
+        """Construct default identity camera parameters for canonical view rendering."""
+        # Setup for 224x224, 60 deg FOV
+        fov_deg = 60.0
+        tanfov = math.tan(0.5 * math.radians(fov_deg))
+        
+        # Identity View Matrix
+        viewmatrix = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
+        
+        # Projection Matrix (Simple perspective)
+        # Does not strictly need to be accurate if rasterizer just uses tanfov, 
+        # but diff-gaussian-rasterization often uses projmatrix for culling.
+        # We can approximate with identity or a weak projection.
+        projmatrix = viewmatrix.clone() 
+        
+        # Intrinsics for project_to_2d (Camera Space -> Image Space)
+        # fx = W / (2 * tanfov), cx = W/2
+        W = 224.0
+        fx = W / (2.0 * tanfov)
+        cx = W / 2.0
+        
+        intrinsics = torch.eye(3, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
+        intrinsics[:, 0, 0] = fx
+        intrinsics[:, 1, 1] = fx
+        intrinsics[:, 0, 2] = cx
+        intrinsics[:, 1, 2] = cx
+        
+        return {
+            "viewmatrix": viewmatrix,
+            "projmatrix": projmatrix,
+            "tanfovx": tanfov,
+            "tanfovy": tanfov,
+            "campos": torch.zeros(batch_size, 3, device=device),
+            "intrinsics": intrinsics
+        }
+
+    def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names):
+        """Helper to visualize Rendered vs GT images. Delegated to GaussianRenderer."""
+        # Cleanly moved to gaussian_renderer.py
+        from openpi.models_pytorch.gaussian_renderer import visualize_rendering_comparison
+        
+        visualize_rendering_comparison(
+            step,
+            gaussian_params,
+            target_obs,
+            cam_params_dict,
+            self.gaussian_renderer,
+            view_names
+        )
+
     def forward(self, observation, actions, noise=None, time=None, step=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         images, img_masks, lang_tokens, lang_masks, state, future_observation = self._preprocess_observation(observation, train=True)
@@ -553,6 +628,84 @@ class PI0Pytorch(nn.Module):
                     # Add to total loss
                     # wm_outputs["loss_total"] is a scalar (mean). We need to broadcast strictness slightly or just add.
                     loss = loss + wm_outputs["loss_total"]
+
+                    # === 4. Gaussian Rendering Supervision === #
+                    # We supervise the decoded Gaussians using the Ground Truth Future Images
+                    
+                    if step is not None and step % 100 == 0:
+                        print(f"DEBUG: Step {step} - Checking Render Loss conditions...")
+                        print(f"DEBUG: self.gaussian_renderer is {type(self.gaussian_renderer)}")
+                        if "z_t1_pred" in wm_outputs:
+                            print("DEBUG: z_t1_pred IS in wm_outputs")
+                        else:
+                            print("DEBUG: z_t1_pred IS NOT in wm_outputs. Keys:", wm_outputs.keys())
+                    
+                    if self.gaussian_renderer is not None and "z_t1_pred" in wm_outputs:
+                        if step is not None and step % 100 == 0:
+                            print("DEBUG: Entering Rendering Loss Block")
+                        try:
+                            z_next = wm_outputs["z_t1_pred"]
+                            # z_next: [B, N, D]
+                            
+                            # Decode to Gaussian Parameters
+                            gaussian_params = self.world_model.decoder(z_next)
+                            
+                            # Prepare Target Images
+                            target_obs = {}
+                            cam_params_dict = {}
+                            
+                            # Use default canonical camera (Identity view)
+                            default_cams = self._get_default_camera_params(z_next.device, z_next.shape[0])
+                            
+                            # Map dataset keys to loss keys & Identify views
+                            valid_views = []
+                            for k, v in future_observation.images.items(): 
+                                img_tensor = v
+                                # Heuristic to identify views
+                                view_name = None
+                                if "agent" in k or "high" in k or "cam_high" in k or "exterior" in k:
+                                    view_name = "agent"
+                                elif "wrist" in k or "bravo" in k:
+                                    view_name = "wrist"
+                                
+                                if view_name:
+                                    # Ensure format [B, 3, H, W]
+                                    if img_tensor.shape[1] != 3 and img_tensor.shape[-1] == 3:
+                                        img_tensor = img_tensor.permute(0, 3, 1, 2)
+                                    
+                                    target_obs[f"{view_name}_image"] = img_tensor
+                                    cam_params_dict[view_name] = default_cams
+                                    valid_views.append(view_name)
+                            
+                            if valid_views:
+                                render_loss, _ = compute_multi_view_rendering_loss(
+                                    gaussian_params,
+                                    target_obs,
+                                    cam_params_dict,
+                                    self.gaussian_renderer,
+                                    view_names=valid_views
+                                )
+                                # Weight the render loss
+                                loss = loss + 0.1 * render_loss
+                                
+                                if step is not None and step % 100 == 0:
+                                     print(f"Step {step}: Render Loss = {render_loss.item():.4f}")
+                                     try:
+                                         self._visualize_rendering_comparison(
+                                            step, 
+                                            gaussian_params, 
+                                            target_obs, 
+                                            cam_params_dict, 
+                                            view_names=valid_views
+                                         )
+                                     except Exception as viz_e:
+                                         print(f"Rendering visualization failed: {viz_e}")
+                        except Exception as e:
+                            # Do not crash training if rendering fails
+                            if step is not None and step % 100 == 0:
+                                import traceback
+                                traceback.print_exc()
+                                print(f"Rendering failed: {e}")
 
                     # Visualization (every 10 steps)
                     if step is not None and step % 10 == 0:
