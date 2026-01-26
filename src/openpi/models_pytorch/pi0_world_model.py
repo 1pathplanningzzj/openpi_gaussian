@@ -218,7 +218,10 @@ class Privileged4DGSDecoder(nn.Module):
         # Using simplified set from prompt:
         # mu (3), Sigma (6 -> 3x3 low cholesky or similar), SH (16), alpha (1)
         # Sum = 3 + 6 + 16 + 1 = 26
-        self.out_dim = 26
+        # Update 0126: For GaussianRenderer compatibility (SH Degree 3)
+        # We need (3+1)^2 * 3 = 16 * 3 = 48 SH coefficients
+        self.sh_dim = 48
+        self.out_dim = 3 + 6 + self.sh_dim + 1 # 58
         
         self.decoder = nn.Sequential(
             nn.Linear(token_dim, 256),
@@ -234,8 +237,8 @@ class Privileged4DGSDecoder(nn.Module):
         # Split
         mu = raw[..., 0:3]
         sigma_params = raw[..., 3:9] # 6 params for covariance (e.g. upper triangle)
-        sh = raw[..., 9:25]
-        opacity = torch.sigmoid(raw[..., 25:26])
+        sh = raw[..., 9 : 9 + self.sh_dim]
+        opacity = torch.sigmoid(raw[..., -1:])
         
         return {
             "xyz": mu,
@@ -401,7 +404,7 @@ def visualize_world_model_prediction(model: BiDirectionalWorldModel, z_t, action
     plt.tight_layout()
     
     # Save to ./visualizations
-    save_dir = "./visualizations"
+    save_dir = "./visualizations/world_model_predictions"
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f"world_model_viz_step_{step:06d}.png")
     plt.savefig(save_path, dpi=100)
