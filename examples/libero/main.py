@@ -96,7 +96,7 @@ class Args:
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = (
-        "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+        "libero_goal"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
@@ -104,7 +104,7 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/gaussian_Model_test/videos"  # Path to save videos
+    video_out_path: str = "data/pi05_test_goal/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -734,6 +734,15 @@ def eval_libero(args: Args) -> None:
         logging.info(
             f"Estimated max control freq ≈ {recommended_max_freq:.2f} Hz. Suggest using replan_steps >= {suggested_replan_steps} (i.e., control freq <= {20.0/suggested_replan_steps:.2f} Hz)"
         )
+
+    # Calculate and save final accuracy
+    final_success_rate = float(total_successes) / float(total_episodes) if total_episodes > 0 else 0.0
+    accuracy_path = pathlib.Path(args.video_out_path) / "final_accuracy.txt"
+    with open(accuracy_path, "w") as f:
+        f.write(f"Total Episodes: {total_episodes}\n")
+        f.write(f"Total Successes: {total_successes}\n")
+        f.write(f"Success Rate: {final_success_rate:.4f}\n")
+    logging.info(f"Saved final accuracy to {accuracy_path}")
 
 
 def _get_libero_env(task, resolution, seed):

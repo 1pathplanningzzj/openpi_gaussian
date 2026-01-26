@@ -302,9 +302,29 @@ class PI0Pytorch(nn.Module):
         pad_masks = []
         att_masks = []
         
+        # Process language tokens first to get text embedding for LGPD
+        def lang_embed_func(lang_tokens):
+            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
+            lang_emb_dim = lang_emb.shape[-1]
+            return lang_emb * math.sqrt(lang_emb_dim)
+
+        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
+        
         # --- 3D Gaussian Encoder ---
         # Delegated to Adapter
-        gaussian_embs, g_mask = self.gaussian_adapter(gaussian_inputs)
+        # Pass Pooled Text Embedding for LGPD
+        # lang_emb: [B, SeqLen, D] -> [B, D] via Mean/Max Pooling
+        # Need to consider masks? lang_masks [B, SeqLen] (1=valid, 0=pad)
+        if self.gaussian_adapter.use_lgpd:
+            # Masked Mean Pooling
+            mask_float = lang_masks.unsqueeze(-1).float() # [B, S, 1]
+            sum_emb = (lang_emb * mask_float).sum(dim=1)
+            sum_mask = mask_float.sum(dim=1).clamp(min=1e-6)
+            text_embedding = sum_emb / sum_mask # [B, D]
+        else:
+            text_embedding = None
+
+        gaussian_embs, g_mask = self.gaussian_adapter(gaussian_inputs, text_embedding=text_embedding)
         
         if gaussian_embs is not None:
              embs.append(gaussian_embs)
@@ -329,14 +349,7 @@ class PI0Pytorch(nn.Module):
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
 
-        # Process language tokens
-        def lang_embed_func(lang_tokens):
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
-            lang_emb_dim = lang_emb.shape[-1]
-            return lang_emb * math.sqrt(lang_emb_dim)
-
-        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
-
+        # Append language tokens (already computed)
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 

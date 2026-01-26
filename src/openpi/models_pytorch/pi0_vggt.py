@@ -26,6 +26,10 @@ except ImportError:
     logging.warning("Could not import VGGT3DGSModel. 3DGS integration may fail.")
     VGGT3DGSModel = None
 
+# Import LGPD Module
+from openpi.models_pytorch.lgpd_module import LanguageGatedPhysicalDistillation
+
+
 class GaussianPredictor(nn.Module):
     """
     Predicts the evolution of Gaussian features conditioned on:
@@ -90,13 +94,15 @@ class GaussianAdapter(nn.Module):
     """
     Adapter for integrating VGGT (Transformer-based 3DGS) features into OpenPI models.
     """
-    def __init__(self, use_gaussian: bool, action_expert_width: int):
+    def __init__(self, use_gaussian: bool, action_expert_width: int, use_lgpd: bool = True):
         super().__init__()
         self.use_gaussian = use_gaussian
         self.encoder = None
         self.proj = None
         self.predictor = None # Future Predictor
-    
+        self.lgpd = None  # Language-Gated Physical Distillation
+        self.use_lgpd = use_lgpd
+
         if self.use_gaussian and VGGT3DGSModel is not None:
             logging.info("Initializing VGGT 3DGS Components in Adapter...")
             
@@ -128,7 +134,17 @@ class GaussianAdapter(nn.Module):
                     gaussian_dim=self.gaussian_feat_dim,
                     hidden_dim=512
                 )
-                
+                  
+                # LGPD Module
+                if self.use_lgpd:
+                    logging.info("Initializing LGPD Module...")
+                    self.lgpd = LanguageGatedPhysicalDistillation(
+                        token_dim=action_expert_width,
+                        text_dim=action_expert_width,  # Assuming pooled text emb has same dim as visual proj
+                        num_context_tokens=16,
+                        background_weight=0.1
+                    )
+
             except Exception as e:
                 logging.error(f"Failed to initialize VGGT components: {e}")
                 self.use_gaussian = False
@@ -149,6 +165,8 @@ class GaussianAdapter(nn.Module):
         VGGT expects [Batch_size, view_num, 3, H, W]
         We select 2 views: Agent (Global) and Wrist.
         """
+        # Also, check if we want to pass text embedding for LGPD here?
+        # Typically the encoder prepares visual inputs. Text is passed later to forward.
         if not self.use_gaussian:
             return None
             
@@ -208,10 +226,12 @@ class GaussianAdapter(nn.Module):
              
         return imgs_stacked.to(device)
 
-    def forward(self, gaussian_inputs):
+    def forward(self, gaussian_inputs, text_embedding=None):
         """
         Processes gaussian inputs and returns embeddings.
-        Input: [B, S, 3, H, W]
+        Input: 
+            gaussian_inputs: [B, S, 3, H, W]
+            text_embedding: [B, D] Optional text embedding for LGPD.
         """
         if not self.use_gaussian or gaussian_inputs is None:
             return None, None
@@ -260,9 +280,34 @@ class GaussianAdapter(nn.Module):
         # Project [B, S*100, D] -> [B, TotalTokens, ProjDataset]
         gaussian_embs = self.proj(tokens_pooled)
         
-        # Prepare masks
+        # Prepare masks (Default Uniform)
         g_bs = gaussian_embs.shape[0]
         g_len = gaussian_embs.shape[1]
-        g_mask = torch.ones(g_bs, g_len, dtype=torch.bool, device=gaussian_embs.device)
-        # Todo zijian 0125 adapt to LDGB fix it.  
+        
+        # === Apply LGPD ===
+        # zijian 0126: Refine tokens based on language if available
+        if self.use_lgpd and self.lgpd is not None and text_embedding is not None:
+            # LGPD returns refined tokens. 
+            # We can also get the gate for visualization if needed, but here we just update tokens.
+            # gaussian_embs: [B, N, D]
+            # text_embedding: [B, D]
+            
+            # Ensure dims match (proj might have changed expected dim)
+            # LGPD inited with action_expert_width.
+            # text_embedding might need projection if it comes from PaliGemma (2048) -> LGPD expects same dim.
+            
+            gaussian_embs, gate = self.lgpd(gaussian_embs, text_embedding, return_gate=True)
+            
+            # Use gate to create a soft attention mask or keep specific mask logic?
+            # Standard Pi0 uses binary mask for valid/padding.
+            # 3DGS tokens are all "valid" (not padding).
+            # But we can use the gate to suppress attention in the Main Transformer later if we wanted to?
+            # For now, we trust LGPD filtered the features themselves, so mask remains all 1s (all valid).
+            g_mask = torch.ones(g_bs, g_len, dtype=torch.bool, device=gaussian_embs.device)
+            
+            # Optional: Return gate for visualization upstream? 
+            # Currently forward only returns (embs, mask).
+        else:
+            g_mask = torch.ones(g_bs, g_len, dtype=torch.bool, device=gaussian_embs.device)
+
         return gaussian_embs, g_mask
