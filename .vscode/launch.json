@@ -9,11 +9,13 @@
             "program": "${workspaceFolder}/scripts/train_pytorch.py",
             "args": [
                 "pi05_libero",
-                "--exp-name=test_world_model_import",
+                "--checkpoint-base-dir=/data/zijianzhang/train_ckpts",
+                "--exp-name=gaussian_world_model_exp0126",
                 "--overwrite"
             ],
             "env": {
-                "CUDA_VISIBLE_DEVICES": "1"
+                "CUDA_VISIBLE_DEVICES": "1",
+                "PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2.0"
             },
             "python": "${workspaceFolder}/uv_venv/bin/python",
             "console": "integratedTerminal",
