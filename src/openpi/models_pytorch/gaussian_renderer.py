@@ -232,10 +232,6 @@ class GaussianRenderer(nn.Module):
         """
         Render 3D Gaussians from a specific camera viewpoint.
         """
-        # DEBUG PRINT
-        if torch.rand(1).item() < 0.01: # Sample occasionally to avoid spam, or just always print once
-             print(f"DEBUG: Inside GaussianRenderer.forward. Batch size: {gaussian_params['xyz'].shape[0]}")
-
         B, N, _ = gaussian_params["xyz"].shape
         device = gaussian_params["xyz"].device
 
@@ -244,8 +240,19 @@ class GaussianRenderer(nn.Module):
             gaussian_params["sigma"]
         )
 
-        # Project to 2D
-        means2D = project_to_2d(gaussian_params["xyz"], camera_params)
+        # Create screenspace points tensor for gradient computation
+        # Following AD-FFgsStudio convention: use zeros_like with requires_grad
+        # The rasterizer will compute screen-space positions internally
+        screenspace_points = torch.zeros_like(
+            gaussian_params["xyz"],
+            dtype=gaussian_params["xyz"].dtype,
+            device=device,
+            requires_grad=True
+        )
+        try:
+            screenspace_points.retain_grad()
+        except:
+            pass
 
         # Prepare for batch processing
         rendered_images = []
@@ -264,8 +271,9 @@ class GaussianRenderer(nn.Module):
                 tanfovy=camera_params["tanfovy"].item() if isinstance(camera_params["tanfovy"], torch.Tensor) else camera_params["tanfovy"],
                 bg=torch.zeros(3, device=device),
                 scale_modifier=1.0,
-                viewmatrix=camera_params["viewmatrix"][b], # Keep as Tensor
-                projmatrix=camera_params["projmatrix"][b], # Keep as Tensor
+                # IMPORTANT: diff-gaussian-rasterization expects Transposed matrices (Column-Major)
+                viewmatrix=camera_params["viewmatrix"][b].transpose(0, 1), 
+                projmatrix=camera_params["projmatrix"][b].transpose(0, 1),
                 sh_degree=self.sh_degree,
                 campos=camera_params["campos"][b], # Keep as Tensor
                 prefiltered=False,
@@ -285,7 +293,7 @@ class GaussianRenderer(nn.Module):
             # Render this batch element
             rendered_color, radii = rasterizer(
                 means3D=gaussian_params["xyz"][b],
-                means2D=means2D[b],
+                means2D=screenspace_points[b],
                 opacities=gaussian_params["opacity"][b],
                 shs=shs_val,
                 scales=scales[b],

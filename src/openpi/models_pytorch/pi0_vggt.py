@@ -14,7 +14,7 @@ import torch.nn.functional as F
 # Add AD-FFgsStudio to python path
 # Assuming the file is at src/openpi/models_pytorch/pi0_gaussian.py
 # We need to go up 3 levels to reach the root (src/openpi/models_pytorch -> src/openpi -> src -> root)
-# that ‘s done ！！⭐️ 🫡
+# that ‘s done ！☑️！✅ 
 _root_path = Path(__file__).resolve().parents[3]
 _ad_ffgs_path = _root_path / "third_party" / "AD-FFgsStudio"
 if str(_ad_ffgs_path) not in sys.path:

@@ -229,6 +229,17 @@ class Privileged4DGSDecoder(nn.Module):
             nn.Linear(256, self.out_dim)
         )
 
+        # Initialize the last layer to produce better initial Gaussians
+        # This helps avoid black images at step 0
+        with torch.no_grad():
+            # Initialize opacity bias to positive value (sigmoid(2.0) ≈ 0.88)
+            self.decoder[-1].bias[-1] = 2.0
+
+            # Initialize first SH coefficient (DC component) to positive value
+            # This gives Gaussians a base gray color
+            # SH coefficients start at index 9, first 3 are RGB DC components
+            self.decoder[-1].bias[9:12] = 0.5  # Gray color
+
     def forward(self, z):
         # z: [B, N, D]
         B, N, D = z.shape
