@@ -475,33 +475,70 @@ class PI0Pytorch(nn.Module):
         """Helper to prepare inputs for 3DGS encoder from observation."""
         return self.gaussian_adapter.prepare_inputs(observation, device, batch_size)
 
-    def _get_default_camera_params(self, device, batch_size):
-        """Construct default identity camera parameters for canonical view rendering."""
-        # Setup for 224x224, 60 deg FOV
+    def _get_camera_params_for_view(self, view_name, device, batch_size):
+        """Get camera parameters for specific view (agent or wrist)."""
         fov_deg = 60.0
         tanfov = math.tan(0.5 * math.radians(fov_deg))
-        
-        # Identity View Matrix
-        viewmatrix = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
-        
-        # Projection Matrix (Simple perspective)
-        # Does not strictly need to be accurate if rasterizer just uses tanfov, 
-        # but diff-gaussian-rasterization often uses projmatrix for culling.
-        # We can approximate with identity or a weak projection.
-        projmatrix = viewmatrix.clone() 
-        
-        # Intrinsics for project_to_2d (Camera Space -> Image Space)
-        # fx = W / (2 * tanfov), cx = W/2
         W = 224.0
         fx = W / (2.0 * tanfov)
         cx = W / 2.0
         
+        # Helper for Projection Matrix (OpenGL style)
+        def getProjectionMatrix(znear, zfar, fovX, fovY):
+            tanHalfFovY = math.tan((fovY / 2))
+            tanHalfFovX = math.tan((fovX / 2))
+            
+            P = torch.zeros(4, 4, device=device)
+            z_sign = 1.0 
+
+            P[0, 0] = 1 / tanHalfFovX
+            P[1, 1] = 1 / tanHalfFovY
+            P[3, 2] = z_sign
+            P[2, 2] = z_sign * zfar / (zfar - znear)
+            P[2, 3] = -(zfar * znear) / (zfar - znear)
+            return P
+
+        # Intrinsics (same for both views)
         intrinsics = torch.eye(3, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
         intrinsics[:, 0, 0] = fx
         intrinsics[:, 1, 1] = fx
         intrinsics[:, 0, 2] = cx
         intrinsics[:, 1, 2] = cx
+
+        if view_name == "agent":
+            # Agent camera: Try identity first (canonical view)
+            # If Gaussians are in world coordinates, identity might work better
+            viewmatrix = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
+            # CRITICAL FIX: Translate world away from camera (Z-axis)
+            # Gaussian stats show mean ~ 0. We need Z > znear (0.01).
+            # Shift everything by +2.0 in Z.
+            viewmatrix[:, 2, 3] = 2.0 
+
+        elif view_name == "wrist":
+            # Wrist camera: Also try identity for now
+            viewmatrix = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
+            # Shift wrist view similarly to ensure visibility
+            viewmatrix[:, 2, 3] = 2.0
+            
+        else:
+            # Default: identity
+            viewmatrix = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
+            viewmatrix[:, 2, 3] = 2.0
+
+        # Create proper Projection Matrix
+        # Note: rasterizer usually expects P @ V, i.e. Full MVP for "projmatrix" argument 
+        # or just P if it does V * pos separately? 
+        # The diff-gaussian-rasterization cuda code does: p_hom = projmatrix * p_orig
+        # So "projmatrix" passed to settings MUST BE the full View+Projection matrix (MVP).
         
+        proj_base = getProjectionMatrix(znear=0.01, zfar=100.0, fovX=math.radians(fov_deg), fovY=math.radians(fov_deg))
+        proj_base = proj_base.unsqueeze(0).repeat(batch_size, 1, 1)
+        
+        # MVP = P @ V
+        # Torch matmul is (..., N, M) x (..., M, P) -> (..., N, P)
+        # We need standard multiplication order P * V
+        projmatrix = torch.bmm(proj_base, viewmatrix)
+
         return {
             "viewmatrix": viewmatrix,
             "projmatrix": projmatrix,
@@ -632,7 +669,7 @@ class PI0Pytorch(nn.Module):
                     # === 4. Gaussian Rendering Supervision === #
                     # We supervise the decoded Gaussians using the Ground Truth Future Images
                     
-                    if step is not None and step % 100 == 0:
+                    if step is not None and step % 40 == 0:
                         print(f"DEBUG: Step {step} - Checking Render Loss conditions...")
                         print(f"DEBUG: self.gaussian_renderer is {type(self.gaussian_renderer)}")
                         if "z_t1_pred" in wm_outputs:
@@ -641,7 +678,7 @@ class PI0Pytorch(nn.Module):
                             print("DEBUG: z_t1_pred IS NOT in wm_outputs. Keys:", wm_outputs.keys())
                     
                     if self.gaussian_renderer is not None and "z_t1_pred" in wm_outputs:
-                        if step is not None and step % 100 == 0:
+                        if step is not None and step % 40 == 0:
                             print("DEBUG: Entering Rendering Loss Block")
                         try:
                             z_next = wm_outputs["z_t1_pred"]
@@ -649,54 +686,105 @@ class PI0Pytorch(nn.Module):
                             
                             # Decode to Gaussian Parameters
                             gaussian_params = self.world_model.decoder(z_next)
+
+                            # DEBUG: Check Gaussian parameters at step 0
+                            if step is not None and step % 40 == 0:
+                                print(f"\n[DEBUG] Gaussian Parameters:")
+                                print(f"  xyz: shape={gaussian_params['xyz'].shape}, min={gaussian_params['xyz'].min():.4f}, max={gaussian_params['xyz'].max():.4f}, mean={gaussian_params['xyz'].mean():.4f}")
+                                print(f"  opacity: shape={gaussian_params['opacity'].shape}, min={gaussian_params['opacity'].min():.4f}, max={gaussian_params['opacity'].max():.4f}, mean={gaussian_params['opacity'].mean():.4f}")
+                                print(f"  sh: shape={gaussian_params['sh'].shape}, min={gaussian_params['sh'].min():.4f}, max={gaussian_params['sh'].max():.4f}, mean={gaussian_params['sh'].mean():.4f}")
+                                print(f"  sigma: shape={gaussian_params['sigma'].shape}, min={gaussian_params['sigma'].min():.4f}, max={gaussian_params['sigma'].max():.4f}, mean={gaussian_params['sigma'].mean():.4f}")
                             
                             # Prepare Target Images
                             target_obs = {}
                             cam_params_dict = {}
-                            
-                            # Use default canonical camera (Identity view)
-                            default_cams = self._get_default_camera_params(z_next.device, z_next.shape[0])
-                            
+
                             # Map dataset keys to loss keys & Identify views
                             valid_views = []
-                            for k, v in future_observation.images.items(): 
+                            for k, v in future_observation.images.items():
                                 img_tensor = v
+
+                                # DEBUG: Print image info at step 0
+                                if step is not None and step % 40 == 0:
+                                    print(f"[DEBUG] Processing image key: '{k}'")
+                                    print(f"[DEBUG]   Shape: {img_tensor.shape}")
+                                    print(f"[DEBUG]   Range BEFORE conversion: min={img_tensor.min():.4f}, max={img_tensor.max():.4f}, mean={img_tensor.mean():.4f}")
+
                                 # Heuristic to identify views
                                 view_name = None
-                                if "agent" in k or "high" in k or "cam_high" in k or "exterior" in k:
+                                if "agent" in k or "high" in k or "cam_high" in k or "exterior" in k or "base" in k:
                                     view_name = "agent"
+                                elif "left_wrist" in k or "wrist_left" in k:
+                                    view_name = "wrist"  # Prefer left wrist
+                                elif "right_wrist" in k or "wrist_right" in k:
+                                    # Skip right wrist if it's all black or if left wrist already exists
+                                    if img_tensor.min() == img_tensor.max() == -1.0:
+                                        if step is not None and step % 40 == 0:
+                                            print(f"[DEBUG] Skipping {k} - all black image")
+                                        continue
+                                    view_name = "wrist"
                                 elif "wrist" in k or "bravo" in k:
                                     view_name = "wrist"
-                                
+
                                 if view_name:
                                     # Ensure format [B, 3, H, W]
                                     if img_tensor.shape[1] != 3 and img_tensor.shape[-1] == 3:
                                         img_tensor = img_tensor.permute(0, 3, 1, 2)
-                                    
-                                    target_obs[f"{view_name}_image"] = img_tensor
-                                    cam_params_dict[view_name] = default_cams
-                                    valid_views.append(view_name)
+
+                                    # IMPORTANT: Convert from [-1, 1] to [0, 1] range
+                                    # Preprocessing normalizes to [-1, 1], but GaussianRenderer outputs [0, 1]
+                                    img_tensor = (img_tensor + 1.0) / 2.0
+
+                                    # DEBUG: Print after conversion
+                                    if step is not None and step % 40 == 0:
+                                        print(f"[DEBUG]   Identified as: {view_name}")
+                                        print(f"[DEBUG]   Range AFTER conversion: min={img_tensor.min():.4f}, max={img_tensor.max():.4f}, mean={img_tensor.mean():.4f}")
+
+                                    # Only add if not already present (avoid duplicates from multiple cameras)
+                                    view_key = f"{view_name}_image"
+                                    if view_key not in target_obs:
+                                        target_obs[view_key] = img_tensor
+
+                                        # Get view-specific camera parameters
+                                        cam_params_dict[view_name] = self._get_camera_params_for_view(
+                                            view_name, z_next.device, z_next.shape[0]
+                                        )
+
+                                        valid_views.append(view_name)
+                                    else:
+                                        if step is not None and step % 40 == 0:
+                                            print(f"[DEBUG]   Skipping duplicate view: {view_name}")
                             
                             if valid_views:
+                                # Only compute rendering loss for agent view (more stable, wider FOV)
+                                # Still collect both views for potential future use
+                                render_views = ["agent"] if "agent" in valid_views else valid_views
+
+                                # DEBUG: Print which views are being rendered
+                                if step is not None and step % 40 == 0:
+                                    print(f"[DEBUG] valid_views: {valid_views}")
+                                    print(f"[DEBUG] render_views: {render_views}")
+                                    print(f"[DEBUG] target_obs keys: {list(target_obs.keys())}")
+
                                 render_loss, _ = compute_multi_view_rendering_loss(
                                     gaussian_params,
                                     target_obs,
                                     cam_params_dict,
                                     self.gaussian_renderer,
-                                    view_names=valid_views
+                                    view_names=render_views
                                 )
                                 # Weight the render loss
                                 loss = loss + 0.1 * render_loss
-                                
-                                if step is not None and step % 100 == 0:
-                                     print(f"Step {step}: Render Loss = {render_loss.item():.4f}")
+
+                                if step is not None and step % 40 == 0:
+                                     print(f"Step {step}: Render Loss = {render_loss.item():.4f} (views: {render_views})")
                                      try:
                                          self._visualize_rendering_comparison(
-                                            step, 
-                                            gaussian_params, 
-                                            target_obs, 
-                                            cam_params_dict, 
-                                            view_names=valid_views
+                                            step,
+                                            gaussian_params,
+                                            target_obs,
+                                            cam_params_dict,
+                                            view_names=render_views  # Only visualize rendered views
                                          )
                                      except Exception as viz_e:
                                          print(f"Rendering visualization failed: {viz_e}")
