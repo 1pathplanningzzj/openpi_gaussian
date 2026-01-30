@@ -11,7 +11,8 @@ from typing import Optional, Tuple, Union
 
 # Removed explicit CLIPTextEncoder to reuse Pi0/PaliGemma's internal embeddings
 # Users should pass the pooled text embedding directly to LGPD.
-
+# zijian it is convenient to have this module here, clip or not PaliGemma. 
+# todo zijian: debug and fix date 2026.0128
 class LanguageGatedPhysicalDistillation(nn.Module):
     """
     Language-Gated Physical Distillation (LGPD) Module.
@@ -65,7 +66,7 @@ class LanguageGatedPhysicalDistillation(nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
-            visual_tokens: [B, N, D] - The 3D/Visual tokens (e.g. from VGGT).
+            visual_tokens: [B, N, D] - The 3D/Visual tokens (e.g. from VGGT reasoning ???).
             text_embedding: [B, D_text] - Pooled text embedding.
         
         Returns:
@@ -78,7 +79,7 @@ class LanguageGatedPhysicalDistillation(nn.Module):
         text_query = self.text_proj(text_embedding).unsqueeze(1)
         
         # 2. Compute Match Score (Dot Product): [B, 1, D] @ [B, D, N] -> [B, 1, N]
-        # We want to know how much each visual token matches the text
+        # We want to know how much each visual token matches the text visulize to confirm it.
         scores = torch.bmm(text_query, visual_tokens.transpose(1, 2))
         scores = scores * self.scale / self.temperature
         
@@ -86,7 +87,6 @@ class LanguageGatedPhysicalDistillation(nn.Module):
         # Use Sigmoid because we want independent probability of being "relevant" per token,
         # not a distribution summing to 1 (Softmax). 
         # But attention usually implies competition. 
-        # If we want "selection", sigmoid is better map for "is this a cup?".
         gate = torch.sigmoid(scores).permute(0, 2, 1) # [B, N, 1]
         
         # 4. Apply Background Bias

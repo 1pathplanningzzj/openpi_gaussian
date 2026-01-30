@@ -124,6 +124,11 @@ class PI0Pytorch(nn.Module):
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
+        # Visualization save directory for rendering comparisons
+        # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
+        import os
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_scale")
+
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
         # Typically Gaussian features join the prefix, so they must match the VLM width
@@ -145,9 +150,13 @@ class PI0Pytorch(nn.Module):
              # Initialize Gaussian Renderer (World Model Supervision)
              try:
                  print("DEBUG: Initializing Gaussian Renderer...")
-                 self.gaussian_renderer = GaussianRenderer(image_size=224, sh_degree=3)
-                 logging.info("Gaussian Renderer initialized for World Model supervision.")
-                 print("DEBUG: Gaussian Renderer initialized successfully.")
+                 # Scale factor to reduce Gaussian sizes for sharper rendering
+                 # If rendering is blurry, reduce this value (e.g., 0.1, 0.05, 0.01)
+                 # Default 0.1 based on empirical testing - adjust if needed
+                 scale_factor = 0.1  # Reduced from 1.0 to improve rendering sharpness
+                 self.gaussian_renderer = GaussianRenderer(image_size=224, sh_degree=3, scale_factor=scale_factor)
+                 logging.info(f"Gaussian Renderer initialized for World Model supervision (scale_factor={scale_factor}).")
+                 print(f"DEBUG: Gaussian Renderer initialized successfully with scale_factor={scale_factor}.")
              except ImportError:
                  self.gaussian_renderer = None
                  logging.warning("Gaussian Renderer not available. Skipping rendering loss.")
@@ -548,7 +557,7 @@ class PI0Pytorch(nn.Module):
             "intrinsics": intrinsics
         }
 
-    def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names):
+    def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names, time_suffix=""):
         """Helper to visualize Rendered vs GT images. Delegated to GaussianRenderer."""
         # Cleanly moved to gaussian_renderer.py
         from openpi.models_pytorch.gaussian_renderer import visualize_rendering_comparison
@@ -559,7 +568,9 @@ class PI0Pytorch(nn.Module):
             target_obs,
             cam_params_dict,
             self.gaussian_renderer,
-            view_names
+            view_names,
+            save_dir=self.vis_save_dir,
+            time_suffix=time_suffix
         )
 
     def forward(self, observation, actions, noise=None, time=None, step=None) -> Tensor:
@@ -689,11 +700,17 @@ class PI0Pytorch(nn.Module):
 
                             # DEBUG: Check Gaussian parameters at step 0
                             if step is not None and step % 40 == 0:
+                                # Convert sigma to scales for debugging
+                                from openpi.models_pytorch.gaussian_renderer import convert_sigma_to_scale_rotation
+                                scales_debug, _ = convert_sigma_to_scale_rotation(gaussian_params['sigma'])
+                                
                                 print(f"\n[DEBUG] Gaussian Parameters:")
                                 print(f"  xyz: shape={gaussian_params['xyz'].shape}, min={gaussian_params['xyz'].min():.4f}, max={gaussian_params['xyz'].max():.4f}, mean={gaussian_params['xyz'].mean():.4f}")
                                 print(f"  opacity: shape={gaussian_params['opacity'].shape}, min={gaussian_params['opacity'].min():.4f}, max={gaussian_params['opacity'].max():.4f}, mean={gaussian_params['opacity'].mean():.4f}")
                                 print(f"  sh: shape={gaussian_params['sh'].shape}, min={gaussian_params['sh'].min():.4f}, max={gaussian_params['sh'].max():.4f}, mean={gaussian_params['sh'].mean():.4f}")
                                 print(f"  sigma: shape={gaussian_params['sigma'].shape}, min={gaussian_params['sigma'].min():.4f}, max={gaussian_params['sigma'].max():.4f}, mean={gaussian_params['sigma'].mean():.4f}")
+                                print(f"  scales (from sigma): min={scales_debug.min():.6f}, max={scales_debug.max():.6f}, mean={scales_debug.mean():.6f}, median={scales_debug.median():.6f}")
+                                print(f"  [NOTE] If scales are too large (>0.1), rendering will be blurry. Try setting renderer.scale_factor=0.1 or smaller.")
                             
                             # Prepare Target Images
                             target_obs = {}
@@ -765,7 +782,7 @@ class PI0Pytorch(nn.Module):
                                     print(f"[DEBUG] valid_views: {valid_views}")
                                     print(f"[DEBUG] render_views: {render_views}")
                                     print(f"[DEBUG] target_obs keys: {list(target_obs.keys())}")
-
+                                    
                                 render_loss, _ = compute_multi_view_rendering_loss(
                                     gaussian_params,
                                     target_obs,
@@ -775,19 +792,57 @@ class PI0Pytorch(nn.Module):
                                 )
                                 # Weight the render loss
                                 loss = loss + 0.1 * render_loss
-
+                                
                                 if step is not None and step % 40 == 0:
                                      print(f"Step {step}: Render Loss = {render_loss.item():.4f} (views: {render_views})")
+                                     
+                                     # Only visualize on main process (rank 0) in distributed training
+                                     # to avoid file conflicts and reduce overhead
                                      try:
-                                         self._visualize_rendering_comparison(
-                                            step,
-                                            gaussian_params,
-                                            target_obs,
-                                            cam_params_dict,
-                                            view_names=render_views  # Only visualize rendered views
-                                         )
-                                     except Exception as viz_e:
-                                         print(f"Rendering visualization failed: {viz_e}")
+                                         import torch.distributed as dist
+                                         is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+                                     except:
+                                         is_main_process = True  # Fallback if DDP not available
+                                     
+                                     if is_main_process:
+                                         try:
+                                             # === Visualization 1: Predicted next state z_{t+1}^{pred} ===
+                                             # This is the original visualization (future frame prediction).
+                                             self._visualize_rendering_comparison(
+                                                 step,
+                                                 gaussian_params,
+                                                 target_obs,
+                                                 cam_params_dict,
+                                                 view_names=render_views,  # Only visualize rendered views
+                                                 time_suffix="_t1_pred"  # z_{t+1}^{pred}
+                                             )
+
+                                             # === Visualization 2 & 3: Decode and render z_t, z_{t+1}^{GT} ===
+                                             # 为了诊断 encoder/decoder + renderer，本地再渲染当前帧和 GT 下一帧的高斯。
+                                             # 注意：这里为了简单，仍然使用 future 的 target_obs/cam_params 做对齐，
+                                             # 主要看 Gaussian 几何和纹理是否合理，而不是严格的时刻匹配。
+                                             gaussian_params_t = self.world_model.decoder(z_t)
+                                             gaussian_params_t1_gt = self.world_model.decoder(z_t1_gt)
+
+                                             # Use same step number but different suffix to couple t and t+1
+                                             self._visualize_rendering_comparison(
+                                                 step,
+                                                 gaussian_params_t,
+                                                 target_obs,
+                                                 cam_params_dict,
+                                                 view_names=render_views,
+                                                 time_suffix="_t"  # z_t (current frame)
+                                             )
+                                             self._visualize_rendering_comparison(
+                                                 step,
+                                                 gaussian_params_t1_gt,
+                                                 target_obs,
+                                                 cam_params_dict,
+                                                 view_names=render_views,
+                                                 time_suffix="_t1_gt"  # z_{t+1}^{GT} (ground truth next frame)
+                                             )
+                                         except Exception as viz_e:
+                                             print(f"Rendering visualization failed: {viz_e}")
                         except Exception as e:
                             # Do not crash training if rendering fails
                             if step is not None and step % 100 == 0:
