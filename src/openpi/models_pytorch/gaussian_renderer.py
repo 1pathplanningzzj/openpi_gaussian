@@ -30,7 +30,7 @@ except ImportError:
 def convert_sigma_to_scale_rotation(sigma_params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Convert 6D covariance parameters to scales and rotations.
-
+    转换协方差矩阵 
     Args:
         sigma_params: [B, N, 6] - Upper triangle of covariance matrix
                       [s11, s12, s13, s22, s23, s33]
@@ -213,10 +213,11 @@ class GaussianRenderer(nn.Module):
     Renders 3D Gaussians to 2D images for supervision.
     """
 
-    def __init__(self, image_size: int = 224, sh_degree: int = 3):
+    def __init__(self, image_size: int = 224, sh_degree: int = 3, scale_factor: float = 1.0):
         super().__init__()
         self.image_size = image_size
         self.sh_degree = sh_degree
+        self.scale_factor = scale_factor  # Scale multiplier to adjust Gaussian sizes
 
         if not RASTERIZER_AVAILABLE:
             raise ImportError(
@@ -239,6 +240,12 @@ class GaussianRenderer(nn.Module):
         scales, rotations = convert_sigma_to_scale_rotation(
             gaussian_params["sigma"]
         )
+        
+        # Apply scale factor to adjust Gaussian sizes (for debugging blurriness)
+        scales = scales * self.scale_factor
+        
+        # Debug: Print scale statistics (only for first batch, every 40 steps would be too verbose here)
+        # You can enable this by checking step number in the calling code
 
         # Create screenspace points tensor for gradient computation
         # Following AD-FFgsStudio convention: use zeros_like with requires_grad
@@ -263,7 +270,7 @@ class GaussianRenderer(nn.Module):
             # Also, it expects Transposed matrices typically? 
             # If using Identity, it doesn't matter. If using real cameras, be careful.
             # AD-FFgsStudio usage passes CUDA tensors directly.
-            
+            # date 2026.01.30 zijianzhang notes 
             raster_settings = GaussianRasterizationSettings(
                 image_height=self.image_size,
                 image_width=self.image_size,
@@ -304,7 +311,7 @@ class GaussianRenderer(nn.Module):
 
         # Stack batch
         rendered_images = torch.stack(rendered_images, dim=0)  # [B, 3, H, W]
-
+        # occ 
         return rendered_images
 
 
@@ -356,7 +363,7 @@ def compute_multi_view_rendering_loss(
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Compute multi-view rendering loss.
-
+    
     Args:
         gaussian_params: 3D Gaussian parameters
         observations: Dictionary with target images for each view
@@ -399,7 +406,7 @@ def compute_multi_view_rendering_loss(
 
     return total_loss, loss_dict
 
-def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params_dict, renderer, view_names):
+def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params_dict, renderer, view_names, save_dir=None, time_suffix=""):
     """
     Helper to visualize Rendered vs GT images.
     Args:
@@ -409,12 +416,18 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
         cam_params_dict: Camera parameters dict
         renderer: Instance of GaussianRenderer
         view_names: List of camera names to visualize
+        save_dir: Optional directory to save visualizations. Defaults to "./visualizations/rendering"
+        time_suffix: Optional suffix to identify time step (e.g., "_t", "_t1_pred", "_t1_gt")
     """
+    import matplotlib
+    # Use non-interactive backend to avoid X11 authorization issues in headless environments
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     import os
     import numpy as np
     
-    save_dir = "./visualizations/rendering"
+    if save_dir is None:
+        save_dir = "./visualizations/rendering"
     os.makedirs(save_dir, exist_ok=True)
     
     # Take first item in batch
@@ -484,7 +497,11 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
             axes[i, 2].axis('off')
             
     plt.tight_layout()
-    save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}.png")
+    # Include time suffix in filename to identify t vs t+1
+    if time_suffix:
+        save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}.png")
+    else:
+        save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}.png")
     plt.savefig(save_path)
     plt.close(fig)
     print(f"Saved Rendering Visualization to {save_path}")
