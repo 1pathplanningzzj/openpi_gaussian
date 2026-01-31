@@ -127,7 +127,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_scale")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_scale_vggt_decoder")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -651,10 +651,18 @@ class PI0Pytorch(nn.Module):
             # Let's temporarily re-encode to be safe and clean.
             
             # Z_t: [B, N, D]
-            z_t, _ = self.gaussian_adapter(self._prepare_gaussian_inputs(observation, actions.device, actions.shape[0]))
+            # Also get decoded Gaussian parameters from VGGT for supervision
+            z_t, _, gaussian_params_t = self.gaussian_adapter(
+                self._prepare_gaussian_inputs(observation, actions.device, actions.shape[0]),
+                return_gaussian_params=True
+            )
             
             # 2. Encode Ground Truth Future Z_{t+1}
-            z_t1_gt, _ = self.gaussian_adapter(self._prepare_gaussian_inputs(future_observation, actions.device, actions.shape[0]))
+            # Get decoded Gaussian parameters for future frame (ground truth)
+            z_t1_gt, _, gaussian_params_t1_gt = self.gaussian_adapter(
+                self._prepare_gaussian_inputs(future_observation, actions.device, actions.shape[0]),
+                return_gaussian_params=True
+            )
             
             if z_t is not None and z_t1_gt is not None:
                 # 3. World Model Forward
@@ -696,7 +704,41 @@ class PI0Pytorch(nn.Module):
                             # z_next: [B, N, D]
                             
                             # Decode to Gaussian Parameters
+                            # World Model decoder 从 tokens 解码为 Gaussian 参数
                             gaussian_params = self.world_model.decoder(z_next)
+                            
+                            # === VGGT Decoder Supervision Loss ===
+                            # 使用 VGGT 解码的参数作为监督目标，帮助 World Model decoder 学习正确的映射
+                            if gaussian_params_t1_gt is not None:
+                                from openpi.models_pytorch.pi0_vggt import compute_vggt_decoder_supervision_loss
+                                
+                                # 准备相机参数（如果可用）
+                                # 注意：cam_params_dict 在后面才定义，所以这里先设为 None
+                                camera_params_for_supervision = None
+                                # TODO: 如果需要相机参数进行监督，可以从 future_observation 中提取
+                                # 暂时不使用相机参数，因为 VGGT 参数转换可以在没有相机参数的情况下工作
+                                
+                                # 计算监督损失
+                                decoder_supervision_loss, decoder_loss_dict = compute_vggt_decoder_supervision_loss(
+                                    decoder_params=gaussian_params,
+                                    vggt_params_dict=gaussian_params_t1_gt,
+                                    camera_params=camera_params_for_supervision,
+                                    lambda_xyz=1.0,
+                                    lambda_opacity=1.0,
+                                    lambda_sh=1.0,
+                                    lambda_sigma=0.5
+                                )
+                                
+                                # 添加到总损失（使用较小的权重，因为这是辅助损失）
+                                lambda_decoder_supervision = 0.1  # 可以调整这个权重
+                                loss = loss + lambda_decoder_supervision * decoder_supervision_loss
+                                
+                                # Debug logging
+                                if step is not None and step % 40 == 0:
+                                    print(f"\n[VGGT Decoder Supervision Loss]")
+                                    print(f"  Total: {decoder_supervision_loss.item():.6f}")
+                                    for k, v in decoder_loss_dict.items():
+                                        print(f"  {k}: {v.item():.6f}")
 
                             # DEBUG: Check Gaussian parameters at step 0
                             if step is not None and step % 40 == 0:
