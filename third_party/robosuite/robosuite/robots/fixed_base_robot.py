@@ -42,6 +42,7 @@ class FixedBaseRobot(Robot):
         """
         Loads controller to be used for dynamic trajectories
         """
+        print(f"[DEBUG] _load_controller using self.sim: {id(self.sim)}")
         # Flag for loading urdf once (only applicable for IK controllers)
         self.composite_controller = composite_controller_factory(
             type=self.composite_controller_config.get("type", "BASIC"),

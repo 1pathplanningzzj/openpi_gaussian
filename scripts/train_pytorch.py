@@ -96,7 +96,14 @@ def setup_ddp():
     use_ddp = world_size > 1
     if use_ddp and not torch.distributed.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
+        # Increase timeout to 30 minutes (1800 seconds) to handle slow operations like visualization
+        import datetime
+        timeout = datetime.timedelta(seconds=1800)
+        torch.distributed.init_process_group(
+            backend=backend, 
+            init_method="env://",
+            timeout=timeout
+        )
 
         # Set up debugging environment variables for DDP issues
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:

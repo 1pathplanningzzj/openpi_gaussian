@@ -37,13 +37,26 @@ def preprocess_observation_pytorch(
     for key in image_keys:
         image = observation.images[key]
 
-        # TODO: This is a hack to handle both [B, C, H, W] and [B, H, W, C] formats
-        # Handle both [B, C, H, W] and [B, H, W, C] formats
-        is_channels_first = image.shape[1] == 3  # Check if channels are in dimension 1
+        # Handle temporal dimension: [B, T, H, W, C] or [B, T, C, H, W]
+        has_temporal = image.ndim == 5
+        is_channels_first = False  # Initialize for non-temporal case
+        
+        if has_temporal:
+            B, T = image.shape[0], image.shape[1]
+            # Reshape to [B*T, ...] for processing, then reshape back
+            if image.shape[2] == 3:  # [B, T, C, H, W]
+                image = image.view(B * T, *image.shape[2:])  # [B*T, C, H, W]
+                image = image.permute(0, 2, 3, 1)  # [B*T, H, W, C]
+            else:  # [B, T, H, W, C]
+                image = image.view(B * T, *image.shape[2:])  # [B*T, H, W, C]
+        else:
+            # TODO: This is a hack to handle both [B, C, H, W] and [B, H, W, C] formats
+            # Handle both [B, C, H, W] and [B, H, W, C] formats
+            is_channels_first = image.shape[1] == 3  # Check if channels are in dimension 1
 
-        if is_channels_first:
-            # Convert [B, C, H, W] to [B, H, W, C] for processing
-            image = image.permute(0, 2, 3, 1)
+            if is_channels_first:
+                # Convert [B, C, H, W] to [B, H, W, C] for processing
+                image = image.permute(0, 2, 3, 1)
 
         if image.dtype == torch.uint8:
             image = image.to(torch.float32) / 127.5 - 1.0
@@ -144,9 +157,14 @@ def preprocess_observation_pytorch(
             # Back to [-1, 1]
             image = image * 2.0 - 1.0
 
-        # Convert back to [B, C, H, W] format if it was originally channels-first
-        if is_channels_first:
-            image = image.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+        # Reshape back to temporal dimension if needed
+        if has_temporal:
+            # Reshape from [B*T, H, W, C] back to [B, T, H, W, C]
+            image = image.view(B, T, *image.shape[1:])  # [B, T, H, W, C]
+        else:
+            # Convert back to [B, C, H, W] format if it was originally channels-first
+            if is_channels_first:
+                image = image.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
 
         out_images[key] = image
 

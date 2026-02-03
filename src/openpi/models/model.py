@@ -206,6 +206,74 @@ class Observation(Generic[ArrayT]):
                     T = batch_dims_from_images[1]
                     data["tokenized_prompt_mask"] = prompt_mask.unsqueeze(1).expand(-1, T, -1)
 
+        # Handle state with temporal dimension and dtype
+        # If images have temporal dimension [B, T_img, ...], state might have different temporal dimension [B, T_state, s]
+        # Type annotation expects [*b, s] where *b should match between images and state
+        # We need to ensure state's temporal dimension matches images' temporal dimension
+        # Also convert to float32 if needed (type annotation expects Float, not f64)
+        state = data["state"]
+        
+        # Convert dtype to float32 if needed
+        if isinstance(state, torch.Tensor):
+            if state.dtype != torch.float32:
+                state = state.to(torch.float32)
+        elif isinstance(state, np.ndarray):
+            if state.dtype != np.float32:
+                state = state.astype(np.float32)
+        # JAX arrays are typically float32 by default
+        
+        if batch_dims_from_images is not None and len(batch_dims_from_images) > 1:
+            # Images have temporal dimension [B, T_img, ...]
+            T_img = batch_dims_from_images[1]
+            if isinstance(state, torch.Tensor):
+                if state.ndim == 2 and state.shape[0] == batch_dims_from_images[0]:
+                    # State is [B, s] but images are [B, T_img, ...], expand state to [B, T_img, s]
+                    state = state.unsqueeze(1).expand(-1, T_img, -1)
+                    data["state"] = state
+                elif state.ndim == 3 and state.shape[0] == batch_dims_from_images[0]:
+                    # State is [B, T_state, s] but images are [B, T_img, ...]
+                    # If T_state != T_img, we need to align them
+                    T_state = state.shape[1]
+                    if T_state != T_img:
+                        # State has fewer frames (e.g., [t, t+1] = 2 frames) but images have more (e.g., 6 frames)
+                        # We'll repeat the last frame to match images' temporal dimension
+                        # This is needed for World Model which only needs [t, t+1]
+                        if T_state < T_img:
+                            # Repeat the last frame: [B, T_state, s] -> [B, T_img, s]
+                            last_frame = state[:, -1:, :]  # [B, 1, s]
+                            padding = last_frame.repeat(1, T_img - T_state, 1)  # [B, T_img - T_state, s]
+                            state = torch.cat([state, padding], dim=1)  # [B, T_img, s]
+                            data["state"] = state
+                        else:
+                            # State has more frames, take first T_img frames
+                            state = state[:, :T_img, :]
+                            data["state"] = state
+            elif hasattr(state, "ndim"):
+                # Handle JAX/numpy arrays
+                if state.ndim == 2 and state.shape[0] == batch_dims_from_images[0]:
+                    # State is [B, s], expand to [B, T_img, s]
+                    if isinstance(state, np.ndarray):
+                        state = np.broadcast_to(state[:, None, :], (state.shape[0], T_img, state.shape[1]))
+                    else:  # JAX array
+                        state = jnp.broadcast_to(state[:, None, :], (state.shape[0], T_img, state.shape[1]))
+                    data["state"] = state
+                elif state.ndim == 3 and state.shape[0] == batch_dims_from_images[0]:
+                    T_state = state.shape[1]
+                    if T_state != T_img:
+                        if T_state < T_img:
+                            # Repeat last frame
+                            last_frame = state[:, -1:, :]
+                            if isinstance(state, np.ndarray):
+                                padding = np.repeat(last_frame, T_img - T_state, axis=1)
+                            else:  # JAX array
+                                padding = jnp.repeat(last_frame, T_img - T_state, axis=1)
+                            state = np.concatenate([state, padding], axis=1) if isinstance(state, np.ndarray) else jnp.concatenate([state, padding], axis=1)
+                            data["state"] = state
+                        else:
+                            # Take first T_img frames
+                            state = state[:, :T_img, :]
+                            data["state"] = state
+
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],

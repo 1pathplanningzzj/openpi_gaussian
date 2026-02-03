@@ -96,7 +96,7 @@ class Args:
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = (
-        "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+        "libero_goal"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
@@ -104,7 +104,7 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/gaussian_world_model_exp0126_14000_spatial/videos"  # Path to save videos
+    video_out_path: str = "data/gaussian_world_model_exp0131_2000_goal_2/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -193,6 +193,37 @@ def _get_target_object_pos(env, task_description):
 def eval_libero(args: Args) -> None:
     # Set random seed
     np.random.seed(args.seed)
+
+    # Setup logging to save log file in the data directory (parent of video_out_path)
+    # video_out_path is typically "data/xxx/videos", so data_dir is "data/xxx"
+    data_dir = pathlib.Path(args.video_out_path).parent
+    data_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Configure logging to both console and file
+    # Note: basicConfig can only be called once, so we need to add handlers to the root logger
+    log_file = data_dir / "eval.log"
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers to avoid duplicates
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Add file handler
+    file_handler = logging.FileHandler(log_file, mode='a')
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    root_logger.addHandler(file_handler)
+    
+    # Add console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+    root_logger.addHandler(console_handler)
+    
+    logging.info(f"Logging to: {log_file}")
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
