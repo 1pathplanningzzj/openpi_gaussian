@@ -1,6 +1,7 @@
 # zijian
 # date 2026.01.19
 # Description: Main PI0 PyTorch model implementation with integrated 3D Gaussian Splatting (DF3DGS) support.
+import json
 import logging
 import math
 
@@ -14,7 +15,8 @@ from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 from openpi.models_pytorch.pi0_vggt import GaussianAdapter
 # Import the new World Model
-from openpi.models_pytorch.pi0_world_model import BiDirectionalWorldModel, visualize_world_model_prediction
+from openpi.models_pytorch.pi0_cross_attention_world_model import CrossAttentionWorldModel
+from openpi.models_pytorch.pi0_world_model import visualize_world_model_prediction
 # Import Gaussian Renderer
 from openpi.models_pytorch.gaussian_renderer import GaussianRenderer, compute_multi_view_rendering_loss
 
@@ -127,12 +129,34 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_scale_vggt_decoder")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_scale_vggt_3frames_1futureframe")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
         # Typically Gaussian features join the prefix, so they must match the VLM width
-        self.gaussian_adapter = GaussianAdapter(use_gaussian, paligemma_config.width)
+        # Disable LGPD for now to test training stability
+        self.gaussian_adapter = GaussianAdapter(use_gaussian, paligemma_config.width, use_lgpd=False)
+        
+        # --- VAE Token Compressor (Option B: Hybrid) ---
+        # VAE is used only for reconstruction supervision (auxiliary loss)
+        # Main pipeline still uses pooling/upsampling for efficiency
+        use_vae_supervision = getattr(config, "use_vae_supervision", False)
+        self.use_vae_supervision = use_vae_supervision
+        if use_vae_supervision and use_gaussian:
+            from .vae_token_compressor import VAETokenCompressor
+            # VAE compresses 1369 tokens to 100 tokens
+            # token_dim is the VGGT embed_dim (2048) or action_expert_width
+            vae_token_dim = paligemma_config.width  # Match action_expert_width
+            vae_beta = getattr(config, "vae_beta", 0.01)  # KL divergence weight
+            self.vae_compressor = VAETokenCompressor(
+                token_dim=vae_token_dim,
+                latent_tokens=100,  # Match pooled tokens
+                hidden_dim=512,
+                beta=vae_beta
+            )
+            logging.info(f"Initialized VAE Token Compressor for supervision (beta={vae_beta})")
+        else:
+            self.vae_compressor = None
         
         # --- BiDirectional World Model ---
         # Using same width as adaptation layer (e.g. 2048 or projected width)
@@ -140,31 +164,58 @@ class PI0Pytorch(nn.Module):
         # so z_t has dimension `paligemma_config.width`.
         # Use world model config
         if hasattr(config, "use_world_model") and config.use_world_model:
-             logging.info("Initializing BiDirectional World Model...")
-             print(f"DEBUG: Initializing World Model. Config has use_world_model={config.use_world_model}")
-             self.world_model = BiDirectionalWorldModel(
+            logging.info("Initializing Cross-Attention World Model...")
+            print(f"DEBUG: Initializing World Model. Config has use_world_model={config.use_world_model}")
+            # Use VGGT decoder if available
+            use_vggt_decoder = (self.gaussian_adapter.use_gaussian and 
+                                self.gaussian_adapter.encoder is not None and
+                                hasattr(self.gaussian_adapter.encoder, 'gs_head'))
+            vggt_decoder = self.gaussian_adapter.encoder.gs_head if use_vggt_decoder else None
+            
+            # Get VGGT embed_dim from encoder if available
+            vggt_embed_dim = 1024  # Default VGGT embed_dim
+            if use_vggt_decoder and hasattr(self.gaussian_adapter.encoder, 'embed_dim'):
+                vggt_embed_dim = self.gaussian_adapter.encoder.embed_dim
+            
+            self.world_model = CrossAttentionWorldModel(
                  token_dim=paligemma_config.width, # Latents are projected to VLM width
-                 action_dim=32 # Action dim is standard for Pi0
-             )
-             
-             # Initialize Gaussian Renderer (World Model Supervision)
-             try:
-                 print("DEBUG: Initializing Gaussian Renderer...")
-                 # Scale factor to reduce Gaussian sizes for sharper rendering
-                 # If rendering is blurry, reduce this value (e.g., 0.1, 0.05, 0.01)
-                 # Default 0.1 based on empirical testing - adjust if needed
-                 scale_factor = 0.1  # Reduced from 1.0 to improve rendering sharpness
-                 self.gaussian_renderer = GaussianRenderer(image_size=224, sh_degree=3, scale_factor=scale_factor)
-                 logging.info(f"Gaussian Renderer initialized for World Model supervision (scale_factor={scale_factor}).")
-                 print(f"DEBUG: Gaussian Renderer initialized successfully with scale_factor={scale_factor}.")
-             except ImportError:
-                 self.gaussian_renderer = None
-                 logging.warning("Gaussian Renderer not available. Skipping rendering loss.")
-                 print("DEBUG: Gaussian Renderer FAILED to initialize (ImportError).")
+                 action_dim=32, # Action dim is standard for Pi0
+                 use_vggt_decoder=use_vggt_decoder,
+                 vggt_decoder=vggt_decoder,
+                input_num_tokens=300,  # GaussianAdapter: 100 tokens/frame * 3 frames = 300 tokens (with frame pos encoding)
+                                    # If frame_pos_encoding disabled, this should be 100
+                 target_num_tokens=1369,  # VGGT decoder expects 37x37=1369 patch tokens
+                vggt_embed_dim=vggt_embed_dim,  # VGGT encoder's embed_dim (1024)
+                cross_attn_config={
+                    "num_heads": 8,
+                    "num_layers": 2,
+                    "mlp_ratio": 4.0,
+                    "dropout": 0.1,
+                    "use_positional_encoding": True,
+                }
+            )
+            
+            if use_vggt_decoder:
+                logging.info("World Model will use VGGT decoder instead of Privileged4DGSDecoder")
+            
+            # Initialize Gaussian Renderer (World Model Supervision)
+            try:
+                print("DEBUG: Initializing Gaussian Renderer...")
+                # Scale factor to reduce Gaussian sizes for sharper rendering
+                # If rendering is blurry, reduce this value (e.g., 0.1, 0.05, 0.01)
+                # Default 0.1 based on empirical testing - adjust if needed
+                scale_factor = 0.1  # Reduced from 1.0 to improve rendering sharpness
+                self.gaussian_renderer = GaussianRenderer(image_size=224, sh_degree=3, scale_factor=scale_factor)
+                logging.info(f"Gaussian Renderer initialized for World Model supervision (scale_factor={scale_factor}).")
+                print(f"DEBUG: Gaussian Renderer initialized successfully with scale_factor={scale_factor}.")
+            except ImportError:
+                self.gaussian_renderer = None
+                logging.warning("Gaussian Renderer not available. Skipping rendering loss.")
+                print("DEBUG: Gaussian Renderer FAILED to initialize (ImportError).")
         else:
-             print(f"DEBUG: Skipping World Model initialization. config.use_world_model={getattr(config, 'use_world_model', 'MISSING')}")
-             self.world_model = None
-             self.gaussian_renderer = None
+            print(f"DEBUG: Skipping World Model initialization. config.use_world_model={getattr(config, 'use_world_model', 'MISSING')}")
+            self.world_model = None
+            self.gaussian_renderer = None
         # -------------------------------
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
@@ -233,6 +284,10 @@ class PI0Pytorch(nn.Module):
                     idx_curr, idx_fut = 0, 1
                 elif time_dim == 3:  # Prev, Curr, Next (from delta_timestamps=[-1, 0, 1])
                     idx_curr, idx_fut = 1, 2
+                elif time_dim == 4:  # [t-2, t-1, t, t+1] (format for VGGT 3 frames + World Model)
+                    idx_curr, idx_fut = 2, 3  # Current is at idx=2 (t), future is at idx=3 (t+1)
+                elif time_dim == 6:  # [t-4, t-3, t-2, t-1, t, t+1] (old format for VGGT 5 frames + World Model)
+                    idx_curr, idx_fut = 4, 5  # Current is at idx=4 (t), future is at idx=5 (t+1)
                 
                 # DEBUG PRINT
                 if train and torch.rand(1).item() < 0.01:
@@ -240,19 +295,51 @@ class PI0Pytorch(nn.Module):
 
                 if idx_fut > 0:
                     curr_imgs, fut_imgs = {}, {}
+                    # For VGGT, we need multiple frames, so keep the temporal dimension
+                    # For World Model and other processing, we extract single frames
                     for k, v in observation.images.items():
-                        # Extract single frame [B, H, W, C]
-                        curr_imgs[k] = v[:, idx_curr]
+                        # Keep temporal dimension for VGGT: [B, T, H, W, C]
+                        # VGGT will extract the needed frames in prepare_inputs
+                        curr_imgs[k] = v  # Keep full temporal sequence [B, T, H, W, C]
+                        # #region agent log
+                        try:
+                            with open('/home/zijianzhang/openpi/.cursor/debug.log', 'a') as f:
+                                log_entry = {
+                                    "sessionId": "debug-session",
+                                    "runId": "run1",
+                                    "hypothesisId": "B",
+                                    "location": "pi0_pytorch.py:252",
+                                    "message": "after keeping temporal dimension in curr_imgs",
+                                    "data": {
+                                        "key": k,
+                                        "curr_img_shape": list(v.shape),
+                                        "curr_img_ndim": v.ndim
+                                    },
+                                    "timestamp": int(__import__('time').time() * 1000)
+                                }
+                                f.write(json.dumps(log_entry) + '\n')
+                        except: pass
+                        # #endregion
+                        # Extract single frame for future observation [B, H, W, C]
                         fut_imgs[k] = v[:, idx_fut]
                     
                     curr_state = observation.state
                     fut_state = observation.state
                     
                     # Handle state [B, T, D]
-                    if observation.state is not None and observation.state.ndim == 3:
-                         if observation.state.shape[1] == time_dim:
-                             curr_state = observation.state[:, idx_curr]
-                             fut_state = observation.state[:, idx_fut]
+                    # For VGGT, we need to keep temporal dimension for state to match images
+                    if observation.state is not None:
+                        if observation.state.ndim == 3:
+                            # State has temporal dimension [B, T, D]
+                            if observation.state.shape[1] == time_dim:
+                                # Keep full temporal dimension for current (VGGT needs it)
+                                curr_state = observation.state  # Keep [B, T, D] for VGGT
+                                fut_state = observation.state[:, idx_fut]  # Single frame for future
+                        elif observation.state.ndim == 2:
+                            # State is [B, D], expand to [B, T, D] to match images
+                            # Repeat state for all time frames
+                            curr_state = observation.state.unsqueeze(1).expand(-1, time_dim, -1)  # [B, T, D]
+                            fut_state = observation.state  # Keep [B, D] for future
 
                     # Clone observation for future
                     # Note: We must also slice the masks and prompts to match the single-step batch dimension,
@@ -263,25 +350,39 @@ class PI0Pytorch(nn.Module):
                     curr_masks = {}
                     for k, v in observation.image_masks.items():
                         if v.ndim == 2: # [B, T]
-                            curr_masks[k] = v[:, idx_curr]
-                            fut_masks[k] = v[:, idx_fut]
+                            # Keep full temporal dimension for current (VGGT needs it)
+                            curr_masks[k] = v  # Keep [B, T] for VGGT
+                            fut_masks[k] = v[:, idx_fut]  # Single frame for future
                         else: # [B] - assume valid for all steps
                             curr_masks[k] = v
                             fut_masks[k] = v
                             
                     # 2. Slice Prompts
                     # Prompts might be expanded to [B, T, L] in model.py
+                    # For VGGT, we need to keep temporal dimension to match images
                     curr_prompt = observation.tokenized_prompt
                     fut_prompt = observation.tokenized_prompt
-                    if curr_prompt is not None and curr_prompt.ndim == 3: # [B, T, L]
-                        curr_prompt = curr_prompt[:, idx_curr]
-                        fut_prompt = fut_prompt[:, idx_fut]
+                    if curr_prompt is not None:
+                        if curr_prompt.ndim == 3: # [B, T, L]
+                            # Keep full temporal dimension for current (VGGT needs it)
+                            curr_prompt = curr_prompt  # Keep [B, T, L] for VGGT
+                            fut_prompt = curr_prompt[:, idx_fut]  # Single frame for future
+                        elif curr_prompt.ndim == 2: # [B, L]
+                            # Expand to [B, T, L] to match images
+                            curr_prompt = curr_prompt.unsqueeze(1).expand(-1, time_dim, -1)  # [B, T, L]
+                            fut_prompt = observation.tokenized_prompt  # Keep [B, L] for future
                         
                     curr_prompt_mask = observation.tokenized_prompt_mask
                     fut_prompt_mask = observation.tokenized_prompt_mask
-                    if curr_prompt_mask is not None and curr_prompt_mask.ndim == 3: # [B, T, L]
-                        curr_prompt_mask = curr_prompt_mask[:, idx_curr]
-                        fut_prompt_mask = fut_prompt_mask[:, idx_fut]
+                    if curr_prompt_mask is not None:
+                        if curr_prompt_mask.ndim == 3: # [B, T, L]
+                            # Keep full temporal dimension for current (VGGT needs it)
+                            curr_prompt_mask = curr_prompt_mask  # Keep [B, T, L] for VGGT
+                            fut_prompt_mask = curr_prompt_mask[:, idx_fut]  # Single frame for future
+                        elif curr_prompt_mask.ndim == 2: # [B, L]
+                            # Expand to [B, T, L] to match images
+                            curr_prompt_mask = curr_prompt_mask.unsqueeze(1).expand(-1, time_dim, -1)  # [B, T, L]
+                            fut_prompt_mask = observation.tokenized_prompt_mask  # Keep [B, L] for future
 
                     future_observation = observation.replace(
                         images=fut_imgs, 
@@ -302,14 +403,59 @@ class PI0Pytorch(nn.Module):
                     # Also preprocess future observation (normalization etc)
                     future_observation = _preprocessing.preprocess_observation_pytorch(future_observation, train=False)
 
+        # #region agent log
+        try:
+            with open('/home/zijianzhang/openpi/.cursor/debug.log', 'a') as f:
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": "B",
+                    "location": "pi0_pytorch.py:before_preprocess",
+                    "message": "before preprocess_observation_pytorch - check observation.images",
+                    "data": {
+                        "observation_images_keys": list(observation.images.keys()) if hasattr(observation, 'images') else None,
+                        "observation_images_shapes": {k: list(v.shape) if hasattr(v, 'shape') else None for k, v in observation.images.items()} if hasattr(observation, 'images') else None,
+                        "observation_images_ndims": {k: v.ndim if hasattr(v, 'ndim') else None for k, v in observation.images.items()} if hasattr(observation, 'images') else None
+                    },
+                    "timestamp": int(__import__('time').time() * 1000)
+                }
+                f.write(json.dumps(log_entry) + '\n')
+        except: pass
+        # #endregion
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        # #region agent log
+        try:
+            with open('/home/zijianzhang/openpi/.cursor/debug.log', 'a') as f:
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": "B",
+                    "location": "pi0_pytorch.py:after_preprocess",
+                    "message": "after preprocess_observation_pytorch - check observation.images",
+                    "data": {
+                        "observation_images_keys": list(observation.images.keys()) if hasattr(observation, 'images') else None,
+                        "observation_images_shapes": {k: list(v.shape) if hasattr(v, 'shape') else None for k, v in observation.images.items()} if hasattr(observation, 'images') else None,
+                        "observation_images_ndims": {k: v.ndim if hasattr(v, 'ndim') else None for k, v in observation.images.items()} if hasattr(observation, 'images') else None
+                    },
+                    "timestamp": int(__import__('time').time() * 1000)
+                }
+                f.write(json.dumps(log_entry) + '\n')
+        except: pass
+        # #endregion
+        
+        # Store the preprocessed observation for later use in World Model
+        # This ensures that when _prepare_gaussian_inputs is called later, it uses the observation
+        # with preserved temporal dimension, not the original one
+        preprocessed_observation = observation
+        
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
             observation.state,
-            future_observation
+            future_observation,
+            preprocessed_observation  # Return preprocessed observation for World Model
         )
 
     def sample_noise(self, shape, device):
@@ -344,17 +490,47 @@ class PI0Pytorch(nn.Module):
 
         lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
         
+        # Handle temporal dimension in lang_emb if present
+        # lang_emb might be [B, SeqLen, D] or [B, T, SeqLen, D]
+        # For concatenation with other embeddings, we need [B, SeqLen, D] or [B, T*SeqLen, D]
+        lang_emb_original = lang_emb
+        lang_masks_original = lang_masks
+        if lang_emb.ndim == 4:  # [B, T, SeqLen, D] - has temporal dimension
+            B, T, S, D = lang_emb.shape
+            # Flatten temporal and sequence dimensions: [B, T, SeqLen, D] -> [B, T*SeqLen, D]
+            lang_emb = lang_emb.view(B, T * S, D)  # [B, T*SeqLen, D]
+            lang_masks = lang_masks.view(B, T * S)  # [B, T*SeqLen]
+            # For text embedding pooling, use original shape
+            lang_emb_for_pooling = lang_emb_original
+            lang_masks_for_pooling = lang_masks_original
+        else:
+            lang_emb_for_pooling = lang_emb
+            lang_masks_for_pooling = lang_masks
+        
         # --- 3D Gaussian Encoder ---
         # Delegated to Adapter
         # Pass Pooled Text Embedding for LGPD
-        # lang_emb: [B, SeqLen, D] -> [B, D] via Mean/Max Pooling
-        # Need to consider masks? lang_masks [B, SeqLen] (1=valid, 0=pad)
+        # lang_emb: [B, SeqLen, D] or [B, T, SeqLen, D] -> [B, D] or [B, T, D] via Mean/Max Pooling
+        # Need to consider masks? lang_masks [B, SeqLen] or [B, T, SeqLen] (1=valid, 0=pad)
         if self.gaussian_adapter.use_lgpd:
-            # Masked Mean Pooling
-            mask_float = lang_masks.unsqueeze(-1).float() # [B, S, 1]
-            sum_emb = (lang_emb * mask_float).sum(dim=1)
-            sum_mask = mask_float.sum(dim=1).clamp(min=1e-6)
-            text_embedding = sum_emb / sum_mask # [B, D]
+            # Handle temporal dimension if present
+            if lang_emb_for_pooling.ndim == 4:  # [B, T, SeqLen, D] - has temporal dimension
+                # Flatten temporal and sequence dimensions for pooling
+                B, T, S, D = lang_emb_for_pooling.shape
+                lang_emb_flat = lang_emb_for_pooling.view(B * T, S, D)  # [B*T, S, D]
+                lang_masks_flat = lang_masks_for_pooling.view(B * T, S)  # [B*T, S]
+                mask_float = lang_masks_flat.unsqueeze(-1).float()  # [B*T, S, 1]
+                sum_emb = (lang_emb_flat * mask_float).sum(dim=1)  # [B*T, D]
+                sum_mask = mask_float.sum(dim=1).clamp(min=1e-6)  # [B*T, 1]
+                text_embedding_flat = sum_emb / sum_mask  # [B*T, D]
+                # Reshape back to [B, T, D] and take mean over time dimension
+                text_embedding = text_embedding_flat.view(B, T, D).mean(dim=1)  # [B, D]
+            else:  # [B, SeqLen, D] - no temporal dimension
+                # Masked Mean Pooling
+                mask_float = lang_masks_for_pooling.unsqueeze(-1).float()  # [B, S, 1]
+                sum_emb = (lang_emb_for_pooling * mask_float).sum(dim=1)  # [B, D]
+                sum_mask = mask_float.sum(dim=1).clamp(min=1e-6)  # [B, 1]
+                text_embedding = sum_emb / sum_mask  # [B, D]
         else:
             text_embedding = None
 
@@ -369,19 +545,45 @@ class PI0Pytorch(nn.Module):
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
+            # Handle temporal dimension: [B, T, H, W, C] or [B, H, W, C]
+            has_temporal = img.ndim == 5
+            if has_temporal:
+                B, T = img.shape[0], img.shape[1]
+                # Flatten temporal dimension: [B, T, H, W, C] -> [B*T, H, W, C]
+                img_flat = img.view(B * T, *img.shape[2:])  # [B*T, H, W, C]
+                # Encode all frames at once
+                def image_embed_func(img_flat):
+                    return self.paligemma_with_expert.embed_image(img_flat)
+                
+                img_emb_flat = self._apply_checkpoint(image_embed_func, img_flat)
+                # img_emb_flat: [B*T, N, D] where N is number of image tokens
+                num_img_embs = img_emb_flat.shape[1]
+                # Reshape back: [B*T, N, D] -> [B, T, N, D]
+                img_emb = img_emb_flat.view(B, T, num_img_embs, img_emb_flat.shape[-1])
+                # Flatten time and token dimensions: [B, T, N, D] -> [B, T*N, D]
+                img_emb = img_emb.view(B, T * num_img_embs, img_emb_flat.shape[-1])
+                
+                # Handle mask: [B, T] -> expand to [B, T*N]
+                img_mask_expanded = img_mask.unsqueeze(-1).expand(-1, -1, num_img_embs)  # [B, T, N]
+                img_mask_flat = img_mask_expanded.reshape(B, T * num_img_embs)  # [B, T*N]
+            else:
+                # No temporal dimension: [B, H, W, C]
+                def image_embed_func(img):
+                    return self.paligemma_with_expert.embed_image(img)
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
-
-            img_emb = self._apply_checkpoint(image_embed_func, img)
-
-            bsize, num_img_embs = img_emb.shape[:2]
+                img_emb = self._apply_checkpoint(image_embed_func, img)
+                bsize, num_img_embs = img_emb.shape[:2]
+                img_mask_flat = img_mask[:, None].expand(bsize, num_img_embs)
 
             embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+            pad_masks.append(img_mask_flat)
 
             # Create attention masks so that image tokens attend to each other
-            att_masks += [0] * num_img_embs
+            if has_temporal:
+                # For temporal images, each time frame's tokens attend to each other
+                att_masks += [0] * (T * num_img_embs)
+            else:
+                att_masks += [0] * num_img_embs
 
         # Append language tokens (already computed)
         embs.append(lang_emb)
@@ -480,9 +682,16 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def _prepare_gaussian_inputs(self, observation, device, batch_size):
-        """Helper to prepare inputs for 3DGS encoder from observation."""
-        return self.gaussian_adapter.prepare_inputs(observation, device, batch_size)
+    def _prepare_gaussian_inputs(self, observation, device, batch_size, is_training=None):
+        """Helper to prepare inputs for 3DGS encoder from observation.
+        
+        Args:
+            is_training: If True, uses training mode (more frames). If False, uses inference mode (fewer frames).
+                        If None, auto-detects from model.training.
+        """
+        if is_training is None:
+            is_training = self.training
+        return self.gaussian_adapter.prepare_inputs(observation, device, batch_size, is_training=is_training)
 
     def _get_camera_params_for_view(self, view_name, device, batch_size):
         """Get camera parameters for specific view (agent or wrist)."""
@@ -519,20 +728,36 @@ class PI0Pytorch(nn.Module):
             # If Gaussians are in world coordinates, identity might work better
             viewmatrix = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
             # CRITICAL FIX: Translate world away from camera (Z-axis)
-            # Gaussian stats show mean ~ 0. We need Z > znear (0.01).
-            # Shift everything by +2.0 in Z.
-            viewmatrix[:, 2, 3] = 2.0 
+            # 
+            # What this does:
+            # - viewmatrix transforms world coordinates to camera coordinates
+            # - viewmatrix[:, 2, 3] = T means: shift scene by +T along Z-axis
+            # - This is equivalent to: camera at Z=-T, looking at +Z direction
+            # 
+            # Why we need this:
+            # - Gaussian Z values can be negative (e.g., [-10, 0])
+            # - In camera space, Z < 0 means "behind camera" → frustum culled → black rendering
+            # - By translating +10.0, we ensure: Z_new = Z_old + 10.0 > 0 (in front of camera)
+            # 
+            # Constraints:
+            # - Must be large enough: T > -min(Z_gaussian) to avoid negative Z_cam
+            # - Must be within [znear, zfar]: translated Z must be in [0.01, 100.0]
+            # - Cannot be arbitrary: too small → black rendering, too large → poor quality
+            # 
+            # Current setting: 10.0 (covers Z range [-10, 0] with margin)
+            # If Gaussian Z range changes significantly, adjust this value accordingly
+            viewmatrix[:, 2, 3] = 10.0 
 
         elif view_name == "wrist":
             # Wrist camera: Also try identity for now
             viewmatrix = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
             # Shift wrist view similarly to ensure visibility
-            viewmatrix[:, 2, 3] = 2.0
+            viewmatrix[:, 2, 3] = 10.0
             
         else:
             # Default: identity
             viewmatrix = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
-            viewmatrix[:, 2, 3] = 2.0
+            viewmatrix[:, 2, 3] = 10.0
 
         # Create proper Projection Matrix
         # Note: rasterizer usually expects P @ V, i.e. Full MVP for "projmatrix" argument 
@@ -556,6 +781,67 @@ class PI0Pytorch(nn.Module):
             "campos": torch.zeros(batch_size, 3, device=device),
             "intrinsics": intrinsics
         }
+    
+    def _compute_2d_maps_loss(self, pred_2d_maps, gt_2d_maps):
+        """
+        Compute loss between predicted and GT 2D maps from VGGT decoder.
+        
+        Args:
+            pred_2d_maps: Dict with keys:
+                - rot_maps: [B, S, H, W, 4]
+                - scale_maps: [B, S, H, W, 3]
+                - opacity_maps: [B, S, H, W, 1]
+                - sh_maps: [B, S, H, W, K, 3]
+                - depth_maps: [B, S, H, W, 1]
+            gt_2d_maps: Same structure as pred_2d_maps
+        
+        Returns:
+            loss: Scalar loss value
+        """
+        import torch.nn.functional as F
+        
+        # Use last frame (S-1) for single frame prediction
+        frame_idx = -1
+        
+        # Extract single frame
+        pred_rot = pred_2d_maps["rot_maps"][:, frame_idx]  # [B, H, W, 4]
+        pred_scale = pred_2d_maps["scale_maps"][:, frame_idx]  # [B, H, W, 3]
+        pred_opacity = pred_2d_maps["opacity_maps"][:, frame_idx]  # [B, H, W, 1]
+        pred_sh = pred_2d_maps["sh_maps"][:, frame_idx]  # [B, H, W, K, 3]
+        pred_depth = pred_2d_maps["depth_maps"][:, frame_idx]  # [B, H, W, 1]
+        
+        gt_rot = gt_2d_maps["rot_maps"][:, frame_idx]
+        gt_scale = gt_2d_maps["scale_maps"][:, frame_idx]
+        gt_opacity = gt_2d_maps["opacity_maps"][:, frame_idx]
+        gt_sh = gt_2d_maps["sh_maps"][:, frame_idx]
+        gt_depth = gt_2d_maps["depth_maps"][:, frame_idx]
+        
+        # Compute losses for each component
+        # Rotation: L2 loss on quaternions (already normalized)
+        loss_rot = F.mse_loss(pred_rot, gt_rot)
+        
+        # Scale: L2 loss
+        loss_scale = F.mse_loss(pred_scale, gt_scale)
+        
+        # Opacity: L2 loss
+        loss_opacity = F.mse_loss(pred_opacity, gt_opacity)
+        
+        # SH: L2 loss
+        loss_sh = F.mse_loss(pred_sh, gt_sh)
+        
+        # Depth: L2 loss (with optional weighting for closer objects)
+        loss_depth = F.mse_loss(pred_depth, gt_depth)
+        
+        # Weighted combination
+        total_loss = (
+            0.1 * loss_rot +      # Rotation is less critical
+            1.0 * loss_scale +    # Scale is important
+            1.0 * loss_opacity +  # Opacity is important
+            1.0 * loss_sh +       # SH (color) is important
+            2.0 * loss_depth      # Depth is very important for 3D structure
+        )
+        
+        return total_loss
 
     def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names, time_suffix=""):
         """Helper to visualize Rendered vs GT images. Delegated to GaussianRenderer."""
@@ -575,7 +861,26 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None, step=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state, future_observation = self._preprocess_observation(observation, train=True)
+        # #region agent log
+        try:
+            with open('/home/zijianzhang/openpi/.cursor/debug.log', 'a') as f:
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": "A",
+                    "location": "pi0_pytorch.py:672",
+                    "message": "forward entry - check observation.images from dataloader",
+                    "data": {
+                        "observation_images_keys": list(observation.images.keys()) if hasattr(observation, 'images') else None,
+                        "observation_images_shapes": {k: list(v.shape) if hasattr(v, 'shape') else None for k, v in observation.images.items()} if hasattr(observation, 'images') else None,
+                        "observation_images_ndims": {k: v.ndim if hasattr(v, 'ndim') else None for k, v in observation.images.items()} if hasattr(observation, 'images') else None
+                    },
+                    "timestamp": int(__import__('time').time() * 1000)
+                }
+                f.write(json.dumps(log_entry) + '\n')
+        except: pass
+        # #endregion
+        images, img_masks, lang_tokens, lang_masks, state, future_observation, preprocessed_observation = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -588,10 +893,34 @@ class PI0Pytorch(nn.Module):
         u_t = noise - actions
         
         # Prepare Gaussian Inputs
+        # IMPORTANT: Use the preprocessed observation (with temporal dimension preserved) for VGGT
+        # The original observation passed to forward() may not have the correct temporal structure
+        # after _preprocess_observation processing. We need to reconstruct it from the processed data.
         gaussian_inputs = None
         # Check against adapter flag
         if self.gaussian_adapter.use_gaussian:
-            gaussian_inputs = self._prepare_gaussian_inputs(observation, actions.device, actions.shape[0])
+            # #region agent log
+            try:
+                with open('/home/zijianzhang/openpi/.cursor/debug.log', 'a') as f:
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "run1",
+                        "hypothesisId": "C",
+                        "location": "pi0_pytorch.py:688",
+                        "message": "before _prepare_gaussian_inputs - check observation.images",
+                        "data": {
+                            "observation_images_keys": list(observation.images.keys()) if hasattr(observation, 'images') else None,
+                            "observation_images_shapes": {k: list(v.shape) if hasattr(v, 'shape') else None for k, v in observation.images.items()} if hasattr(observation, 'images') else None,
+                            "observation_images_ndims": {k: v.ndim if hasattr(v, 'ndim') else None for k, v in observation.images.items()} if hasattr(observation, 'images') else None
+                        },
+                        "timestamp": int(__import__('time').time() * 1000)
+                    }
+                    f.write(json.dumps(log_entry) + '\n')
+            except: pass
+            # #endregion
+            # FIX: Use preprocessed_observation instead of original observation
+            # The preprocessed_observation has temporal dimension preserved, while original observation may have been modified
+            gaussian_inputs = self._prepare_gaussian_inputs(preprocessed_observation, actions.device, actions.shape[0])
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, gaussian_inputs=gaussian_inputs
@@ -652,17 +981,141 @@ class PI0Pytorch(nn.Module):
             
             # Z_t: [B, N, D]
             # Also get decoded Gaussian parameters from VGGT for supervision
-            z_t, _, gaussian_params_t = self.gaussian_adapter(
-                self._prepare_gaussian_inputs(observation, actions.device, actions.shape[0]),
-                return_gaussian_params=True
+            # Visualize every 100 steps, but only on rank 0 to avoid NCCL timeout
+            import torch.distributed as dist
+            is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+            visualize = (step is not None and step % 100 == 0 and is_main_process) if step is not None else False
+            
+            # Compute text_embedding for LGPD (same logic as in embed_prefix)
+            text_embedding_for_vggt = None
+            if self.gaussian_adapter.use_lgpd and lang_tokens is not None and lang_masks is not None:
+                def lang_embed_func(lang_tokens):
+                    lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
+                    lang_emb_dim = lang_emb.shape[-1]
+                    return lang_emb * math.sqrt(lang_emb_dim)
+                
+                lang_emb_for_pooling = self._apply_checkpoint(lang_embed_func, lang_tokens)
+                lang_masks_for_pooling = lang_masks
+                
+                # Handle temporal dimension if present
+                if lang_emb_for_pooling.ndim == 4:  # [B, T, SeqLen, D] - has temporal dimension
+                    B, T, S, D = lang_emb_for_pooling.shape
+                    lang_emb_flat = lang_emb_for_pooling.view(B * T, S, D)  # [B*T, S, D]
+                    lang_masks_flat = lang_masks_for_pooling.view(B * T, S)  # [B*T, S]
+                    mask_float = lang_masks_flat.unsqueeze(-1).float()  # [B*T, S, 1]
+                    sum_emb = (lang_emb_flat * mask_float).sum(dim=1)  # [B*T, D]
+                    sum_mask = mask_float.sum(dim=1).clamp(min=1e-6)  # [B*T, 1]
+                    text_embedding_flat = sum_emb / sum_mask  # [B*T, D]
+                    # Reshape back to [B, T, D] and take mean over time dimension
+                    text_embedding_for_vggt = text_embedding_flat.view(B, T, D).mean(dim=1)  # [B, D]
+                else:  # [B, SeqLen, D] - no temporal dimension
+                    # Masked Mean Pooling
+                    mask_float = lang_masks_for_pooling.unsqueeze(-1).float()  # [B, S, 1]
+                    sum_emb = (lang_emb_for_pooling * mask_float).sum(dim=1)  # [B, D]
+                    sum_mask = mask_float.sum(dim=1).clamp(min=1e-6)  # [B, 1]
+                    text_embedding_for_vggt = sum_emb / sum_mask  # [B, D]
+            
+            # #region agent log
+            try:
+                with open('/home/zijianzhang/openpi/.cursor/debug.log', 'a') as f:
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "run1",
+                        "hypothesisId": "C",
+                        "location": "pi0_pytorch.py:848",
+                        "message": "before _prepare_gaussian_inputs (World Model) - check preprocessed_observation.images",
+                        "data": {
+                            "preprocessed_observation_images_keys": list(preprocessed_observation.images.keys()) if hasattr(preprocessed_observation, 'images') else None,
+                            "preprocessed_observation_images_shapes": {k: list(v.shape) if hasattr(v, 'shape') else None for k, v in preprocessed_observation.images.items()} if hasattr(preprocessed_observation, 'images') else None,
+                            "preprocessed_observation_images_ndims": {k: v.ndim if hasattr(v, 'ndim') else None for k, v in preprocessed_observation.images.items()} if hasattr(preprocessed_observation, 'images') else None
+                        },
+                        "timestamp": int(__import__('time').time() * 1000)
+                    }
+                    f.write(json.dumps(log_entry) + '\n')
+            except: pass
+            # #endregion
+            # FIX: Use preprocessed_observation instead of original observation
+            # The preprocessed_observation has temporal dimension preserved, while original observation may have been modified
+            # Get raw tokens for VAE supervision if enabled
+            return_raw_tokens = self.use_vae_supervision and self.vae_compressor is not None
+            adapter_output = self.gaussian_adapter(
+                self._prepare_gaussian_inputs(preprocessed_observation, actions.device, actions.shape[0]),
+                text_embedding=text_embedding_for_vggt,
+                return_gaussian_params=True,
+                return_raw_tokens=return_raw_tokens,
+                step=step,
+                visualize=visualize
             )
+            if return_raw_tokens:
+                z_t, _, gaussian_params_t, raw_tokens_t = adapter_output
+            else:
+                z_t, _, gaussian_params_t = adapter_output
+                raw_tokens_t = None
+            
+            # Fix NaN: Check and sanitize z_t
+            if z_t is not None:
+                if torch.isnan(z_t).any() or torch.isinf(z_t).any():
+                    import warnings
+                    warnings.warn("NaN/Inf detected in z_t from gaussian_adapter. Replacing with zeros.")
+                    z_t = torch.where(
+                        torch.isnan(z_t) | torch.isinf(z_t),
+                        torch.zeros_like(z_t),
+                        z_t
+            )
+            
+            # Clear cache between encodings to save memory
+            torch.cuda.empty_cache()
             
             # 2. Encode Ground Truth Future Z_{t+1}
             # Get decoded Gaussian parameters for future frame (ground truth)
-            z_t1_gt, _, gaussian_params_t1_gt = self.gaussian_adapter(
-                self._prepare_gaussian_inputs(future_observation, actions.device, actions.shape[0]),
-                return_gaussian_params=True
+            # Note: future_observation is intentionally single frame [B, H, W, C] (extracted from v[:, idx_fut])
+            # This is correct for World Model ground truth, which only needs t+1 frame
+            # #region agent log
+            try:
+                with open('/home/zijianzhang/openpi/.cursor/debug.log', 'a') as f:
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "run1",
+                        "hypothesisId": "C",
+                        "location": "pi0_pytorch.py:891",
+                        "message": "before _prepare_gaussian_inputs (future_observation) - check future_observation.images",
+                        "data": {
+                            "future_observation_images_keys": list(future_observation.images.keys()) if hasattr(future_observation, 'images') else None,
+                            "future_observation_images_shapes": {k: list(v.shape) if hasattr(v, 'shape') else None for k, v in future_observation.images.items()} if hasattr(future_observation, 'images') else None,
+                            "future_observation_images_ndims": {k: v.ndim if hasattr(v, 'ndim') else None for k, v in future_observation.images.items()} if hasattr(future_observation, 'images') else None,
+                            "note": "future_observation is intentionally single frame for World Model ground truth"
+                        },
+                        "timestamp": int(__import__('time').time() * 1000)
+                    }
+                    f.write(json.dumps(log_entry) + '\n')
+            except: pass
+            # #endregion
+            # future_observation is single frame [B, H, W, C] for World Model ground truth
+            # Pass is_training=False to avoid repeating the frame (World Model only needs t+1 frame)
+            adapter_output_t1 = self.gaussian_adapter(
+                self._prepare_gaussian_inputs(future_observation, actions.device, actions.shape[0], is_training=False),
+                return_gaussian_params=True,
+                return_raw_tokens=return_raw_tokens
             )
+            if return_raw_tokens:
+                z_t1_gt, _, gaussian_params_t1_gt, raw_tokens_t1_gt = adapter_output_t1
+            else:
+                z_t1_gt, _, gaussian_params_t1_gt = adapter_output_t1
+                raw_tokens_t1_gt = None
+            
+            # Fix NaN: Check and sanitize z_t1_gt
+            if z_t1_gt is not None:
+                if torch.isnan(z_t1_gt).any() or torch.isinf(z_t1_gt).any():
+                    import warnings
+                    warnings.warn("NaN/Inf detected in z_t1_gt from gaussian_adapter. Replacing with zeros.")
+                    z_t1_gt = torch.where(
+                        torch.isnan(z_t1_gt) | torch.isinf(z_t1_gt),
+                        torch.zeros_like(z_t1_gt),
+                        z_t1_gt
+            )
+            
+            # Clear cache after encoding future frame
+            torch.cuda.empty_cache()
             
             if z_t is not None and z_t1_gt is not None:
                 # 3. World Model Forward
@@ -675,15 +1128,66 @@ class PI0Pytorch(nn.Module):
                     # We should probably take actions[:, 0, :] corresponding to current step.
                     action_t = actions[:, 0, :]
                     
+                    # Prepare temporal tokens for cross-attention
+                    # z_t is [B, 300, D] (3 frames × 100 tokens) from gaussian_adapter
+                    # Reshape to [B, 3, 100, D] for cross-attention
+                    B, total_tokens, D = z_t.shape
+                    if total_tokens == 300:  # 3 frames × 100 tokens
+                        z_temporal = z_t.view(B, 3, 100, D)  # [B, 3, 100, D]
+                    else:
+                        # Fallback: if not 300 tokens, use z_t as single frame
+                        # Or reshape based on actual structure
+                        z_temporal = z_t.unsqueeze(1)  # [B, 1, N, D] - single frame
+                        logging.warning(f"z_t has {total_tokens} tokens, expected 300. Using single frame for temporal.")
+                    
                     wm_outputs = self.world_model.compute_full_loss(
                         z_t=z_t, 
                         action_t=action_t, 
-                        z_t1_gt=z_t1_gt
+                        z_t1_gt=z_t1_gt,
+                        z_temporal=z_temporal  # Pass temporal tokens for cross-attention
                     )
                     
                     # Add to total loss
                     # wm_outputs["loss_total"] is a scalar (mean). We need to broadcast strictness slightly or just add.
                     loss = loss + wm_outputs["loss_total"]
+                    
+                    # === VAE Supervision Loss (Option B: Hybrid) ===
+                    # Use VAE as auxiliary supervision to improve token compression/reconstruction
+                    if self.use_vae_supervision and self.vae_compressor is not None:
+                        if raw_tokens_t is not None and raw_tokens_t1_gt is not None:
+                            # raw_tokens_t: [B, S, 1369, D] (S=3 frames)
+                            # raw_tokens_t1_gt: [B, S, 1369, D] (S=1 frame for future)
+                            # Use the last frame from t (current frame) and t1_gt for VAE supervision
+                            B_t, S_t, N_t, D_t = raw_tokens_t.shape
+                            B_t1, S_t1, N_t1, D_t1 = raw_tokens_t1_gt.shape
+                            
+                            # Extract current frame (last frame) from t: [B, 1369, D]
+                            raw_tokens_current = raw_tokens_t[:, -1, :, :]  # [B, 1369, D]
+                            # Extract future frame from t1_gt: [B, 1369, D]
+                            raw_tokens_future = raw_tokens_t1_gt[:, 0, :, :]  # [B, 1369, D]
+                            
+                            # Compute VAE loss on current frame (reconstruction supervision)
+                            _, _, vae_loss_dict_current = self.vae_compressor(
+                                raw_tokens_current, return_loss=True
+                            )
+                            
+                            # Compute VAE loss on future frame (reconstruction supervision)
+                            _, _, vae_loss_dict_future = self.vae_compressor(
+                                raw_tokens_future, return_loss=True
+                            )
+                            
+                            # Average VAE losses
+                            vae_recon_loss = (vae_loss_dict_current['recon_loss'] + vae_loss_dict_future['recon_loss']) / 2.0
+                            vae_kl_loss = (vae_loss_dict_current['kl_loss'] + vae_loss_dict_future['kl_loss']) / 2.0
+                            vae_total_loss = (vae_loss_dict_current['total_loss'] + vae_loss_dict_future['total_loss']) / 2.0
+                            
+                            # Add VAE loss as auxiliary supervision (with small weight)
+                            vae_weight = getattr(self, 'vae_loss_weight', 0.1)  # Default weight
+                            loss = loss + vae_weight * vae_total_loss
+                            
+                            # Log VAE losses periodically
+                            if step is not None and step % 100 == 0:
+                                print(f"Step {step}: VAE Loss - Recon: {vae_recon_loss.item():.4f}, KL: {vae_kl_loss.item():.4f}, Total: {vae_total_loss.item():.4f}")
 
                     # === 4. Gaussian Rendering Supervision === #
                     # We supervise the decoded Gaussians using the Ground Truth Future Images
@@ -703,58 +1207,18 @@ class PI0Pytorch(nn.Module):
                             z_next = wm_outputs["z_t1_pred"]
                             # z_next: [B, N, D]
                             
-                            # Decode to Gaussian Parameters
-                            # World Model decoder 从 tokens 解码为 Gaussian 参数
-                            gaussian_params = self.world_model.decoder(z_next)
-                            
-                            # === VGGT Decoder Supervision Loss ===
-                            # 使用 VGGT 解码的参数作为监督目标，帮助 World Model decoder 学习正确的映射
-                            if gaussian_params_t1_gt is not None:
-                                from openpi.models_pytorch.pi0_vggt import compute_vggt_decoder_supervision_loss
+                            # DEBUG: Check z_next values and gradients
+                            if torch.isnan(z_next).any():
+                                print(f"[CRITICAL] Step {step}: z_next contains NaNs!")
+                            if torch.isinf(z_next).any():
+                                print(f"[CRITICAL] Step {step}: z_next contains Infs!")
                                 
-                                # 准备相机参数（如果可用）
-                                # 注意：cam_params_dict 在后面才定义，所以这里先设为 None
-                                camera_params_for_supervision = None
-                                # TODO: 如果需要相机参数进行监督，可以从 future_observation 中提取
-                                # 暂时不使用相机参数，因为 VGGT 参数转换可以在没有相机参数的情况下工作
-                                
-                                # 计算监督损失
-                                decoder_supervision_loss, decoder_loss_dict = compute_vggt_decoder_supervision_loss(
-                                    decoder_params=gaussian_params,
-                                    vggt_params_dict=gaussian_params_t1_gt,
-                                    camera_params=camera_params_for_supervision,
-                                    lambda_xyz=1.0,
-                                    lambda_opacity=1.0,
-                                    lambda_sh=1.0,
-                                    lambda_sigma=0.5
-                                )
-                                
-                                # 添加到总损失（使用较小的权重，因为这是辅助损失）
-                                lambda_decoder_supervision = 0.1  # 可以调整这个权重
-                                loss = loss + lambda_decoder_supervision * decoder_supervision_loss
-                                
-                                # Debug logging
-                                if step is not None and step % 40 == 0:
-                                    print(f"\n[VGGT Decoder Supervision Loss]")
-                                    print(f"  Total: {decoder_supervision_loss.item():.6f}")
-                                    for k, v in decoder_loss_dict.items():
-                                        print(f"  {k}: {v.item():.6f}")
-
-                            # DEBUG: Check Gaussian parameters at step 0
                             if step is not None and step % 40 == 0:
-                                # Convert sigma to scales for debugging
-                                from openpi.models_pytorch.gaussian_renderer import convert_sigma_to_scale_rotation
-                                scales_debug, _ = convert_sigma_to_scale_rotation(gaussian_params['sigma'])
-                                
-                                print(f"\n[DEBUG] Gaussian Parameters:")
-                                print(f"  xyz: shape={gaussian_params['xyz'].shape}, min={gaussian_params['xyz'].min():.4f}, max={gaussian_params['xyz'].max():.4f}, mean={gaussian_params['xyz'].mean():.4f}")
-                                print(f"  opacity: shape={gaussian_params['opacity'].shape}, min={gaussian_params['opacity'].min():.4f}, max={gaussian_params['opacity'].max():.4f}, mean={gaussian_params['opacity'].mean():.4f}")
-                                print(f"  sh: shape={gaussian_params['sh'].shape}, min={gaussian_params['sh'].min():.4f}, max={gaussian_params['sh'].max():.4f}, mean={gaussian_params['sh'].mean():.4f}")
-                                print(f"  sigma: shape={gaussian_params['sigma'].shape}, min={gaussian_params['sigma'].min():.4f}, max={gaussian_params['sigma'].max():.4f}, mean={gaussian_params['sigma'].mean():.4f}")
-                                print(f"  scales (from sigma): min={scales_debug.min():.6f}, max={scales_debug.max():.6f}, mean={scales_debug.mean():.6f}, median={scales_debug.median():.6f}")
-                                print(f"  [NOTE] If scales are too large (>0.1), rendering will be blurry. Try setting renderer.scale_factor=0.1 or smaller.")
-                            
-                            # Prepare Target Images
+                                print(f"[DEBUG] z_next info: shape={z_next.shape}, requires_grad={z_next.requires_grad}, grad_fn={z_next.grad_fn}")
+                                print(f"[DEBUG] z_next stats: min={z_next.min():.4f}, max={z_next.max():.4f}, mean={z_next.mean():.4f}")
+
+                            # Prepare Target Images and Camera Parameters FIRST
+                            # We need camera params for VGGT decoder conversion
                             target_obs = {}
                             cam_params_dict = {}
 
@@ -814,6 +1278,101 @@ class PI0Pytorch(nn.Module):
                                         if step is not None and step % 40 == 0:
                                             print(f"[DEBUG]   Skipping duplicate view: {view_name}")
                             
+                            # Decode to Gaussian Parameters
+                            # Use VGGT decoder if available, otherwise use legacy decoder
+                            # Use first valid view's camera params (typically "agent")
+                            camera_params_for_decode = None
+                            if valid_views:
+                                # Use agent view camera params if available, otherwise use first view
+                                if "agent" in cam_params_dict:
+                                    camera_params_for_decode = cam_params_dict["agent"]
+                                else:
+                                    camera_params_for_decode = cam_params_dict[valid_views[0]]
+                            
+                            # === Option 1: Direct 2D Maps Supervision (NEW) ===
+                            # Get predicted 2D maps from World Model
+                            if self.world_model.use_vggt_decoder:
+                                pred_2d_maps = self.world_model.decode(
+                                    z_next,
+                                    future_observation=future_observation,
+                                    gaussian_adapter=self.gaussian_adapter,
+                                    camera_params=camera_params_for_decode,
+                                    return_2d_maps=True,  # Return 2D maps for direct supervision
+                                    step=step
+                                )
+                                
+                                # Get GT 2D maps from future_observation using VGGT encoder
+                                # Simply call encoder.forward() which returns all 2D maps directly
+                                vggt_inputs_gt = self.gaussian_adapter.prepare_inputs(
+                                    future_observation,
+                                    z_next.device,
+                                    z_next.shape[0],
+                                    is_training=False
+                                )
+                                
+                                if vggt_inputs_gt is not None:
+                                    with torch.no_grad():
+                                        # VGGT3DGSModel.forward() returns:
+                                        # depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, aggregated_tokens_list, patch_start_idx
+                                        outputs_gt = self.gaussian_adapter.encoder(vggt_inputs_gt)
+                                        
+                                        depth_maps_gt = outputs_gt[0]  # [B, S, H, W, 1]
+                                        rot_maps_gt = outputs_gt[1]    # [B, S, H, W, 4]
+                                        scale_maps_gt = outputs_gt[2]  # [B, S, H, W, 3]
+                                        opacity_maps_gt = outputs_gt[3] # [B, S, H, W, 1]
+                                        sh_maps_gt = outputs_gt[4]      # [B, S, H, W, K, 3]
+                                        
+                                        gt_2d_maps = {
+                                            "rot_maps": rot_maps_gt,
+                                            "scale_maps": scale_maps_gt,
+                                            "opacity_maps": opacity_maps_gt,
+                                            "sh_maps": sh_maps_gt,
+                                            "depth_maps": depth_maps_gt
+                                        }
+                                        
+                                        # Compute 2D maps loss
+                                        loss_2d_maps = self._compute_2d_maps_loss(pred_2d_maps, gt_2d_maps)
+                                        
+                                        if step is not None and step % 40 == 0:
+                                            print(f"Step {step}: 2D Maps Loss = {loss_2d_maps.item():.4f}")
+                                        
+                                        # Add to total loss
+                                        loss = loss + 0.1 * loss_2d_maps  # Weight: 0.1
+                                
+                                # Also convert to 3D for rendering loss
+                                gaussian_params = self.world_model.decode(
+                                    z_next,
+                                    future_observation=future_observation,
+                                    gaussian_adapter=self.gaussian_adapter,
+                                    camera_params=camera_params_for_decode,
+                                    return_2d_maps=False,  # Convert to 3D for rendering
+                                    step=step
+                                )
+                            else:
+                                # Fallback: Use legacy decoder if VGGT decoder not available
+                                # Note: This path should rarely be used if VGGT is properly initialized
+                                gaussian_params = self.world_model.decode(
+                                    z_next,
+                                    future_observation=future_observation,
+                                    gaussian_adapter=self.gaussian_adapter,
+                                    camera_params=camera_params_for_decode,
+                                    return_2d_maps=False
+                                )
+                            
+                            # DEBUG: Check Gaussian parameters at step 0
+                            if step is not None and step % 40 == 0:
+                                # Convert sigma to scales for debugging
+                                from openpi.models_pytorch.gaussian_renderer import convert_sigma_to_scale_rotation
+                                scales_debug, _ = convert_sigma_to_scale_rotation(gaussian_params['sigma'])
+                                
+                                print(f"\n[DEBUG] Gaussian Parameters:")
+                                print(f"  xyz: shape={gaussian_params['xyz'].shape}, min={gaussian_params['xyz'].min():.4f}, max={gaussian_params['xyz'].max():.4f}, mean={gaussian_params['xyz'].mean():.4f}")
+                                print(f"  opacity: shape={gaussian_params['opacity'].shape}, min={gaussian_params['opacity'].min():.4f}, max={gaussian_params['opacity'].max():.4f}, mean={gaussian_params['opacity'].mean():.4f}")
+                                print(f"  sh: shape={gaussian_params['sh'].shape}, min={gaussian_params['sh'].min():.4f}, max={gaussian_params['sh'].max():.4f}, mean={gaussian_params['sh'].mean():.4f}")
+                                print(f"  sigma: shape={gaussian_params['sigma'].shape}, min={gaussian_params['sigma'].min():.4f}, max={gaussian_params['sigma'].max():.4f}, mean={gaussian_params['sigma'].mean():.4f}")
+                                print(f"  scales (from sigma): min={scales_debug.min():.6f}, max={scales_debug.max():.6f}, mean={scales_debug.mean():.6f}, median={scales_debug.median():.6f}")
+                                print(f"  [NOTE] If scales are too large (>0.1), rendering will be blurry. Try setting renderer.scale_factor=0.1 or smaller.")
+                            
                             if valid_views:
                                 # Only compute rendering loss for agent view (more stable, wider FOV)
                                 # Still collect both views for potential future use
@@ -830,10 +1389,16 @@ class PI0Pytorch(nn.Module):
                                     target_obs,
                                     cam_params_dict,
                                     self.gaussian_renderer,
-                                    view_names=render_views
+                                    view_names=render_views,
+                                    step=step
                                 )
                                 # Weight the render loss
                                 loss = loss + 0.1 * render_loss
+                                
+                                # FIX: Ensure render_loss is connected to computation graph even if rendering fails (black image)
+                                # This prevents "element 0 of tensors does not require grad" error when num_valid_gaussians=0
+                                if z_next.requires_grad:
+                                    loss = loss + 0.0 * z_next.sum()
                                 
                                 if step is not None and step % 40 == 0:
                                      print(f"Step {step}: Render Loss = {render_loss.item():.4f} (views: {render_views})")
@@ -859,22 +1424,31 @@ class PI0Pytorch(nn.Module):
                                                  time_suffix="_t1_pred"  # z_{t+1}^{pred}
                                              )
 
-                                             # === Visualization 2 & 3: Decode and render z_t, z_{t+1}^{GT} ===
-                                             # 为了诊断 encoder/decoder + renderer，本地再渲染当前帧和 GT 下一帧的高斯。
-                                             # 注意：这里为了简单，仍然使用 future 的 target_obs/cam_params 做对齐，
-                                             # 主要看 Gaussian 几何和纹理是否合理，而不是严格的时刻匹配。
-                                             gaussian_params_t = self.world_model.decoder(z_t)
-                                             gaussian_params_t1_gt = self.world_model.decoder(z_t1_gt)
+                                             # === Visualization 2: Decode and render z_{t+1}^{GT} ===
+                                             # 只可视化 GT 的下一帧，用于对比预测结果
+                                             # 不再可视化 z_t (当前帧)，减少可视化开销
+                                             # Use VGGT decoder if available
+                                             if self.world_model.use_vggt_decoder:
+                                                 # Use agent view camera params if available
+                                                 camera_params_viz = cam_params_dict.get("agent") if cam_params_dict else None
+                                                 gaussian_params_t1_gt = self.world_model.decode(
+                                                     z_t1_gt,
+                                                     future_observation=future_observation,
+                                                     gaussian_adapter=self.gaussian_adapter,
+                                                     camera_params=camera_params_viz
+                                                 )
+                                             else:
+                                                 # Fallback: Use decode method (will use legacy decoder if VGGT not available)
+                                                 camera_params_viz = cam_params_dict.get("agent") if cam_params_dict else None
+                                                 gaussian_params_t1_gt = self.world_model.decode(
+                                                     z_t1_gt,
+                                                     future_observation=future_observation,
+                                                     gaussian_adapter=self.gaussian_adapter,
+                                                     camera_params=camera_params_viz,
+                                                     return_2d_maps=False
+                                                 )
 
-                                             # Use same step number but different suffix to couple t and t+1
-                                             self._visualize_rendering_comparison(
-                                                 step,
-                                                 gaussian_params_t,
-                                                 target_obs,
-                                                 cam_params_dict,
-                                                 view_names=render_views,
-                                                 time_suffix="_t"  # z_t (current frame)
-                                             )
+                                             # Only visualize GT next frame (t+1)
                                              self._visualize_rendering_comparison(
                                                  step,
                                                  gaussian_params_t1_gt,
@@ -892,8 +1466,10 @@ class PI0Pytorch(nn.Module):
                                 traceback.print_exc()
                                 print(f"Rendering failed: {e}")
 
-                    # Visualization (every 10 steps)
-                    if step is not None and step % 10 == 0:
+                    # Visualization (every 10 steps, only on rank 0 to avoid NCCL timeout)
+                    import torch.distributed as dist
+                    is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+                    if step is not None and step % 10 == 0 and is_main_process:
                         print(f"DEBUG: Attempting visualization at step {step}")
                         try:
                             visualize_world_model_prediction(
@@ -933,12 +1509,13 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state, _ = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, _, preprocessed_observation = self._preprocess_observation(observation, train=False)
         
         gaussian_inputs = None
         if self.gaussian_adapter.use_gaussian:
-            # For inference, observation images should be sufficient
-            gaussian_inputs = self._prepare_gaussian_inputs(observation, device, bsize)
+            # For inference, use inference mode (fewer frames, more flexible)
+            # Use preprocessed_observation to ensure temporal dimension is preserved
+            gaussian_inputs = self._prepare_gaussian_inputs(preprocessed_observation, device, bsize, is_training=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, gaussian_inputs=gaussian_inputs

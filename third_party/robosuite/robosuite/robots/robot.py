@@ -229,7 +229,18 @@ class Robot(object):
         Args:
             sim (MjSim): New simulation being instantiated to replace the old one
         """
+        print(f"[DEBUG] reset_sim updating self.sim from {id(self.sim) if hasattr(self, 'sim') else 'None'} to {id(sim)}")
         self.sim = sim
+
+        # Update the simulator reference in the composite controller and its part controllers.
+        # This ensures that when the simulation is reset (e.g. during a hard reset with a new XML),
+        # the controllers point to the new MjSim instance instead of holding onto a stale/closed one.
+        if self.composite_controller is not None:
+            self.composite_controller.sim = sim
+            if hasattr(self.composite_controller, "part_controllers"):
+                for controller in self.composite_controller.part_controllers.values():
+                    if hasattr(controller, "sim"):
+                        controller.sim = sim
 
     def reset(self, deterministic=False, rng=None):
         """

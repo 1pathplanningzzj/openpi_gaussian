@@ -225,6 +225,7 @@ class MujocoEnv(metaclass=EnvMeta):
         index or a list of indices that point to the corresponding elements
         in a flatten array, which is how MuJoCo stores physical simulation data.
         """
+        print(f"[DEBUG] _setup_references using sim: {id(self.sim)}")
         # Setup mappings from model to IDs
         self.model.generate_id_mappings(sim=self.sim)
 
@@ -251,6 +252,7 @@ class MujocoEnv(metaclass=EnvMeta):
 
         # Create the simulation instance
         self.sim = MjSim.from_xml_string(xml)
+        print(f"[DEBUG] _initialize_sim created new sim: {id(self.sim)}")
 
         # run a single step to make sure changes have propagated through sim state
         self.sim.forward()

@@ -76,7 +76,16 @@ class LanguageGatedPhysicalDistillation(nn.Module):
         B, N, D = visual_tokens.shape
         
         # 1. Project text: [B, D_text] -> [B, D] -> [B, 1, D]
-        text_query = self.text_proj(text_embedding).unsqueeze(1)
+        # Handle case where text_embedding might have temporal dimension [B, T, D_text]
+        if text_embedding.ndim == 3:
+            # [B, T, D_text] -> take mean over time -> [B, D_text]
+            text_embedding = text_embedding.mean(dim=1)
+        elif text_embedding.ndim != 2:
+            raise ValueError(f"text_embedding must be 2D [B, D] or 3D [B, T, D], got shape {text_embedding.shape}")
+        
+        # Now text_embedding is [B, D_text]
+        text_proj = self.text_proj(text_embedding)  # [B, D]
+        text_query = text_proj.unsqueeze(1)  # [B, 1, D]
         
         # 2. Compute Match Score (Dot Product): [B, 1, D] @ [B, D, N] -> [B, 1, N]
         # We want to know how much each visual token matches the text visulize to confirm it.

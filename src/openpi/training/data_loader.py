@@ -153,17 +153,28 @@ def create_torch_dataset(
         
     print(f"DEBUG: Found image keys: {image_keys} with FPS: {dataset_meta.fps}")
 
-    # Request Current (0.0) and Next (1) frame for images and state
-    # This enables World Model training: current state + action -> next state
+    # Request frames for images: [t-2, t-1, t, t+1]
+    # - [t-2, t-1, t] for VGGT encoding (current + 2 past frames, 3 frames total)
+    # - [t+1] for World Model training (future frame)
+    # Reduced from 5 frames to 3 frames to save memory (5 frames caused OOM)
     for key in image_keys:
-        delta_timestamps[key] = [0.0, 1.0 / dataset_meta.fps]  # [current, next]
+        # Request 4 frames: past 2 frames + current + future frame
+        # delta_timestamps uses relative time offsets from current frame (0.0)
+        delta_timestamps[key] = [
+            -2.0 / dataset_meta.fps,   # t-2 (2 frames before current)
+            -1.0 / dataset_meta.fps,   # t-1 (1 frame before current)
+            0.0,                        # t (current frame)
+            1.0 / dataset_meta.fps      # t+1 (1 frame after current, for World Model)
+        ]
+        print(f"DEBUG: Requesting 4 frames: [t-2, t-1, t, t+1] for key {key} (VGGT uses [t-2, t-1, t], World Model uses t+1)")
 
     # Also request temporal state - try both possible key formats
+    # State still needs [t, t+1] for World Model training: current state + action -> next state
     state_keys_to_try = ["observation.state", "observation/state", "state"]
     for state_key in state_keys_to_try:
         if state_key in dataset_meta.features:
             delta_timestamps[state_key] = [0.0, 1.0 / dataset_meta.fps]  # [current, next]
-            print(f"DEBUG: Added temporal state with key: {state_key}")
+            print(f"DEBUG: Added temporal state with key: {state_key} (for World Model: [t, t+1])")
             break
     else:
         print(f"WARNING: Could not find state key in dataset features. Available keys: {list(dataset_meta.features.keys())}")
