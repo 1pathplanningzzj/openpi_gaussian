@@ -29,7 +29,14 @@ import logging
 import os
 import platform
 import shutil
+import sys
 import time
+
+# Ensure current project's src directory is in Python path (before other paths)
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_src_path = os.path.join(_project_root, "src")
+if _src_path not in sys.path:
+    sys.path.insert(0, _src_path)
 
 import jax
 import numpy as np
@@ -450,6 +457,11 @@ def train_loop(config: _config.TrainConfig):
         log_memory_usage(device, 0, "after_model_creation")
 
     # Enable memory optimizations for large-scale training
+    # Always enable expandable_segments to avoid fragmentation (helps with OOM)
+    if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        logging.info("Enabled memory optimizations (expandable_segments)")
+    
     if world_size >= 8:
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True

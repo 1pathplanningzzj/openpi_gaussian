@@ -52,7 +52,23 @@ python examples/libero/main.py
 
 # To run with glx for Mujoco instead (use this if you have egl errors):
 MUJOCO_GL=glx python examples/libero/main.py
+
+# Run in background (headless mode with xvfb):
 xvfb-run -a python examples/libero/main.py
+
+# Run in background with nohup (logs are automatically saved to data directory):
+# The script automatically saves logs to: data/<video_out_path>/eval.log
+# For example, if video_out_path is "data/gaussian_world_model_exp0131_2000_goal_2/videos",
+# the log will be saved to: data/gaussian_world_model_exp0131_2000_goal_2/eval.log
+nohup xvfb-run -a python examples/libero/main.py > /dev/null 2>&1 &
+
+# Or redirect both to a custom log file (optional, script also saves to data directory):
+nohup xvfb-run -a python examples/libero/main.py > custom_run.log 2>&1 &
+
+# Or with screen (detachable session):
+screen -S libero
+xvfb-run -a python examples/libero/main.py
+# Press Ctrl+A then D to detach, use 'screen -r libero' to reattach
 
 ```
 <!-- uv venv ~/openpi/uv_venv --python 3.11 # 创建虚拟环境 uv 3.11 
@@ -63,6 +79,8 @@ uv run --active scripts/serve_policy.py --env LIBERO  # uv 系统会有一个默
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run --active scripts/train.py pi05_libero --exp-name=my_experiment --overwrite
 uv run --active scripts/serve_policy.py policy:checkpoint --policy.config=pi0_libero_low_mem_finetune --policy.dir=/data1/zhangzj26/pi0_model/checkpoints/pi0_libero_low_mem_finetune/my_experiment/1000
 CUDA_VISIBLE_DEVICES=1 uv run --active scripts/serve_policy.py --env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir /data/zijianzhang/train_ckpts/pi05_libero/my_experiment_0120/1000
+
+ CUDA_VISIBLE_DEVICES=0 uv run --active scripts/serve_policy.py --env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir /data/zijianzhang/train_ckpts/pi05_libero/gaussian_world_model_exp0126/14000/
 Terminal window 2: -->
 ```bash
 # Run the server

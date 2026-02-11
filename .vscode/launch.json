@@ -10,11 +10,11 @@
             "args": [
                 "pi05_libero",
                 "--checkpoint-base-dir=/data/zijianzhang/train_ckpts",
-                "--exp-name=gaussian_world_model_exp0126",
+                "--exp-name=gaussian_world_model_exp0206",
                 "--overwrite"
             ],
             "env": {
-                "CUDA_VISIBLE_DEVICES": "1",
+                "CUDA_VISIBLE_DEVICES": "0",
                 "PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2.0"
             },
             "python": "${workspaceFolder}/uv_venv/bin/python",

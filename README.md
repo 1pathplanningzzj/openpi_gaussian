@@ -329,17 +329,17 @@ CUDA_VISIBLE_DEVICES=1 uv run --active scripts/train_pytorch.py pi05_libero \
 
 # Training with Gaussian World Model
 # If rendering is blurry, try setting GAUSSIAN_SCALE_FACTOR=0.1 (or smaller) to reduce Gaussian sizes
-CUDA_VISIBLE_DEVICES=1 nohup uv run --active scripts/train_pytorch.py pi05_libero --checkpoint-base-dir=/data/zijianzhang/train_ckpts --exp-name=gaussian_world_model_exp0126 --overwrite > training_exp0127.log 2>&1 &
+CUDA_VISIBLE_DEVICES=0 nohup uv run --active scripts/train_pytorch.py pi05_libero --checkpoint-base-dir=/data/zijianzhang/train_ckpts --exp-name=gaussian_world_model_exp0211 --overwrite > training_exp0211.log 2>&1 &
 
 
 # 首次训练（从头开始）
-CUDA_VISIBLE_DEVICES=0,1,6,7 nohup uv_venv/bin/torchrun \
+CUDA_VISIBLE_DEVICES=0,1 nohup uv_venv/bin/torchrun \
     --standalone \
     --nnodes=1 \
     --nproc_per_node=4 \
     scripts/train_pytorch.py pi05_libero \
-    --exp_name gaussian_world_model_exp0131 \
-    --checkpoint_base_dir /data/zijianzhang/train_ckpts > training_exp0131_ddp.log 2>&1 &
+    --exp_name gaussian_world_model_exp0211 \
+    --checkpoint_base_dir /data/zijianzhang/train_ckpts > training_exp0211_ddp.log 2>&1 &
 
 # 从 checkpoint 恢复训练（添加 --resume 参数）
 CUDA_VISIBLE_DEVICES=0,1,2,3 nohup uv_venv/bin/torchrun \

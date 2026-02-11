@@ -34,6 +34,11 @@ class Pi0Config(_model.BaseModelConfig):
     use_gaussian: bool = False
     # Whether to use BiDirectional World Model for aux loss
     use_world_model: bool = False
+    # VGGT encoder/decoder training options (for reconstruction loss)
+    unfreeze_vggt_encoder: bool = False  # If True, unfreeze entire VGGT encoder for end-to-end training
+    unfreeze_vggt_decoder_only: bool = True  # If True (default), only unfreeze decoder (gs_head) while keeping encoder frozen
+    # Current frame reconstruction loss weight (for training VGGT encoder+decoder)
+    current_frame_recon_loss_weight: float = 0.5  # Weight for current frame reconstruction loss
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
