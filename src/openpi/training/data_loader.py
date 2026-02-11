@@ -140,9 +140,19 @@ def create_torch_dataset(
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.dataset_root)
     
     # Calculate delta timestamps
+    # LeRobot validation expects timestamps to be multiples of 1/10 (0.1) seconds
+    # If dataset fps is not 10, we need to round timestamps to 0.1 second intervals
+    # For actions: use 0.1 second intervals regardless of actual fps
+    # This ensures compatibility with LeRobot's validation
+    action_fps = 10.0  # Standard fps for action timestamps (0.1 second intervals)
     delta_timestamps = {
-        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        key: [round(t / action_fps, 2) for t in range(action_horizon)] for key in data_config.action_sequence_keys
     }
+    
+    # Log actual fps for debugging
+    if dataset_meta.fps != action_fps:
+        print(f"WARNING: Dataset fps ({dataset_meta.fps}) != action_fps ({action_fps}). "
+              f"Using {action_fps} fps for action delta_timestamps to match LeRobot validation.")
     
     # Detect image keys from features
     # robustly find any key containing "image" or "rgb" if the strict prefix check fails
@@ -157,24 +167,31 @@ def create_torch_dataset(
     # - [t-2, t-1, t] for VGGT encoding (current + 2 past frames, 3 frames total)
     # - [t+1] for World Model training (future frame)
     # Reduced from 5 frames to 3 frames to save memory (5 frames caused OOM)
+    # Use 0.1 second intervals to match LeRobot validation
+    image_fps = 10.0  # Use standard 10 fps for image timestamps
     for key in image_keys:
         # Request 4 frames: past 2 frames + current + future frame
         # delta_timestamps uses relative time offsets from current frame (0.0)
+        # Round to 0.1 second intervals for LeRobot validation
         delta_timestamps[key] = [
-            -2.0 / dataset_meta.fps,   # t-2 (2 frames before current)
-            -1.0 / dataset_meta.fps,   # t-1 (1 frame before current)
-            0.0,                        # t (current frame)
-            1.0 / dataset_meta.fps      # t+1 (1 frame after current, for World Model)
+            round(-2.0 / image_fps, 2),   # t-2 (2 frames before current) = -0.2
+            round(-1.0 / image_fps, 2),   # t-1 (1 frame before current) = -0.1
+            0.0,                           # t (current frame)
+            round(1.0 / image_fps, 2)     # t+1 (1 frame after current, for World Model) = 0.1
         ]
         print(f"DEBUG: Requesting 4 frames: [t-2, t-1, t, t+1] for key {key} (VGGT uses [t-2, t-1, t], World Model uses t+1)")
+        print(f"DEBUG: Using image_fps={image_fps} (dataset_meta.fps={dataset_meta.fps})")
 
     # Also request temporal state - try both possible key formats
     # State still needs [t, t+1] for World Model training: current state + action -> next state
+    # Use 0.1 second intervals to match LeRobot validation
+    state_fps = 10.0  # Use standard 10 fps for state timestamps
     state_keys_to_try = ["observation.state", "observation/state", "state"]
     for state_key in state_keys_to_try:
         if state_key in dataset_meta.features:
-            delta_timestamps[state_key] = [0.0, 1.0 / dataset_meta.fps]  # [current, next]
+            delta_timestamps[state_key] = [0.0, round(1.0 / state_fps, 2)]  # [current, next] = [0.0, 0.1]
             print(f"DEBUG: Added temporal state with key: {state_key} (for World Model: [t, t+1])")
+            print(f"DEBUG: Using state_fps={state_fps} (dataset_meta.fps={dataset_meta.fps})")
             break
     else:
         print(f"WARNING: Could not find state key in dataset features. Available keys: {list(dataset_meta.features.keys())}")

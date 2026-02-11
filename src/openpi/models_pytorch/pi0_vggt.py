@@ -36,7 +36,7 @@ def visualize_vggt_and_lgpd(
     gaussian_params: Optional[Dict[str, torch.Tensor]],
     lgpd_gate: Optional[torch.Tensor],
     step: int,
-    save_dir: str = "/home/zijianzhang/openpi/visualizations/vggt_lgpd"
+    save_dir: str = "./visualizations/vggt_lgpd"
 ):
     """
     Visualize VGGT frames and LGPD gate together.
@@ -163,7 +163,7 @@ def visualize_vggt_frames(
     gaussian_inputs: torch.Tensor,
     gaussian_params: Optional[Dict[str, torch.Tensor]],
     step: int,
-    save_dir: str = "/home/zijianzhang/openpi/visualizations/vggt_frames"
+    save_dir: str = "./visualizations/vggt_frames"
 ):
     """
     Visualize the 3 frames used for VGGT encoding.
@@ -307,7 +307,8 @@ class GaussianAdapter(nn.Module):
     Adapter for integrating VGGT (Transformer-based 3DGS) features into OpenPI models.
     """
     def __init__(self, use_gaussian: bool, action_expert_width: int, use_lgpd: bool = True, 
-                 num_frames: int = 3, inference_num_frames: int = 1):
+                 num_frames: int = 3, inference_num_frames: int = 1, 
+                 unfreeze_encoder: bool = False, unfreeze_decoder_only: bool = True):
         """
         Args:
             use_gaussian: Whether to use Gaussian features
@@ -319,6 +320,10 @@ class GaussianAdapter(nn.Module):
                        Wrist view is excluded from VGGT encoding (but still used in 2D encoders like SigLIP).
             inference_num_frames: Number of frames to use during inference (default: 1, single frame).
                                  Single frame is more practical for real-time inference.
+            unfreeze_encoder: If True, unfreeze VGGT encoder to allow end-to-end training (default: False).
+                             When True, encoder will be trained with reconstruction loss.
+            unfreeze_decoder_only: If True, only unfreeze decoder (gs_head) while keeping encoder frozen (default: True).
+                                 This is a middle ground: train decoder with reconstruction loss while keeping encoder fixed.
         """
         super().__init__()
         self.use_gaussian = use_gaussian
@@ -337,10 +342,29 @@ class GaussianAdapter(nn.Module):
                 # Parameters based on vggt3dgs_model.py defaults or typical values
                 self.encoder = VGGT3DGSModel(sh_degree=4, min_depth=1.5, max_depth=100.0)
                 
-                # Freeze Encoder
-                for param in self.encoder.parameters():
-                    param.requires_grad = False
-                self.encoder.eval()
+                # Freeze/Unfreeze Encoder based on configuration
+                if unfreeze_encoder:
+                    # Unfreeze entire encoder for end-to-end training
+                    for param in self.encoder.parameters():
+                        param.requires_grad = True
+                    self.encoder.train()
+                    logging.info("VGGT encoder is UNFROZEN - will be trained with reconstruction loss")
+                elif unfreeze_decoder_only:
+                    # Freeze encoder backbone, but unfreeze decoder (gs_head)
+                    for name, param in self.encoder.named_parameters():
+                        if 'gs_head' in name or 'gs_feathead' in name:
+                            param.requires_grad = True
+                        else:
+                            param.requires_grad = False
+                    # Set encoder to train mode so decoder can be trained
+                    self.encoder.train()
+                    logging.info("VGGT encoder backbone is FROZEN, but decoder (gs_head) is UNFROZEN")
+                else:
+                    # Fully freeze encoder (original behavior)
+                    for param in self.encoder.parameters():
+                        param.requires_grad = False
+                    self.encoder.eval()
+                    logging.info("VGGT encoder is FROZEN (original behavior)")
                 
                 # Projection and Head
                 # VGGT embed_dim: The aggregator seems to return 2048 dim (concatenated? or large DINO)
@@ -448,32 +472,6 @@ class GaussianAdapter(nn.Module):
         # Get agent view image
         img = agent_images[agent_key]
         logging.debug(f"Using agent view for VGGT: {agent_key}, shape: {img.shape}, ndim: {img.ndim}")
-        # #region agent log
-        import json
-        try:
-            with open('/home/zijianzhang/openpi/.cursor/debug.log', 'a') as f:
-                log_entry = {
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "D",
-                    "location": "pi0_vggt.py:431",
-                    "message": "prepare_inputs - check img shape from observation (before processing)",
-                    "data": {
-                        "agent_key": agent_key,
-                        "img_shape": list(img.shape),
-                        "img_ndim": img.ndim,
-                        "all_agent_keys": list(agent_images.keys()),
-                        "all_agent_shapes": {k: list(v.shape) if hasattr(v, 'shape') else None for k, v in agent_images.items()},
-                        "all_agent_ndims": {k: v.ndim if hasattr(v, 'ndim') else None for k, v in agent_images.items()},
-                        "is_training": is_training,
-                        "target_num_frames": self.num_frames if (is_training if is_training is not None else (self.training if hasattr(self, 'training') else True)) else self.inference_num_frames
-                    },
-                    "timestamp": int(__import__('time').time() * 1000)
-                }
-                f.write(json.dumps(log_entry) + '\n')
-        except: pass
-        # #endregion
-        
         # Determine number of frames to use
         # Auto-detect training mode if not specified
         if is_training is None:
@@ -491,27 +489,6 @@ class GaussianAdapter(nn.Module):
         # Goal: Extract current frame + previous (target_num_frames - 1) frames
         # Strategy: Use past frames for temporal consistency (better for VGGT's global attention)
         # If dataset has [t-2, t-1, t, t+1], we want [t-2, t-1, t] (current + 2 past frames)
-        # #region agent log
-        import json
-        try:
-            with open('/home/zijianzhang/openpi/.cursor/debug.log', 'a') as f:
-                log_entry = {
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "D",
-                    "location": "pi0_vggt.py:474",
-                    "message": "prepare_inputs - check img shape before temporal handling",
-                    "data": {
-                        "img_shape": list(img.shape),
-                        "img_ndim": img.ndim,
-                        "target_num_frames": target_num_frames,
-                        "is_training": is_training
-                    },
-                    "timestamp": int(__import__('time').time() * 1000)
-                }
-                f.write(json.dumps(log_entry) + '\n')
-        except: pass
-        # #endregion
         if img.ndim == 5:  # [B, T, C, H, W] or [B, T, H, W, C]
             T = img.shape[1]
             

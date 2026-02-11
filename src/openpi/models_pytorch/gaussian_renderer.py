@@ -413,68 +413,49 @@ class GaussianRenderer(nn.Module):
         gaussian_params["xyz"] = torch.clamp(gaussian_params["xyz"], min=-100.0, max=100.0)
         
         # Clamp opacity to [0, 1]
+        # Debug: Print opacity stats (only every 40 steps)
+        if step is not None and step % 40 == 0:
+            opacity_before = gaussian_params["opacity"]
+            print(f"[GaussianRenderer] Opacity before clamp: min={opacity_before.min():.6f}, max={opacity_before.max():.6f}, mean={opacity_before.mean():.6f}")
         gaussian_params["opacity"] = torch.clamp(gaussian_params["opacity"], min=0.0, max=1.0)
+        if step is not None and step % 40 == 0:
+            opacity_after = gaussian_params["opacity"]
+            print(f"[GaussianRenderer] Opacity after clamp: min={opacity_after.min():.6f}, max={opacity_after.max():.6f}, mean={opacity_after.mean():.6f}")
         
         # Ensure sigma is positive and not too small/large
-        gaussian_params["sigma"] = torch.clamp(gaussian_params["sigma"], min=1e-8, max=1.0)
+        # NOTE: sigma is variance (scale^2), so if scale can be up to 10.0, sigma can be up to 100.0
+        # Previous max=1.0 was too restrictive and caused all scales to be 1.0
+        # Debug: Print sigma stats before clamping (only every 40 steps to avoid spam)
+        if step is not None and step % 40 == 0:
+            sigma_before = gaussian_params["sigma"]
+            print(f"[GaussianRenderer] Sigma before clamp: min={sigma_before.min():.6f}, max={sigma_before.max():.6f}, mean={sigma_before.mean():.6f}")
+        gaussian_params["sigma"] = torch.clamp(gaussian_params["sigma"], min=1e-8, max=100.0)
+        if step is not None and step % 40 == 0:
+            sigma_after = gaussian_params["sigma"]
+            print(f"[GaussianRenderer] Sigma after clamp: min={sigma_after.min():.6f}, max={sigma_after.max():.6f}, mean={sigma_after.mean():.6f}")
 
-        # #region agent log
-        import json
-        log_path = "/home/zijianzhang/openpi/.cursor/debug.log"
-        try:
-            with open(log_path, "a") as f:
-                f.write(json.dumps({
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "A",
-                    "location": "gaussian_renderer.py:283",
-                    "message": "Before convert_sigma_to_scale_rotation",
-                    "data": {
-                        "sigma_shape": list(gaussian_params["sigma"].shape),
-                        "sigma_min": float(gaussian_params["sigma"].min().item()),
-                        "sigma_max": float(gaussian_params["sigma"].max().item()),
-                        "sigma_mean": float(gaussian_params["sigma"].mean().item()),
-                        "sigma_has_nan": bool(torch.isnan(gaussian_params["sigma"]).any().item()),
-                        "sigma_has_inf": bool(torch.isinf(gaussian_params["sigma"]).any().item())
-                    },
-                    "timestamp": int(torch.cuda.Event(enable_timing=True).query() * 1000) if torch.cuda.is_available() else 0
-                }) + "\n")
-        except: pass
-        # #endregion
-        
+
         # Convert covariance parameters to scales and rotations
         scales, rotations = convert_sigma_to_scale_rotation(
             gaussian_params["sigma"]
         )
         
-        # #region agent log
-        try:
-            with open(log_path, "a") as f:
-                f.write(json.dumps({
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "A,C",
-                    "location": "gaussian_renderer.py:290",
-                    "message": "After convert_sigma_to_scale_rotation",
-                    "data": {
-                        "scales_shape": list(scales.shape),
-                        "scales_min": float(scales.min().item()),
-                        "scales_max": float(scales.max().item()),
-                        "scales_has_nan": bool(torch.isnan(scales).any().item()),
-                        "scales_has_inf": bool(torch.isinf(scales).any().item()),
-                        "rotations_shape": list(rotations.shape),
-                        "rotations_has_nan": bool(torch.isnan(rotations).any().item()),
-                        "rotations_has_inf": bool(torch.isinf(rotations).any().item())
-                    },
-                    "timestamp": 0
-                }) + "\n")
-        except: pass
-        # #endregion
-        
-        # Clamp scales to reasonable range
-        scales = torch.clamp(scales, min=1e-6, max=1.0)
+
+        # Clamp scales to reasonable range, but allow larger values (up to 10.0)
+        # Previous max=1.0 was too restrictive when scale_maps are 0.59-1.10
+        # Debug: Print scale stats before clamping (only every 40 steps)
+        if step is not None and step % 40 == 0:
+            scales_before = scales
+            print(f"[GaussianRenderer] Scales before clamp: min={scales_before.min():.6f}, max={scales_before.max():.6f}, mean={scales_before.mean():.6f}")
+        scales = torch.clamp(scales, min=1e-6, max=10.0)
+        if step is not None and step % 40 == 0:
+            scales_after = scales
+            print(f"[GaussianRenderer] Scales after clamp: min={scales_after.min():.6f}, max={scales_after.max():.6f}, mean={scales_after.mean():.6f}")
         
         # Apply scale factor to adjust Gaussian sizes (for debugging blurriness)
+        # NOTE: VGGT decoder outputs scales in range 0.59-1.10, which are too large for sharp rendering
+        # Apply scale_factor (default 0.1) to reduce scales to ~0.06-0.11 range for sharper rendering
+        # If rendering is still blurry, reduce scale_factor further (e.g., 0.05, 0.01)
         scales = scales * self.scale_factor
         
         # Normalize quaternions
@@ -518,27 +499,6 @@ class GaussianRenderer(nn.Module):
                 warnings.warn(f"Camera parameter validation failed: {issues[0]}")
         
         for b in range(B):
-            # #region agent log
-            try:
-                with open(log_path, "a") as f:
-                    f.write(json.dumps({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "B,D",
-                        "location": "gaussian_renderer.py:318",
-                        "message": "Before camera space transform",
-                        "data": {
-                            "batch_idx": b,
-                            "xyz_world_min": [float(x) for x in gaussian_params["xyz"][b].min(dim=0)[0].cpu().tolist()],
-                            "xyz_world_max": [float(x) for x in gaussian_params["xyz"][b].max(dim=0)[0].cpu().tolist()],
-                            "viewmatrix_has_nan": bool(torch.isnan(camera_params["viewmatrix"][b]).any().item()),
-                            "viewmatrix_has_inf": bool(torch.isinf(camera_params["viewmatrix"][b]).any().item())
-                        },
-                        "timestamp": 0
-                    }) + "\n")
-            except: pass
-            # #endregion
-            
             # Debug: Check if Gaussians are in valid range before rendering
             xyz_b = gaussian_params["xyz"][b]  # [N, 3]
             # Transform to camera space to check visibility
@@ -548,58 +508,12 @@ class GaussianRenderer(nn.Module):
             xyz_cam = torch.matmul(xyz_homo, viewmatrix_b.transpose(-1, -2))  # [N, 4]
             z_cam = xyz_cam[:, 2]  # [N] - Z in camera space
             
-            # #region agent log
-            try:
-                with open(log_path, "a") as f:
-                    f.write(json.dumps({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "B",
-                        "location": "gaussian_renderer.py:330",
-                        "message": "After camera space transform",
-                        "data": {
-                            "batch_idx": b,
-                            "xyz_cam_min": [float(x) for x in xyz_cam.min(dim=0)[0].cpu().tolist()],
-                            "xyz_cam_max": [float(x) for x in xyz_cam.max(dim=0)[0].cpu().tolist()],
-                            "z_cam_min": float(z_cam.min().item()),
-                            "z_cam_max": float(z_cam.max().item()),
-                            "num_valid": int((z_cam > 0.01).sum().item())
-                        },
-                        "timestamp": 0
-                    }) + "\n")
-            except: pass
-            # #endregion
-            
             # Check if any Gaussians are in front of camera (z > 0)
             valid_mask = z_cam > 0.01  # znear threshold
             num_valid = valid_mask.sum().item()
             
             # If no valid Gaussians, render will be black - this is expected for some batches
             # But we should still render to get gradients (rasterizer handles this)
-            
-            # #region agent log
-            try:
-                projmatrix_b = camera_params["projmatrix"][b]
-                with open(log_path, "a") as f:
-                    f.write(json.dumps({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "D",
-                        "location": "gaussian_renderer.py:341",
-                        "message": "Before creating raster_settings",
-                        "data": {
-                            "batch_idx": b,
-                            "tanfovx": float(camera_params["tanfovx"].item() if isinstance(camera_params["tanfovx"], torch.Tensor) else camera_params["tanfovx"]),
-                            "tanfovy": float(camera_params["tanfovy"].item() if isinstance(camera_params["tanfovy"], torch.Tensor) else camera_params["tanfovy"]),
-                            "projmatrix_has_nan": bool(torch.isnan(projmatrix_b).any().item()),
-                            "projmatrix_has_inf": bool(torch.isinf(projmatrix_b).any().item()),
-                            "campos_has_nan": bool(torch.isnan(camera_params["campos"][b]).any().item()),
-                            "campos_has_inf": bool(torch.isinf(camera_params["campos"][b]).any().item())
-                        },
-                        "timestamp": 0
-                    }) + "\n")
-            except: pass
-            # #endregion
             
             # Create rasterization settings for this batch element
             # Note: diff-gaussian-rasterization expects Tensors on GPU, not numpy arrays
@@ -632,28 +546,9 @@ class GaussianRenderer(nn.Module):
             num_coeffs = (self.sh_degree + 1) ** 2
             expected_sh_dim = num_coeffs * 3  # 16 * 3 = 48 for sh_degree=3
             
-            # #region agent log
-            try:
-                with open(log_path, "a") as f:
-                    f.write(json.dumps({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "E",
-                        "location": "gaussian_renderer.py:365",
-                        "message": "SH coefficients before reshape",
-                        "data": {
-                            "batch_idx": b,
-                            "sh_shape_before": list(shs_val.shape),
-                            "num_coeffs": num_coeffs,
-                            "expected_sh_dim": expected_sh_dim,
-                            "sh_degree": self.sh_degree,
-                            "sh_has_nan": bool(torch.isnan(shs_val).any().item()),
-                            "sh_has_inf": bool(torch.isinf(shs_val).any().item())
-                        },
-                        "timestamp": 0
-                    }) + "\n")
-            except: pass
-            # #endregion
+            # Debug: Print SH stats (only every 40 steps)
+            if step is not None and step % 40 == 0 and b == 0:
+                print(f"[GaussianRenderer] SH before reshape: shape={shs_val.shape}, min={shs_val.min():.6f}, max={shs_val.max():.6f}, mean={shs_val.mean():.6f}")
             
             # Handle different SH dimensions (VGGT may use sh_degree=4 -> 75 dims, we need 48 for sh_degree=3)
             if shs_val.shape[-1] == expected_sh_dim:
@@ -668,23 +563,12 @@ class GaussianRenderer(nn.Module):
                 sh_padded[:, :shs_val.shape[-1]] = shs_val
                 shs_val = sh_padded.view(-1, num_coeffs, 3)
             
-            # #region agent log
-            try:
-                with open(log_path, "a") as f:
-                    f.write(json.dumps({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "E",
-                        "location": "gaussian_renderer.py:400",
-                        "message": "SH coefficients after reshape",
-                        "data": {
-                            "batch_idx": b,
-                            "sh_shape_after": list(shs_val.shape)
-                        },
-                        "timestamp": 0
-                    }) + "\n")
-            except: pass
-            # #endregion
+            # Debug: Print SH stats after reshape (only every 40 steps)
+            if step is not None and step % 40 == 0 and b == 0:
+                print(f"[GaussianRenderer] SH after reshape: shape={shs_val.shape}, min={shs_val.min():.6f}, max={shs_val.max():.6f}, mean={shs_val.mean():.6f}")
+                # Check SH C0 (DC term) which determines base color
+                sh_c0 = shs_val[:, 0, :]  # [N, 3] - DC term for RGB
+                print(f"[GaussianRenderer] SH C0 (DC term): min={sh_c0.min():.6f}, max={sh_c0.max():.6f}, mean={sh_c0.mean():.6f}")
             
             # Final validation before rendering
             # Filter out invalid Gaussians (NaN/Inf, out of range, etc.)
@@ -693,32 +577,6 @@ class GaussianRenderer(nn.Module):
             scales_b_valid = scales[b]
             rotations_b_valid = rotations[b]
             shs_val_valid = shs_val
-            
-            # #region agent log
-            try:
-                with open(log_path, "a") as f:
-                    f.write(json.dumps({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "A,B,C,E",
-                        "location": "gaussian_renderer.py:378",
-                        "message": "Final validation before rasterizer call",
-                        "data": {
-                            "batch_idx": b,
-                            "xyz_shape": list(xyz_b_valid.shape),
-                            "opacity_shape": list(opacity_b_valid.shape),
-                            "scales_shape": list(scales_b_valid.shape),
-                            "rotations_shape": list(rotations_b_valid.shape),
-                            "shs_shape": list(shs_val_valid.shape),
-                            "xyz_has_nan": bool(torch.isnan(xyz_b_valid).any().item()),
-                            "scales_has_nan": bool(torch.isnan(scales_b_valid).any().item()),
-                            "rotations_has_nan": bool(torch.isnan(rotations_b_valid).any().item()),
-                            "shs_has_nan": bool(torch.isnan(shs_val_valid).any().item())
-                        },
-                        "timestamp": 0
-                    }) + "\n")
-            except: pass
-            # #endregion
             
             # Check for any remaining invalid values
             valid_mask = (
@@ -993,11 +851,19 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
             rendered_np = rendered_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() # [H, W, 3]
             print(f"[Viz] Rendered {view_name} range: min={rendered_np.min():.4f}, max={rendered_np.max():.4f}, mean={rendered_np.mean():.4f}")
             
+            # Debug: Check if rendering is all zeros or very small
+            if rendered_np.max() < 1e-6:
+                print(f"[Viz] WARNING: Rendered image is all zeros or very small (max={rendered_np.max():.6f})!")
+                print(f"[Viz] This suggests: 1) Scale values too small, 2) Opacity too small, 3) SH coefficients wrong, or 4) 3D positions wrong")
+            
             # Robust visualization for Rendered
             denom = rendered_np.max() - rendered_np.min()
             if denom > 1e-6:
                 rendered_viz = (rendered_np - rendered_np.min()) / denom
             else:
+                # If all values are the same (or all zeros), use raw values but warn
+                if rendered_np.max() < 1e-6:
+                    print(f"[Viz] WARNING: All rendered values are near zero, visualization will be black!")
                 rendered_viz = rendered_np # All same value
             rendered_viz = np.clip(rendered_viz, 0, 1)
 
