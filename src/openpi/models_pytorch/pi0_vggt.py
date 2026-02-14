@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -11,6 +12,41 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
+
+# ---------------------------------------------------------------------------
+# Lightweight LoRA adapter (no peft dependency)
+# ---------------------------------------------------------------------------
+class LoRALinear(nn.Module):
+    """LoRA adapter wrapping an existing nn.Linear (frozen)."""
+
+    def __init__(self, original: nn.Linear, rank: int = 8, alpha: float = 32.0):
+        super().__init__()
+        self.original = original
+        self.scaling = alpha / rank
+        self.lora_A = nn.Linear(original.in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, original.out_features, bias=False)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        for p in self.original.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        return self.original(x) + self.lora_B(self.lora_A(x)) * self.scaling
+
+
+def apply_lora_to_model(model: nn.Module, target_names=("qkv", "proj"), rank: int = 8, alpha: float = 32.0):
+    """Walk *model* and replace matching nn.Linear layers with LoRALinear wrappers.
+
+    Returns the number of LoRA-injected layers.
+    """
+    count = 0
+    for parent_name, parent_module in list(model.named_modules()):
+        for attr_name, child in list(parent_module.named_children()):
+            if isinstance(child, nn.Linear) and any(t in attr_name for t in target_names):
+                lora = LoRALinear(child, rank=rank, alpha=alpha)
+                setattr(parent_module, attr_name, lora)
+                count += 1
+    return count
 
 # Add AD-FFgsStudio to python path
 _root_path = Path(__file__).resolve().parents[3]
@@ -306,9 +342,11 @@ class GaussianAdapter(nn.Module):
     """
     Adapter for integrating VGGT (Transformer-based 3DGS) features into OpenPI models.
     """
-    def __init__(self, use_gaussian: bool, action_expert_width: int, use_lgpd: bool = True, 
-                 num_frames: int = 3, inference_num_frames: int = 1, 
-                 unfreeze_encoder: bool = False, unfreeze_decoder_only: bool = True):
+    def __init__(self, use_gaussian: bool, action_expert_width: int, use_lgpd: bool = True,
+                 num_frames: int = 3, inference_num_frames: int = 1,
+                 unfreeze_encoder: bool = False, unfreeze_decoder_only: bool = True,
+                 use_lora: bool = True, lora_rank: int = 8, lora_alpha: float = 32.0,
+                 lora_targets=("qkv", "proj")):
         """
         Args:
             use_gaussian: Whether to use Gaussian features
@@ -350,21 +388,38 @@ class GaussianAdapter(nn.Module):
                     self.encoder.train()
                     logging.info("VGGT encoder is UNFROZEN - will be trained with reconstruction loss")
                 elif unfreeze_decoder_only:
-                    # Freeze encoder backbone, but unfreeze decoder (gs_head)
+                    # Freeze encoder backbone, but unfreeze decoder (gs_head) and depth_head
                     for name, param in self.encoder.named_parameters():
-                        if 'gs_head' in name or 'gs_feathead' in name:
+                        if 'gs_head' in name or 'gs_feathead' in name or 'depth_head' in name:
                             param.requires_grad = True
                         else:
                             param.requires_grad = False
-                    # Set encoder to train mode so decoder can be trained
+                    # Set encoder to train mode so decoder/depth_head can be trained
                     self.encoder.train()
-                    logging.info("VGGT encoder backbone is FROZEN, but decoder (gs_head) is UNFROZEN")
+                    logging.info("VGGT encoder backbone is FROZEN, but decoder (gs_head) and depth_head are UNFROZEN")
                 else:
                     # Fully freeze encoder (original behavior)
                     for param in self.encoder.parameters():
                         param.requires_grad = False
                     self.encoder.eval()
                     logging.info("VGGT encoder is FROZEN (original behavior)")
+
+                # Apply LoRA to encoder backbone (after freezing)
+                if use_lora and not unfreeze_encoder:
+                    aggregator = self.encoder.aggregator
+                    n_lora = apply_lora_to_model(
+                        aggregator, target_names=lora_targets,
+                        rank=lora_rank, alpha=lora_alpha,
+                    )
+                    lora_params = sum(
+                        p.numel() for p in aggregator.parameters() if p.requires_grad
+                    )
+                    total_params = sum(p.numel() for p in aggregator.parameters())
+                    logging.info(
+                        f"LoRA applied: {n_lora} layers, rank={lora_rank}, "
+                        f"trainable={lora_params:,} / {total_params:,} "
+                        f"({100*lora_params/total_params:.2f}%)"
+                    )
                 
                 # Projection and Head
                 # VGGT embed_dim: The aggregator seems to return 2048 dim (concatenated? or large DINO)
