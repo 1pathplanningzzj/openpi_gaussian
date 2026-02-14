@@ -383,11 +383,11 @@ class GaussianRenderer(nn.Module):
                         torch.zeros_like(value),
                         value
                     )
-                elif key == "sigma":
+                elif key == "scales":
                     # Replace with small positive values
                     gaussian_params[key] = torch.where(
                         torch.isnan(value) | torch.isinf(value),
-                        torch.ones_like(value) * 1e-6,
+                        torch.ones_like(value) * 1e-4,
                         value
                     )
                 elif key == "opacity":
@@ -421,41 +421,27 @@ class GaussianRenderer(nn.Module):
         if step is not None and step % 40 == 0:
             opacity_after = gaussian_params["opacity"]
             print(f"[GaussianRenderer] Opacity after clamp: min={opacity_after.min():.6f}, max={opacity_after.max():.6f}, mean={opacity_after.mean():.6f}")
-        
-        # Ensure sigma is positive and not too small/large
-        # NOTE: sigma is variance (scale^2), so if scale can be up to 10.0, sigma can be up to 100.0
-        # Previous max=1.0 was too restrictive and caused all scales to be 1.0
-        # Debug: Print sigma stats before clamping (only every 40 steps to avoid spam)
-        if step is not None and step % 40 == 0:
-            sigma_before = gaussian_params["sigma"]
-            print(f"[GaussianRenderer] Sigma before clamp: min={sigma_before.min():.6f}, max={sigma_before.max():.6f}, mean={sigma_before.mean():.6f}")
-        gaussian_params["sigma"] = torch.clamp(gaussian_params["sigma"], min=1e-8, max=100.0)
-        if step is not None and step % 40 == 0:
-            sigma_after = gaussian_params["sigma"]
-            print(f"[GaussianRenderer] Sigma after clamp: min={sigma_after.min():.6f}, max={sigma_after.max():.6f}, mean={sigma_after.mean():.6f}")
 
+        # --- Get scales and rotations ---
+        # New path: use scales and rotations directly (like gsplat reference in AD-FFgsStudio)
+        # Old path (sigma): decompose covariance → loses rotation info (all become identity)
+        if "scales" in gaussian_params:
+            scales = gaussian_params["scales"]
+            rotations = gaussian_params["rotations"]
+        else:
+            # Legacy fallback: decompose sigma (loses rotation!)
+            scales, rotations = convert_sigma_to_scale_rotation(
+                gaussian_params["sigma"]
+            )
 
-        # Convert covariance parameters to scales and rotations
-        scales, rotations = convert_sigma_to_scale_rotation(
-            gaussian_params["sigma"]
-        )
-        
-
-        # Clamp scales to reasonable range, but allow larger values (up to 10.0)
-        # Previous max=1.0 was too restrictive when scale_maps are 0.59-1.10
-        # Debug: Print scale stats before clamping (only every 40 steps)
+        # Clamp scales
         if step is not None and step % 40 == 0:
-            scales_before = scales
-            print(f"[GaussianRenderer] Scales before clamp: min={scales_before.min():.6f}, max={scales_before.max():.6f}, mean={scales_before.mean():.6f}")
+            print(f"[GaussianRenderer] Scales before clamp: min={scales.min():.6f}, max={scales.max():.6f}, mean={scales.mean():.6f}")
         scales = torch.clamp(scales, min=1e-6, max=10.0)
         if step is not None and step % 40 == 0:
-            scales_after = scales
-            print(f"[GaussianRenderer] Scales after clamp: min={scales_after.min():.6f}, max={scales_after.max():.6f}, mean={scales_after.mean():.6f}")
-        
-        # Apply scale factor to adjust Gaussian sizes (for debugging blurriness)
-        # NOTE: VGGT decoder outputs scales in range 0.59-1.10, which are too large for sharp rendering
-        # Apply scale_factor (default 0.1) to reduce scales to ~0.06-0.11 range for sharper rendering
-        # If rendering is still blurry, reduce scale_factor further (e.g., 0.05, 0.01)
+            print(f"[GaussianRenderer] Scales after clamp: min={scales.min():.6f}, max={scales.max():.6f}, mean={scales.mean():.6f}")
+
+        # Apply scale factor
         scales = scales * self.scale_factor
         
         # Normalize quaternions
@@ -623,8 +609,8 @@ class GaussianRenderer(nn.Module):
                     rotations=rotations[b]
                 )
             
-            # Debug: Log rendering statistics (only for first batch to avoid spam)
-            if b == 0:
+            # Debug: Log rendering statistics (only for first batch, every 40 steps)
+            if b == 0 and step is not None and step % 40 == 0:
                 z_min, z_max = z_cam.min().item(), z_cam.max().item()
                 rendered_max = rendered_color.max().item()
                 rendered_mean = rendered_color.mean().item()
@@ -693,6 +679,66 @@ class GaussianRenderer(nn.Module):
         return rendered_images
 
 
+def compute_ssim_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """SSIM loss with 3x3 kernel and reflection padding. Returns per-pixel loss map."""
+    ref_pad = torch.nn.ReflectionPad2d(1)
+    pred = ref_pad(pred)
+    target = ref_pad(target)
+
+    mu_pred = F.avg_pool2d(pred, kernel_size=3, stride=1)
+    mu_target = F.avg_pool2d(target, kernel_size=3, stride=1)
+
+    musq_pred = mu_pred.pow(2)
+    musq_target = mu_target.pow(2)
+    mu_pred_target = mu_pred * mu_target
+
+    sigma_pred = F.avg_pool2d(pred.pow(2), kernel_size=3, stride=1) - musq_pred
+    sigma_target = F.avg_pool2d(target.pow(2), kernel_size=3, stride=1) - musq_target
+    sigma_pred_target = F.avg_pool2d(pred * target, kernel_size=3, stride=1) - mu_pred_target
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    ssim_map = ((2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)) \
+               / ((musq_pred + musq_target + C1) * (sigma_pred + sigma_target + C2) + 1e-8)
+    return torch.clamp((1 - ssim_map) / 2, 0, 1)
+
+
+def compute_photometric_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Combined photometric loss: 0.85 * SSIM + 0.15 * L1. Returns scalar."""
+    l1_loss = (target - pred).abs().mean(1, True)
+    ssim_loss = compute_ssim_loss(pred, target).mean(1, True)
+    return (0.85 * ssim_loss + 0.15 * l1_loss).mean()
+
+
+def compute_edge_smooth_loss(rgb: torch.Tensor, disp_map: torch.Tensor) -> torch.Tensor:
+    """Edge-aware depth smoothness loss. rgb: [B,3,H,W], disp_map: [B,1,H,W]."""
+    grad_rgb_x = (rgb[:, :, :, :-1] - rgb[:, :, :, 1:]).abs().mean(1, True)
+    grad_rgb_y = (rgb[:, :, :-1, :] - rgb[:, :, 1:, :]).abs().mean(1, True)
+
+    grad_disp_x = (disp_map[:, :, :, :-1] - disp_map[:, :, :, 1:]).abs()
+    grad_disp_y = (disp_map[:, :, :-1, :] - disp_map[:, :, 1:, :]).abs()
+
+    grad_disp_x *= (-1.0 * grad_rgb_x).exp()
+    grad_disp_y *= (-1.0 * grad_rgb_y).exp()
+    return grad_disp_x.mean() + grad_disp_y.mean()
+
+
+def compute_gaussian_regularization(
+    gaussian_params: Dict[str, torch.Tensor],
+    lambda_scale: float = 0.01,
+    lambda_opacity: float = 0.01,
+) -> torch.Tensor:
+    """Scale + opacity regularization (encourages small Gaussians and sparsity)."""
+    device = gaussian_params["xyz"].device
+    reg = torch.tensor(0.0, device=device)
+    if "scales" in gaussian_params:
+        reg = reg + lambda_scale * gaussian_params["scales"].norm(dim=-1).mean()
+    if "opacity" in gaussian_params:
+        reg = reg + lambda_opacity * gaussian_params["opacity"].abs().mean()
+    return reg
+
+
 def compute_rendering_loss(
     gaussian_params: Dict[str, torch.Tensor],
     target_image: torch.Tensor,
@@ -702,7 +748,7 @@ def compute_rendering_loss(
     step: Optional[int] = None
 ) -> torch.Tensor:
     """
-    Compute rendering loss with optional attention masking.
+    Compute rendering loss (L1 + SSIM photometric) with optional attention masking.
 
     Args:
         gaussian_params: 3D Gaussian parameters
@@ -717,17 +763,15 @@ def compute_rendering_loss(
     # Render from the given viewpoint
     rendered_image = renderer(gaussian_params, camera_params, step=step)
 
-    # Compute pixel-wise loss
-    pixel_loss = (rendered_image - target_image) ** 2  # [B, 3, H, W]
-
     if M_attn is not None:
-        # Interaction-aware rendering loss
-        # L_render = M_attn · ||Î - I||²
-        weighted_loss = M_attn.unsqueeze(1) * pixel_loss  # [B, 3, H, W]
+        # Masked photometric loss
+        l1_loss = (rendered_image - target_image).abs()
+        ssim_loss = compute_ssim_loss(rendered_image, target_image)
+        pixel_loss = 0.85 * ssim_loss + 0.15 * l1_loss
+        weighted_loss = M_attn.unsqueeze(1) * pixel_loss
         loss = weighted_loss.mean()
     else:
-        # Standard rendering loss
-        loss = pixel_loss.mean()
+        loss = compute_photometric_loss(rendered_image, target_image)
 
     return loss
 
@@ -739,11 +783,15 @@ def compute_multi_view_rendering_loss(
     renderer: GaussianRenderer,
     M_attn_dict: Optional[Dict[str, torch.Tensor]] = None,
     view_names: list = ["agent", "wrist"],
-    step: Optional[int] = None
+    step: Optional[int] = None,
+    depth_map: Optional[torch.Tensor] = None,
+    lambda_scale: float = 0.001,
+    lambda_opacity: float = 0.001,
+    lambda_edge_smooth: float = 0.01,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Compute multi-view rendering loss.
-    
+    Compute multi-view rendering loss with regularization and edge-aware depth smoothness.
+
     Args:
         gaussian_params: 3D Gaussian parameters
         observations: Dictionary with target images for each view
@@ -751,52 +799,71 @@ def compute_multi_view_rendering_loss(
         renderer: GaussianRenderer instance
         M_attn_dict: Optional dictionary of attention masks for each view
         view_names: List of view names to render
+        step: Current training step
+        depth_map: [B, 1, H, W] predicted depth map for edge-aware smoothness
+        lambda_scale: Weight for scale regularization
+        lambda_opacity: Weight for opacity regularization
+        lambda_edge_smooth: Weight for edge-aware depth smoothness
 
     Returns:
         total_loss: Total rendering loss across all views
         loss_dict: Dictionary of per-view losses
     """
-    total_loss = 0.0
+    device = gaussian_params["xyz"].device
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True) if gaussian_params["xyz"].requires_grad \
+        else torch.tensor(0.0, device=device)
     loss_dict = {}
 
     for view_name in view_names:
         try:
-            # Get target image for this view
             target_image = observations[f"{view_name}_image"]
-
-            # Get camera parameters for this view
             camera_params = camera_params_dict[view_name]
-
-            # Get attention mask for this view (if available)
             M_attn = M_attn_dict.get(view_name) if M_attn_dict is not None else None
 
-            # Compute rendering loss for this view
             view_loss = compute_rendering_loss(
-                gaussian_params,
-                target_image,
-                camera_params,
-                renderer,
-                M_attn,
-                step=step
+                gaussian_params, target_image, camera_params, renderer, M_attn, step=step
             )
 
             loss_dict[f"loss_render_{view_name}"] = view_loss
-            total_loss += view_loss
+            total_loss = total_loss + view_loss
         except Exception as e:
-            # If rendering fails, return zero loss with gradient connection
             import warnings
             warnings.warn(f"Rendering failed for view {view_name}: {e}")
-            # Create a zero loss that's connected to the computation graph
-            # Use gaussian_params to ensure gradient flow
             if gaussian_params["xyz"].requires_grad:
                 dummy_loss = 0.0 * gaussian_params["xyz"].sum()
             else:
-                dummy_loss = torch.tensor(0.0, device=gaussian_params["xyz"].device, requires_grad=False)
+                dummy_loss = torch.tensor(0.0, device=device, requires_grad=False)
             loss_dict[f"loss_render_{view_name}"] = dummy_loss
-            total_loss += dummy_loss
+            total_loss = total_loss + dummy_loss
 
-    # Average across views
+    # Average photometric loss across views
     total_loss = total_loss / len(view_names)
+
+    # Scale + opacity regularization
+    reg_loss = compute_gaussian_regularization(gaussian_params, lambda_scale, lambda_opacity)
+    loss_dict["loss_reg"] = reg_loss
+    total_loss = total_loss + reg_loss
+
+    # Edge-aware depth smoothness
+    if depth_map is not None:
+        # Use first view's target image as RGB reference for edge detection
+        first_view = view_names[0]
+        rgb_ref_key = f"{first_view}_image"
+        if rgb_ref_key in observations:
+            rgb_ref = observations[rgb_ref_key]
+            # Resize depth to match RGB if needed
+            if depth_map.shape[2:] != rgb_ref.shape[2:]:
+                depth_map = F.interpolate(depth_map, size=rgb_ref.shape[2:], mode="bilinear", align_corners=False)
+            # Normalize disparity by mean for stability (AD-FFgsStudio convention)
+            disp = 1.0 / (depth_map + 1e-6)
+            disp = disp / (disp.mean() + 1e-6)
+            edge_loss = lambda_edge_smooth * compute_edge_smooth_loss(rgb_ref, disp)
+            loss_dict["loss_edge_smooth"] = edge_loss
+            total_loss = total_loss + edge_loss
+
+    if step is not None and step % 40 == 0:
+        parts = ", ".join(f"{k}={v.item():.6f}" for k, v in loss_dict.items())
+        print(f"[MultiViewLoss] Step {step}: {parts}, total={total_loss.item():.6f}")
 
     return total_loss, loss_dict
 
@@ -840,10 +907,15 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
             # Single item slice for gaussians
             params_single = {
                "xyz": gaussian_params["xyz"][idx:idx+1],
-               "sigma": gaussian_params["sigma"][idx:idx+1],
                "sh": gaussian_params["sh"][idx:idx+1],
                "opacity": gaussian_params["opacity"][idx:idx+1]
             }
+            # Use scales+rotations if available, otherwise fall back to sigma
+            if "scales" in gaussian_params:
+                params_single["scales"] = gaussian_params["scales"][idx:idx+1]
+                params_single["rotations"] = gaussian_params["rotations"][idx:idx+1]
+            else:
+                params_single["sigma"] = gaussian_params["sigma"][idx:idx+1]
             
             rendered_img = renderer(params_single, cam_params) # [1, 3, H, W]
             rendered_img = rendered_img.float() # Ensure float for plotting
@@ -856,46 +928,33 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
                 print(f"[Viz] WARNING: Rendered image is all zeros or very small (max={rendered_np.max():.6f})!")
                 print(f"[Viz] This suggests: 1) Scale values too small, 2) Opacity too small, 3) SH coefficients wrong, or 4) 3D positions wrong")
             
-            # Robust visualization for Rendered
-            denom = rendered_np.max() - rendered_np.min()
-            if denom > 1e-6:
-                rendered_viz = (rendered_np - rendered_np.min()) / denom
-            else:
-                # If all values are the same (or all zeros), use raw values but warn
-                if rendered_np.max() < 1e-6:
-                    print(f"[Viz] WARNING: All rendered values are near zero, visualization will be black!")
-                rendered_viz = rendered_np # All same value
-            rendered_viz = np.clip(rendered_viz, 0, 1)
+            # Direct clamp to [0,1] — no min-max normalization
+            # Rendered image from SH should already be in ~[0,1] range (SH_C0 * sh + 0.5)
+            rendered_viz = np.clip(rendered_np, 0, 1)
 
             # 2. GT Image
             gt_img = target_obs[f"{view_name}_image"][idx] # [3, H, W]
             gt_img = gt_img.float()
-            
+
             gt_np = gt_img.permute(1, 2, 0).detach().cpu().numpy()
-            print(f"[Viz] GT {view_name} raw range: min={gt_np.min():.4f}, max={gt_np.max():.4f}, mean={gt_np.mean():.4f}")
-            
-            # Robust visualization for GT
-            gt_min, gt_max = gt_np.min(), gt_np.max()
-            if gt_max - gt_min > 1e-6:
-                 gt_viz = (gt_np - gt_min) / (gt_max - gt_min)
-            else:
-                 gt_viz = gt_np
-            gt_viz = np.clip(gt_viz, 0, 1)
-            
-            # 3. Difference (on visual properties)
+
+            # Direct clamp — GT is already in [0,1] after (img+1)/2
+            gt_viz = np.clip(gt_np, 0, 1)
+
+            # 3. Difference (on actual pixel values, not normalized)
             diff_np = np.abs(rendered_viz - gt_viz)
-            
+
             # Plot
             axes[i, 0].imshow(gt_viz)
-            axes[i, 0].set_title(f"{view_name} GT (Norm)")
+            axes[i, 0].set_title(f"{view_name} GT")
             axes[i, 0].axis('off')
-            
+
             axes[i, 1].imshow(rendered_viz)
-            axes[i, 1].set_title(f"{view_name} Rendered (Norm)")
+            axes[i, 1].set_title(f"{view_name} Rendered")
             axes[i, 1].axis('off')
-            
+
             axes[i, 2].imshow(diff_np)
-            axes[i, 2].set_title(f"{view_name} Diff (Norm)")
+            axes[i, 2].set_title(f"{view_name} Diff")
             axes[i, 2].axis('off')
             
     plt.tight_layout()

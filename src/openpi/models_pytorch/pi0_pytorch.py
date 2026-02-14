@@ -124,7 +124,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_scale_vggt_3frames_1futureframe")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test1")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -145,29 +145,22 @@ class PI0Pytorch(nn.Module):
         self.current_frame_recon_loss_weight = getattr(config, "current_frame_recon_loss_weight", 0.5)
         
         # --- World Model Tokens in Prefix (NEW Architecture) ---
-        # Add world tokens and future query tokens to prefix for unified VLM processing
+        # Add future query tokens to prefix for unified VLM processing
         self.use_world_tokens_in_prefix = getattr(config, "use_world_model", False) and use_gaussian
         if self.use_world_tokens_in_prefix:
-            # Number of world tokens (pooled from VGGT encoder output)
-            # Default: 100 tokens (10x10 grid) per frame, or 300 tokens (3 frames × 100)
-            self.world_token_count = getattr(config, "world_token_count", 100)  # Use pooled tokens (single frame)
-            
-            # Number of future query tokens (predictions for z_{t+1})
-            self.future_token_count = getattr(config, "future_token_count", 100)  # Match world_token_count
-            
-            # Projection layer for world tokens (if VGGT dim != VLM width)
-            # Note: GaussianAdapter already projects to paligemma_config.width, but we keep this for flexibility
-            self.world_token_proj = nn.Linear(paligemma_config.width, paligemma_config.width)
-            
-            # Future query tokens: learnable embeddings that will be predicted by VLM
-            # These tokens will be placed at the end of prefix and output will be used as z_{t+1}
+            # 256 future query tokens (matches 16×16 decoder grid)
+            self.future_token_count = 256
+
+            # World tokens removed — redundant with Gaussian tokens (300)
+            self.world_token_count = 0
+            self.world_token_proj = None
+
+            # Future query tokens: learnable embeddings predicted by VLM
             self.future_query_tokens = nn.Parameter(
                 torch.randn(1, self.future_token_count, paligemma_config.width) * 0.02
             )
-            
-            logging.info(f"Initialized World Model tokens in prefix:")
-            logging.info(f"  - World tokens: {self.world_token_count} tokens")
-            logging.info(f"  - Future query tokens: {self.future_token_count} tokens")
+
+            logging.info(f"Initialized future query tokens: {self.future_token_count} (coupled mask)")
         else:
             self.world_token_count = 0
             self.future_token_count = 0
@@ -210,14 +203,15 @@ class PI0Pytorch(nn.Module):
                 token_dim=paligemma_config.width,
                 use_vggt_decoder=use_vggt_decoder,
                 vggt_decoder=vggt_decoder,
-                input_num_tokens=100,
+                input_num_tokens=256,
                 target_num_tokens=1369,
                 vggt_embed_dim=vggt_embed_dim,
+                decode_mode="independent",
             )
 
-            # Initialize Gaussian Renderer
+            # Initialize Gaussian Renderer (sh_degree=0 for DC-only RGB)
             try:
-                self.gaussian_renderer = GaussianRenderer(image_size=224, sh_degree=3, scale_factor=0.1)
+                self.gaussian_renderer = GaussianRenderer(image_size=224, sh_degree=0, scale_factor=1.0)
                 logging.info("Gaussian Renderer initialized for World Model supervision.")
             except ImportError:
                 self.gaussian_renderer = None
@@ -498,41 +492,9 @@ class PI0Pytorch(nn.Module):
         # --- Get World Tokens from GaussianAdapter (NEW) ---
         world_tokens = None
         world_mask = None
-        if self.use_world_tokens_in_prefix and gaussian_inputs is not None:
-            # Get raw tokens from GaussianAdapter (before pooling/projection)
-            # We need to call adapter's forward to get the pooled tokens
-            # The adapter returns [B, N, D] where N can be 100 (pooled) or 300 (3 frames × 100)
-            adapter_output = self.gaussian_adapter(gaussian_inputs, text_embedding=text_embedding, return_raw_tokens=False)
-            if adapter_output and len(adapter_output) > 0:
-                gaussian_embs_raw = adapter_output[0]  # [B, N, D] where N is 100 or 300
-                
-                # Extract world tokens: use pooled tokens (100) or take first frame if 300
-                B, N, D = gaussian_embs_raw.shape
-                if N == 300:  # 3 frames × 100 tokens
-                    # Take the last frame (current frame) tokens: [B, 100, D]
-                    world_tokens = gaussian_embs_raw[:, -100:, :]  # Last 100 tokens = current frame
-                elif N == 100:  # Already pooled
-                    world_tokens = gaussian_embs_raw
-                else:
-                    # Fallback: take first N tokens or pool
-                    world_tokens = gaussian_embs_raw[:, :self.world_token_count, :] if N >= self.world_token_count else gaussian_embs_raw
-                    if world_tokens.shape[1] < self.world_token_count:
-                        # Pad if needed
-                        padding = torch.zeros(B, self.world_token_count - world_tokens.shape[1], D, 
-                                             device=world_tokens.device, dtype=world_tokens.dtype)
-                        world_tokens = torch.cat([world_tokens, padding], dim=1)
-                    elif world_tokens.shape[1] > self.world_token_count:
-                        # Truncate if needed
-                        world_tokens = world_tokens[:, :self.world_token_count, :]
-                
-                # Project if needed (usually not needed as adapter already projects)
-                if self.world_token_proj is not None:
-                    world_tokens = self.world_token_proj(world_tokens)
-                
-                # Create mask
-                world_mask = torch.ones(B, self.world_token_count, dtype=torch.bool, device=world_tokens.device)
-                segment_lengths['world'] = self.world_token_count
-        
+        # World tokens removed — redundant with Gaussian tokens (300).
+        # The block below is intentionally empty; kept for code structure clarity.
+
         # Original Gaussian embeddings (for backward compatibility, if not using world tokens)
         gaussian_embs, g_mask = self.gaussian_adapter(gaussian_inputs, text_embedding=text_embedding)
         
@@ -545,6 +507,7 @@ class PI0Pytorch(nn.Module):
              segment_lengths['gaussian'] = g_len
 
         # Process images
+        total_img_tokens = 0
         for img, img_mask in zip(images, img_masks, strict=True):
             # Handle temporal dimension: [B, T, H, W, C] or [B, H, W, C]
             has_temporal = img.ndim == 5
@@ -555,7 +518,7 @@ class PI0Pytorch(nn.Module):
                 # Encode all frames at once
                 def image_embed_func(img_flat):
                     return self.paligemma_with_expert.embed_image(img_flat)
-                
+
                 img_emb_flat = self._apply_checkpoint(image_embed_func, img_flat)
                 # img_emb_flat: [B*T, N, D] where N is number of image tokens
                 num_img_embs = img_emb_flat.shape[1]
@@ -563,10 +526,11 @@ class PI0Pytorch(nn.Module):
                 img_emb = img_emb_flat.view(B, T, num_img_embs, img_emb_flat.shape[-1])
                 # Flatten time and token dimensions: [B, T, N, D] -> [B, T*N, D]
                 img_emb = img_emb.view(B, T * num_img_embs, img_emb_flat.shape[-1])
-                
+
                 # Handle mask: [B, T] -> expand to [B, T*N]
                 img_mask_expanded = img_mask.unsqueeze(-1).expand(-1, -1, num_img_embs)  # [B, T, N]
                 img_mask_flat = img_mask_expanded.reshape(B, T * num_img_embs)  # [B, T*N]
+                n_tokens = T * num_img_embs
             else:
                 # No temporal dimension: [B, H, W, C]
                 def image_embed_func(img):
@@ -575,9 +539,11 @@ class PI0Pytorch(nn.Module):
                 img_emb = self._apply_checkpoint(image_embed_func, img)
                 bsize, num_img_embs = img_emb.shape[:2]
                 img_mask_flat = img_mask[:, None].expand(bsize, num_img_embs)
+                n_tokens = num_img_embs
 
             embs.append(img_emb)
             pad_masks.append(img_mask_flat)
+            total_img_tokens += n_tokens
 
             # Create attention masks so that image tokens attend to each other
             if has_temporal:
@@ -585,6 +551,7 @@ class PI0Pytorch(nn.Module):
                 att_masks += [0] * (T * num_img_embs)
             else:
                 att_masks += [0] * num_img_embs
+        segment_lengths['images'] = total_img_tokens
 
         # Append language tokens (already computed)
         embs.append(lang_emb)
@@ -602,18 +569,19 @@ class PI0Pytorch(nn.Module):
             # World tokens can attend to all previous tokens (images, language, gaussian)
             att_masks += [0] * self.world_token_count
         
-        # --- Add Future Query Tokens (NEW) ---
+        # --- Add Future Query Tokens (Coupled Mask) ---
         if self.use_world_tokens_in_prefix and self.future_query_tokens is not None:
             B = pad_masks[0].shape[0] if pad_masks else 1
             device = pad_masks[0].device if pad_masks else next(self.parameters()).device
-            # Expand learnable tokens to batch size
-            future_tokens = self.future_query_tokens.expand(B, -1, -1)  # [B, future_token_count, D]
+            future_tokens = self.future_query_tokens.expand(B, -1, -1)  # [B, 256, D]
             future_mask = torch.ones(B, self.future_token_count, dtype=torch.bool, device=device)
-            
+
             embs.append(future_tokens)
             pad_masks.append(future_mask)
-            # Future query tokens can attend to all previous tokens (including world tokens)
-            att_masks += [0] * self.future_token_count
+            # Coupled mask: first future token creates a causal boundary (att=1),
+            # remaining future tokens are bidirectional among themselves (att=0).
+            # Effect: future tokens can see all context, but context cannot see future tokens.
+            att_masks += [1] + [0] * (self.future_token_count - 1)
             segment_lengths['future'] = self.future_token_count
 
         embs = torch.cat(embs, dim=1)
@@ -749,40 +717,19 @@ class PI0Pytorch(nn.Module):
         intrinsics[:, 1, 2] = cx
 
         if view_name == "agent":
-            # Agent camera: Try identity first (canonical view)
-            # If Gaussians are in world coordinates, identity might work better
+            # Agent camera: identity viewmatrix (no translation)
+            # depth2pc already outputs points in camera space (z = depth > 0),
+            # so no Z-axis translation is needed. Adding translation would
+            # push Gaussians further away and cause uniform gray rendering.
             viewmatrix = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
-            # CRITICAL FIX: Translate world away from camera (Z-axis)
-            # 
-            # What this does:
-            # - viewmatrix transforms world coordinates to camera coordinates
-            # - viewmatrix[:, 2, 3] = T means: shift scene by +T along Z-axis
-            # - This is equivalent to: camera at Z=-T, looking at +Z direction
-            # 
-            # Why we need this:
-            # - Gaussian Z values can be negative (e.g., [-10, 0])
-            # - In camera space, Z < 0 means "behind camera" → frustum culled → black rendering
-            # - By translating +10.0, we ensure: Z_new = Z_old + 10.0 > 0 (in front of camera)
-            # 
-            # Constraints:
-            # - Must be large enough: T > -min(Z_gaussian) to avoid negative Z_cam
-            # - Must be within [znear, zfar]: translated Z must be in [0.01, 100.0]
-            # - Cannot be arbitrary: too small → black rendering, too large → poor quality
-            # 
-            # Current setting: 10.0 (covers Z range [-10, 0] with margin)
-            # If Gaussian Z range changes significantly, adjust this value accordingly
-            viewmatrix[:, 2, 3] = 10.0 
 
         elif view_name == "wrist":
-            # Wrist camera: Also try identity for now
+            # Wrist camera: also identity (same reasoning as agent)
             viewmatrix = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
-            # Shift wrist view similarly to ensure visibility
-            viewmatrix[:, 2, 3] = 10.0
-            
+
         else:
             # Default: identity
             viewmatrix = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
-            viewmatrix[:, 2, 3] = 10.0
 
         # Create proper Projection Matrix
         # Note: rasterizer usually expects P @ V, i.e. Full MVP for "projmatrix" argument 
@@ -972,7 +919,8 @@ class PI0Pytorch(nn.Module):
         z_t1_pred_tokens = None
         if self.use_world_tokens_in_prefix and 'future' in segment_lengths:
             # Calculate the start position of future tokens in prefix_output
-            # Order: gaussian (if exists) -> images -> language -> world -> future
+            # Order: gaussian (if exists) -> images -> language -> future
+            # (world tokens removed — no longer in prefix)
             future_start = 0
             if 'gaussian' in segment_lengths:
                 future_start += segment_lengths['gaussian']
@@ -990,189 +938,129 @@ class PI0Pytorch(nn.Module):
                 print(f"[DEBUG] Extracted future tokens: shape={z_t1_pred_tokens.shape}, "
                       f"start={future_start}, end={future_end}, segment_lengths={segment_lengths}")
 
-        # Date 2026.01.24 🏀 🏀 🏀 zijian todo fix it for better
-        # NEW Architecture: World Model tokens in Prefix
-        # Future frame prediction is now done by VLM through future query tokens in prefix
-        # Extract z_{t+1} from prefix_output and decode/render
-        
-        # --- World Model Loss (NEW Architecture: Using VLM-predicted tokens) ---
+        # --- World Model Render Loss (render-only, no forward loss) ---
         if self.use_world_tokens_in_prefix and z_t1_pred_tokens is not None and future_observation is not None:
-            # Use the tokens predicted by VLM as z_{t+1}
-            z_next = z_t1_pred_tokens  # [B, future_token_count, D]
-            
-            # Get GT z_{t+1} for supervision
+            z_next = z_t1_pred_tokens  # [B, 256, D]
+
             import torch.distributed as dist
             is_main_process = not dist.is_initialized() or dist.get_rank() == 0
-            visualize = (step is not None and step % 100 == 0 and is_main_process) if step is not None else False
-            
-            # Compute text_embedding for VGGT (same logic as in embed_prefix)
-            text_embedding_for_vggt = None
-            if self.gaussian_adapter.use_lgpd and lang_tokens is not None and lang_masks is not None:
-                def lang_embed_func(lang_tokens):
-                    lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
-                    lang_emb_dim = lang_emb.shape[-1]
-                    return lang_emb * math.sqrt(lang_emb_dim)
-                
-                lang_emb_for_pooling = self._apply_checkpoint(lang_embed_func, lang_tokens)
-                lang_masks_for_pooling = lang_masks
-                
-                # Handle temporal dimension if present
-                if lang_emb_for_pooling.ndim == 4:  # [B, T, SeqLen, D]
-                    B, T, S, D = lang_emb_for_pooling.shape
-                    lang_emb_flat = lang_emb_for_pooling.view(B * T, S, D)
-                    lang_masks_flat = lang_masks_for_pooling.view(B * T, S)
-                    mask_float = lang_masks_flat.unsqueeze(-1).float()
-                    sum_emb = (lang_emb_flat * mask_float).sum(dim=1)
-                    sum_mask = mask_float.sum(dim=1).clamp(min=1e-6)
-                    text_embedding_flat = sum_emb / sum_mask
-                    text_embedding_for_vggt = text_embedding_flat.view(B, T, D).mean(dim=1)
-                else:
-                    mask_float = lang_masks_for_pooling.unsqueeze(-1).float()
-                    sum_emb = (lang_emb_for_pooling * mask_float).sum(dim=1)
-                    sum_mask = mask_float.sum(dim=1).clamp(min=1e-6)
-                    text_embedding_for_vggt = sum_emb / sum_mask
-            
-            # Encode GT future frame z_{t+1}^{GT}
-            adapter_output_t1 = self.gaussian_adapter(
-                self._prepare_gaussian_inputs(future_observation, actions.device, actions.shape[0], is_training=False),
-                return_gaussian_params=True,
-                return_raw_tokens=self.use_vae_supervision and self.vae_compressor is not None
-            )
-            if self.use_vae_supervision and self.vae_compressor is not None:
-                z_t1_gt, _, gaussian_params_t1_gt, raw_tokens_t1_gt = adapter_output_t1
-            else:
-                z_t1_gt, _, gaussian_params_t1_gt = adapter_output_t1
-                raw_tokens_t1_gt = None
-            
-            # Extract pooled tokens from z_t1_gt if needed (match future_token_count)
-            if z_t1_gt.shape[1] != self.future_token_count:
-                if z_t1_gt.shape[1] == 300:  # 3 frames × 100
-                    z_t1_gt = z_t1_gt[:, -100:, :]  # Take last frame
-                elif z_t1_gt.shape[1] > self.future_token_count:
-                    z_t1_gt = z_t1_gt[:, :self.future_token_count, :]
-                else:
-                    # Pad if needed
-                    B, N, D = z_t1_gt.shape
-                    padding = torch.zeros(B, self.future_token_count - N, D, device=z_t1_gt.device, dtype=z_t1_gt.dtype)
-                    z_t1_gt = torch.cat([z_t1_gt, padding], dim=1)
-            
-            # Ensure z_t1_gt matches z_next dtype (bfloat16 for training)
-            # z_next is bfloat16 from VLM, so z_t1_gt should also be bfloat16
-            if z_t1_gt.dtype != z_next.dtype:
-                z_t1_gt = z_t1_gt.to(dtype=z_next.dtype)
-            
-            # Forward loss: predict z_{t+1} from z_t and action
-            # Both z_next and z_t1_gt are now bfloat16, matching training precision
-            forward_loss = F.mse_loss(z_next, z_t1_gt)
-            loss = loss + forward_loss
-            
-            if step is not None and step % 40 == 0:
-                print(f"Step {step}: World Model Forward Loss (VLM) = {forward_loss.item():.4f}")
-            
-            # Decode and render (using world_model.decode as a utility)
-            # This part doesn't need gradients, so we can use float32 for stability
-            # Only do this periodically to save memory (every 40 steps for visualization)
+
+            # Decode + render every step for proper gradient flow
             if self.world_model is not None and self.gaussian_renderer is not None:
-                # Only decode/render periodically to save memory
-                should_decode_render = (step is not None and step % 40 == 0) if step is not None else False
-                if should_decode_render:
-                    try:
-                        # Use world_model.decode to convert tokens to 3D Gaussians
-                        # Get camera params
-                        camera_params_for_decode = self._get_camera_params_for_view(
-                            "agent", z_next.device, z_next.shape[0]
-                        )
-                        
-                        # Convert z_next to float32 for decode (detach from graph, no gradients needed)
-                        # VLM outputs bfloat16, but decode expects float32
-                        with torch.no_grad():
-                            z_next_float32 = z_next.detach().to(dtype=torch.float32)
-                            
-                            # Decode predicted tokens to 3D Gaussians (no gradients)
-                            gaussian_params = self.world_model.decode(
-                                z_next_float32,
-                                future_observation=future_observation,
-                                gaussian_adapter=self.gaussian_adapter,
-                                camera_params=camera_params_for_decode,
-                                return_2d_maps=False,
-                                step=step
+                try:
+                    camera_params_for_decode = self._get_camera_params_for_view(
+                        "agent", z_next.device, z_next.shape[0]
+                    )
+                    z_next_float32 = z_next.float()
+
+                    # Decode predicted tokens to 3D Gaussians (with gradients)
+                    gaussian_params = self.world_model.decode(
+                        z_next_float32,
+                        future_observation=future_observation,
+                        gaussian_adapter=self.gaussian_adapter,
+                        camera_params=camera_params_for_decode,
+                        return_2d_maps=False,
+                        step=step,
+                        current_observation=preprocessed_observation,
+                    )
+
+                    # Sanitize Gaussian params
+                    depth_map = gaussian_params.pop("depth_map", None)  # [B, 1, H, W]
+                    for k, v in gaussian_params.items():
+                        if torch.isnan(v).any() or torch.isinf(v).any():
+                            gaussian_params[k] = torch.where(
+                                torch.isfinite(v), v, torch.zeros_like(v)
                             )
-                            
-                            # Clear cache immediately after decode
-                            torch.cuda.empty_cache()
-                        
-                        # Prepare target images for rendering loss (outside no_grad for efficiency)
-                        target_obs = {}
-                        cam_params_dict = {}
-                        valid_views = []
-                        
-                        for k, v in future_observation.images.items():
-                            img_tensor = v
-                            view_name = None
-                            if "agent" in k or "high" in k or "cam_high" in k or "exterior" in k or "base" in k:
-                                view_name = "agent"
-                            elif "left_wrist" in k or "wrist_left" in k:
-                                view_name = "wrist"
-                            elif "right_wrist" in k or "wrist_right" in k:
-                                if img_tensor.min() == img_tensor.max() == -1.0:
-                                    continue
-                                view_name = "wrist"
-                            elif "wrist" in k or "bravo" in k:
-                                view_name = "wrist"
-                            
-                            if view_name:
-                                if img_tensor.shape[1] != 3 and img_tensor.shape[-1] == 3:
-                                    img_tensor = img_tensor.permute(0, 3, 1, 2)
-                                img_tensor = (img_tensor + 1.0) / 2.0
-                                view_key = f"{view_name}_image"
-                                if view_key not in target_obs:
-                                    target_obs[view_key] = img_tensor
-                                    cam_params_dict[view_name] = self._get_camera_params_for_view(
-                                        view_name, z_next.device, z_next.shape[0]
-                                    )
-                                    valid_views.append(view_name)
-                        
-                        if valid_views:
-                            render_views = ["agent"] if "agent" in valid_views else valid_views
-                            from openpi.models_pytorch.gaussian_renderer import compute_multi_view_rendering_loss
-                            
-                            # Rendering loss computation (no gradients needed, just for visualization/monitoring)
-                            with torch.no_grad():
-                                render_loss, _ = compute_multi_view_rendering_loss(
-                                    gaussian_params,
-                                    target_obs,
-                                    cam_params_dict,
-                                    self.gaussian_renderer,
-                                    view_names=render_views,
-                                    step=step
+
+                    # Prepare target images for rendering loss
+                    target_obs = {}
+                    cam_params_dict = {}
+                    valid_views = []
+
+                    for k, v in future_observation.images.items():
+                        img_tensor = v
+                        view_name = None
+                        if k == "image" or "agent" in k or "high" in k or "cam_high" in k or "exterior" in k or "base" in k:
+                            view_name = "agent"
+                        elif "left_wrist" in k or "wrist_left" in k:
+                            view_name = "wrist"
+                        elif "right_wrist" in k or "wrist_right" in k:
+                            if img_tensor.min() == img_tensor.max() == -1.0:
+                                continue
+                            view_name = "wrist"
+                        elif "wrist" in k or "bravo" in k:
+                            view_name = "wrist"
+
+                        if view_name:
+                            if img_tensor.shape[1] != 3 and img_tensor.shape[-1] == 3:
+                                img_tensor = img_tensor.permute(0, 3, 1, 2)
+                            img_tensor = (img_tensor + 1.0) / 2.0
+                            view_key = f"{view_name}_image"
+                            if view_key not in target_obs:
+                                target_obs[view_key] = img_tensor
+                                cam_params_dict[view_name] = self._get_camera_params_for_view(
+                                    view_name, z_next.device, z_next.shape[0]
                                 )
-                                # Note: render_loss is detached (from no_grad context), so it won't affect gradients
-                                # We log it but don't add to loss to avoid dtype mismatch (bfloat16 vs float32)
-                                
-                                print(f"Step {step}: Render Loss (VLM) = {render_loss.item():.4f} (detached, not in loss)")
-                                
-                                # Visualization
-                                if is_main_process:
-                                    try:
-                                        self._visualize_rendering_comparison(
-                                            step,
-                                            gaussian_params,
-                                            target_obs,
-                                            cam_params_dict,
-                                            view_names=render_views,
-                                            time_suffix="_t1_pred_vlm"
-                                        )
-                                    except Exception as viz_e:
-                                        print(f"Rendering visualization failed: {viz_e}")
-                            
-                            # Clear cache after rendering and delete large tensors to free memory
-                            del gaussian_params, target_obs, cam_params_dict, z_next_float32
-                            torch.cuda.empty_cache()
-                    except Exception as e:
-                        if step is not None and step % 100 == 0:
-                            import traceback
-                            traceback.print_exc()
-                            print(f"World Model decode/rendering failed: {e}")
+                                valid_views.append(view_name)
+
+                    if valid_views:
+                        render_views = ["agent"] if "agent" in valid_views else valid_views
+
+                        # Render loss every step (gradient supervision for decoder)
+                        render_loss, render_loss_dict = compute_multi_view_rendering_loss(
+                            gaussian_params,
+                            target_obs,
+                            cam_params_dict,
+                            self.gaussian_renderer,
+                            view_names=render_views,
+                            step=step,
+                            depth_map=depth_map,
+                            lambda_scale=0.001,
+                            lambda_opacity=0.001,
+                            lambda_edge_smooth=0.01,
+                        )
+                        render_loss_weight = 1.0
+                        if torch.isfinite(render_loss):
+                            loss = loss + render_loss_weight * render_loss.to(loss.dtype)
+                        
+                        # SH DC regularization: encourage neutral gray (sh_dc ≈ 0) to prevent dark rendering
+                        # This prevents the model from learning to output negative SH DC values
+                        if "sh" in gaussian_params:
+                            sh_dc = gaussian_params["sh"]  # [B, N, 3] - SH DC coefficients
+                            # L2 regularization: penalize SH DC deviating from 0 (neutral gray)
+                            sh_dc_reg = (sh_dc ** 2).mean() * 0.01  # Small weight to avoid over-constraining
+                            loss = loss + sh_dc_reg
+                            if step is not None and step % 40 == 0:
+                                logging.info(f"Step {step}: SH DC Reg = {sh_dc_reg.item():.6f}, SH DC mean = {sh_dc.mean().item():.6f}")
+
+                        # Periodic logging + visualization
+                        should_log = step is not None and step % 40 == 0
+                        if should_log:
+                            loss_parts = ", ".join(f"{k}={v.item():.6f}" for k, v in render_loss_dict.items())
+                            logging.info(f"Step {step}: Render Loss = {render_loss.item():.4f}, weight={render_loss_weight}, breakdown: {loss_parts}")
+
+                        if should_log and is_main_process:
+                            with torch.no_grad():
+                                try:
+                                    self._visualize_rendering_comparison(
+                                        step,
+                                        gaussian_params,
+                                        target_obs,
+                                        cam_params_dict,
+                                        view_names=render_views,
+                                        time_suffix="_t1_pred_vlm"
+                                    )
+                                except Exception as viz_e:
+                                    logging.warning(f"Step {step}: Visualization failed: {viz_e}")
+
+                        del gaussian_params, target_obs, cam_params_dict, z_next_float32, depth_map
+                        torch.cuda.empty_cache()
+                except Exception as e:
+                    import traceback
+                    logging.warning(f"Step {step}: Decode/render failed: {e}")
+                    if step is not None and step % 100 == 0:
+                        traceback.print_exc()
+                        logging.warning(traceback.format_exc())
 
         return loss
 

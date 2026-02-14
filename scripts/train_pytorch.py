@@ -586,8 +586,12 @@ def train_loop(config: _config.TrainConfig):
             # Gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
 
-            # Optimizer step
-            optim.step()
+            # NaN gradient protection: skip optimizer step if gradients are NaN
+            # This prevents weight corruption from unstable render loss backward pass
+            if torch.isfinite(grad_norm):
+                optim.step()
+            else:
+                logging.warning(f"Step {global_step}: grad_norm is {grad_norm}, skipping optimizer step")
             optim.zero_grad(set_to_none=True)
 
             # Clear gradients more aggressively
