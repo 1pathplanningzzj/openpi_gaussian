@@ -76,19 +76,19 @@ class _FeatureFusionBlock(nn.Module):
 class IndependentGaussianHead(nn.Module):
     """
     Decodes VLM future tokens [B, 256, D] directly to dense Gaussian parameter maps.
-    
+
     Architecture: DPT-style multi-scale feature fusion + image feature fusion.
     - Multi-scale features: 16×16 → 32×32 → 64×64 → 128×128
     - Image feature fusion: Residual connection with input image features
-    Output: rot(4) + scale(3) + opacity(1) + RGB(3) + depth_delta(1) = 12 channels
+    Output: rot(4) + scale(3) + opacity(1) + RGB(3) + depth_delta(1) + xy_offset(2) = 14 channels
     """
 
-    def __init__(self, token_dim: int = 2048, grid_size: int = 16, 
+    def __init__(self, token_dim: int = 2048, grid_size: int = 16,
                  use_image_fusion: bool = True, img_dim: int = 3):
         super().__init__()
         self.grid_size = grid_size
         self.use_image_fusion = use_image_fusion
-        out_ch = 4 + 3 + 1 + 3 + 1  # rot + scale + opacity + RGB + depth_delta
+        out_ch = 4 + 3 + 1 + 3 + 1 + 2  # rot + scale + opacity + RGB + depth_delta + xy_offset
         
         # Multi-scale feature extraction (DPT-style)
         # Layer 1: 16×16 → 32×32
@@ -129,7 +129,7 @@ class IndependentGaussianHead(nn.Module):
             tokens: [B, 256, D] VLM future tokens
             images: [B, 3, H, W] Optional input images for feature fusion
         Returns:
-            [B, 12, 128, 128] raw Gaussian parameter maps
+            [B, 14, 128, 128] raw Gaussian parameter maps
         """
         B, N, D = tokens.shape
         g = self.grid_size
@@ -335,28 +335,23 @@ class GaussianDecoder(nn.Module):
                 aggregated_tokens_list[i] = aggregated_tokens_list[i].view(B_vggt, S_vggt, _p, _c)
 
         # 3. Depth from unmodified VGGT features (trainable depth head)
-        # Use AD-FFgsStudio style depth normalization: sigmoid(log(depth)) for stability
         depth_maps, _ = gaussian_adapter.encoder.depth_head(
             aggregated_tokens_list, images=vggt_inputs, patch_start_idx=patch_start_idx
         )
-        # AD-FFgsStudio style: sigmoid(log(depth)) ensures positive depth values
         depth_maps = torch.sigmoid(torch.log(depth_maps))
         min_depth = gaussian_adapter.encoder.min_depth
         max_depth = gaussian_adapter.encoder.max_depth
         depth_maps = min_depth + (max_depth - min_depth) * depth_maps  # [B, S, H, W, 1]
 
-        # 4. Independent decoder: VLM tokens → Gaussian params (RGB) + depth_delta
-        # Extract current frame image for feature fusion
+        # 4. Independent decoder: VLM tokens → Gaussian params + depth_delta + xy_offset
         frame_idx = S_vggt - 1
         current_frame_img = vggt_inputs[:, frame_idx]  # [B, 3, H_vggt, W_vggt]
-        # Resize to decoder resolution if needed (will be handled inside gaussian_head)
-        raw = self.gaussian_head(z, images=current_frame_img)  # [B, 12, 128, 128]
-        rot_raw, scale_raw, opa_raw, rgb_raw, depth_delta = raw.split(
-            [4, 3, 1, 3, 1], dim=1
+        raw = self.gaussian_head(z, images=current_frame_img)  # [B, 14, 128, 128]
+        rot_raw, scale_raw, opa_raw, rgb_raw, depth_delta, xy_offset_raw = raw.split(
+            [4, 3, 1, 3, 1, 2], dim=1
         )
 
         # 5. Combine depth: base (VGGT, t-time) + delta (predicted motion)
-        frame_idx = S_vggt - 1
         base_depth = depth_maps[:, frame_idx, :, :, 0]  # [B, H_vggt, W_vggt]
         H_dec, W_dec = raw.shape[2], raw.shape[3]
         base_depth_resized = F.interpolate(
@@ -364,6 +359,7 @@ class GaussianDecoder(nn.Module):
         ).squeeze(1)  # [B, H_dec, W_dec]
         depth_delta_2d = depth_delta.squeeze(1)  # [B, H_dec, W_dec]
         final_depth = base_depth_resized + depth_delta_2d
+        final_depth = torch.clamp(final_depth, min=0.1)
 
         # 6. Activations
         B = z.shape[0]
@@ -371,24 +367,13 @@ class GaussianDecoder(nn.Module):
         rot_maps = rot_maps / (rot_maps.norm(dim=-1, keepdim=True) + 1e-8)
         scale_maps = F.softplus(scale_raw.permute(0, 2, 3, 1), beta=1)  # [B, H, W, 3]
         opacity_maps = torch.sigmoid(opa_raw.permute(0, 2, 3, 1))  # [B, H, W, 1]
-        # RGB: Directly predict SH DC coefficients (more stable than RGB → SH DC conversion)
-        # Renderer computes: color = SH_C0 * sh_dc + 0.5
-        # We predict sh_dc directly, which allows for both positive (bright) and negative (dark) values
-        # But we initialize to output neutral gray (sh_dc ≈ 0) by default
         SH_C0 = 0.28209479177387814
-        # Option 1: Direct SH DC prediction (tanh → [-1, 1] range, then scale)
-        # This gives us control over brightness: sh_dc = 0 → color = 0.5 (neutral gray)
-        sh_dc = torch.tanh(rgb_raw.permute(0, 2, 3, 1)) * 2.0  # [B, H, W, 3], range [-2, 2]
-        # Clamp to reasonable range to avoid extreme colors
+        sh_dc = torch.tanh(rgb_raw.permute(0, 2, 3, 1)) * 2.0  # [B, H, W, 3]
         sh_dc = torch.clamp(sh_dc, min=-1.5, max=1.5)
-        
-        # For visualization/debugging: convert back to RGB
-        rgb_maps = SH_C0 * sh_dc + 0.5  # [B, H, W, 3], range [0, 1]
+        rgb_maps = SH_C0 * sh_dc + 0.5  # [B, H, W, 3]
         rgb_maps = torch.clamp(rgb_maps, min=0.0, max=1.0)
 
         # 7. Depth → xyz
-        # LIBERO original camera: 256×256, fx=fy=221.7025, cx=cy=128.0
-        # Scale intrinsics to match decoder output resolution (H_dec × W_dec)
         if camera_params is not None and "fx" in camera_params:
             xyz = self.depth2pc(
                 final_depth,
@@ -397,7 +382,6 @@ class GaussianDecoder(nn.Module):
                 downsample_factor=1,
             )
         else:
-            # Scale LIBERO intrinsics from 256×256 to decoder output resolution
             decoder_scale = H_dec / 256.0  # 128/256 = 0.5
             xyz = self.depth2pc(
                 final_depth,
@@ -406,25 +390,28 @@ class GaussianDecoder(nn.Module):
                 downsample_factor=1,
             )
 
-        # 8. Flatten and sanitize
+        # 8. Apply xy_offset: allow Gaussians to shift in camera-space xy
         N = H_dec * W_dec
+        xy_off = torch.tanh(xy_offset_raw.permute(0, 2, 3, 1)) * 5.0  # [B, H, W, 2], range [-5, 5]
+        xy_off_flat = xy_off.reshape(B, N, 2)
+        xyz = xyz + torch.cat([xy_off_flat, torch.zeros_like(xy_off_flat[..., :1])], dim=-1)
+
+        # 9. Sanitize
         rot_flat = rot_maps.reshape(B, N, 4)
         scale_flat = scale_maps.reshape(B, N, 3)
         opacity_flat = opacity_maps.reshape(B, N, 1)
-        sh_flat = sh_dc.reshape(B, N, 3)  # [B, N, 3] — DC-only SH
-        
-        # Note: Currently using SH DC only (degree 0). If future support for higher-order SH:
-        # - sh_flat would be [B, N, K*3] where K = (sh_degree+1)^2
-        # - Apply SH mask: sh_mask = [1.0, 0.1*0.25^1, 0.1*0.25^2, ...] for degrees 0,1,2,...
-        # - sh_flat = sh_flat * sh_mask.view(1, 1, -1)  # Attenuate higher-order coefficients
+        sh_flat = sh_dc.reshape(B, N, 3)
 
-        scale_flat = torch.clamp(scale_flat, min=1e-7, max=10.0)
+        scale_flat = torch.clamp(scale_flat, min=1e-4, max=10.0)
         xyz = torch.clamp(xyz, min=-100.0, max=100.0)
         xyz = torch.where(torch.isnan(xyz) | torch.isinf(xyz), torch.zeros_like(xyz), xyz)
+        z_clamped = torch.clamp(xyz[..., 2:3], min=0.1)
+        xyz = torch.cat([xyz[..., :2], z_clamped], dim=-1)
 
         if step is not None and step % 40 == 0:
             import logging
             logging.info(f"[IndependentDecoder] Step {step}: depth_delta=[{depth_delta_2d.min():.3f}, {depth_delta_2d.max():.3f}], "
+                         f"xy_off=[{xy_off.min():.3f}, {xy_off.max():.3f}], "
                          f"scales=[{scale_flat.min():.3f}, {scale_flat.max():.3f}], rgb=[{rgb_maps.min():.3f}, {rgb_maps.max():.3f}], N={N}")
 
         return {
@@ -433,7 +420,7 @@ class GaussianDecoder(nn.Module):
             "opacity": opacity_flat,
             "sh": sh_flat,
             "rotations": rot_flat,
-            "depth_map": final_depth.unsqueeze(1),  # [B, 1, H, W] for edge-aware smoothness
+            "depth_map": final_depth.unsqueeze(1),  # [B, 1, H, W]
         }
 
     # ------------------------------------------------------------------
@@ -661,9 +648,11 @@ class GaussianDecoder(nn.Module):
         sh_flat = sh.reshape(B, N, -1)
 
         # Sanitize
-        scale_flat = torch.clamp(scale_flat, min=1e-7, max=10.0)
+        scale_flat = torch.clamp(scale_flat, min=1e-4, max=10.0)
         xyz = torch.clamp(xyz, min=-100.0, max=100.0)
         xyz = torch.where(torch.isnan(xyz) | torch.isinf(xyz), torch.zeros_like(xyz), xyz)
+        z_clamped = torch.clamp(xyz[..., 2:3], min=0.1)
+        xyz = torch.cat([xyz[..., :2], z_clamped], dim=-1)
 
         # Pass scales and rotations directly to renderer (like gsplat reference).
         # Previous code built a diagonal sigma and then decomposed it back,

@@ -26,6 +26,14 @@ except ImportError:
     print("Warning: GaussianRasterizer not available. Rendering loss will be disabled.")
     RASTERIZER_AVAILABLE = False
 
+# Import LPIPS for perceptual loss
+try:
+    import lpips
+    LPIPS_AVAILABLE = True
+except ImportError:
+    print("Warning: lpips not available. Install with: pip install lpips")
+    LPIPS_AVAILABLE = False
+
 
 def convert_sigma_to_scale_rotation(sigma_params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -347,17 +355,25 @@ class GaussianRenderer(nn.Module):
     Renders 3D Gaussians to 2D images for supervision.
     """
 
-    def __init__(self, image_size: int = 224, sh_degree: int = 3, scale_factor: float = 1.0):
+    def __init__(self, image_size: int = 224, sh_degree: int = 3, scale_factor: float = 1.0, use_lpips: bool = False):
         super().__init__()
         self.image_size = image_size
         self.sh_degree = sh_degree
         self.scale_factor = scale_factor  # Scale multiplier to adjust Gaussian sizes
+        self.use_lpips = use_lpips
 
         if not RASTERIZER_AVAILABLE:
             raise ImportError(
                 "GaussianRasterizer not available. "
                 "Please compile diff-gaussian-rasterization."
             )
+
+        # Initialize LPIPS loss function if available
+        self.lpips_fn = None
+        if use_lpips and LPIPS_AVAILABLE:
+            self.lpips_fn = lpips.LPIPS(net='vgg')
+            self.lpips_fn.eval()  # Always in eval mode
+            print("[GaussianRenderer] LPIPS loss enabled (VGG backbone)")
 
     def forward(
         self,
@@ -434,10 +450,10 @@ class GaussianRenderer(nn.Module):
                 gaussian_params["sigma"]
             )
 
-        # Clamp scales
+        # Clamp scales — min=1e-4 prevents degenerate Gaussians that cause NaN in rasterizer backward
         if step is not None and step % 40 == 0:
             print(f"[GaussianRenderer] Scales before clamp: min={scales.min():.6f}, max={scales.max():.6f}, mean={scales.mean():.6f}")
-        scales = torch.clamp(scales, min=1e-6, max=10.0)
+        scales = torch.clamp(scales, min=1e-4, max=10.0)
         if step is not None and step % 40 == 0:
             print(f"[GaussianRenderer] Scales after clamp: min={scales.min():.6f}, max={scales.max():.6f}, mean={scales.mean():.6f}")
 
@@ -704,11 +720,63 @@ def compute_ssim_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return torch.clamp((1 - ssim_map) / 2, 0, 1)
 
 
-def compute_photometric_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Combined photometric loss: 0.85 * SSIM + 0.15 * L1. Returns scalar."""
-    l1_loss = (target - pred).abs().mean(1, True)
-    ssim_loss = compute_ssim_loss(pred, target).mean(1, True)
-    return (0.85 * ssim_loss + 0.15 * l1_loss).mean()
+def compute_photometric_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    dynamic_weight_map: Optional[torch.Tensor] = None,
+    lpips_fn: Optional[nn.Module] = None,
+    use_lpips: bool = True,
+    training_step: Optional[int] = None,
+) -> torch.Tensor:
+    """Combined photometric loss: 0.6 * L1 + 0.2 * SSIM + 0.2 * LPIPS (if available).
+
+    Args:
+        pred: [B, 3, H, W] rendered image
+        target: [B, 3, H, W] ground truth image
+        dynamic_weight_map: [B, 1, H, W] per-pixel weight that upweights dynamic regions.
+            If None, uniform weighting is used (original behavior).
+        lpips_fn: Optional LPIPS loss function. If None and use_lpips=True, will create one.
+        use_lpips: Whether to use LPIPS loss (default True if available).
+        training_step: Current training step. If provided, LPIPS is only enabled after step 10000.
+    Returns:
+        Scalar loss.
+    """
+    l1_loss = (target - pred).abs()
+    ssim_loss = compute_ssim_loss(pred, target)
+
+    # Disable LPIPS before step 5000 to let action learning converge first
+    if training_step is not None and training_step < 5000:
+        use_lpips = False
+
+    # Compute LPIPS if available and requested
+    if use_lpips and LPIPS_AVAILABLE:
+        if lpips_fn is None:
+            # Create LPIPS function on first call (will be cached in renderer)
+            lpips_fn = lpips.LPIPS(net='vgg').to(pred.device)
+            lpips_fn.eval()  # Always in eval mode
+
+        with torch.no_grad() if not pred.requires_grad else torch.enable_grad():
+            # LPIPS expects images in [-1, 1] range, our images are in [0, 1]
+            pred_normalized = pred * 2.0 - 1.0
+            target_normalized = target * 2.0 - 1.0
+            lpips_loss = lpips_fn(pred_normalized, target_normalized)  # [B, 1, 1, 1]
+            lpips_loss = lpips_loss.squeeze()  # [B] or scalar
+            if lpips_loss.dim() == 0:
+                lpips_loss = lpips_loss.unsqueeze(0)  # Ensure at least [B]
+            # Clamp LPIPS to ensure non-negative values (LPIPS should be in [0, inf))
+            lpips_loss = torch.clamp(lpips_loss, min=0.0)
+            # Expand to [B, 1, H, W] for consistent weighting
+            lpips_loss = lpips_loss.view(-1, 1, 1, 1).expand_as(l1_loss.mean(1, True))
+
+        # Combine: 0.6 * L1 + 0.2 * SSIM + 0.2 * LPIPS
+        pixel_loss = 0.6 * l1_loss.mean(1, True) + 0.2 * ssim_loss.mean(1, True) + 0.2 * lpips_loss
+    else:
+        # Fallback to original: 0.85 * SSIM + 0.15 * L1
+        pixel_loss = 0.85 * ssim_loss.mean(1, True) + 0.15 * l1_loss.mean(1, True)
+
+    if dynamic_weight_map is not None:
+        return (pixel_loss * dynamic_weight_map).mean()
+    return pixel_loss.mean()
 
 
 def compute_edge_smooth_loss(rgb: torch.Tensor, disp_map: torch.Tensor) -> torch.Tensor:
@@ -745,10 +813,11 @@ def compute_rendering_loss(
     camera_params: Dict[str, torch.Tensor],
     renderer: GaussianRenderer,
     M_attn: Optional[torch.Tensor] = None,
-    step: Optional[int] = None
+    step: Optional[int] = None,
+    dynamic_weight_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Compute rendering loss (L1 + SSIM photometric) with optional attention masking.
+    Compute rendering loss (L1 + SSIM + LPIPS photometric) with optional attention masking.
 
     Args:
         gaussian_params: 3D Gaussian parameters
@@ -756,6 +825,7 @@ def compute_rendering_loss(
         camera_params: Camera parameters
         renderer: GaussianRenderer instance
         M_attn: [B, H, W] - Optional attention mask
+        dynamic_weight_map: [B, 1, H, W] - Per-pixel weight for dynamic regions
 
     Returns:
         loss: Scalar rendering loss
@@ -764,14 +834,20 @@ def compute_rendering_loss(
     rendered_image = renderer(gaussian_params, camera_params, step=step)
 
     if M_attn is not None:
-        # Masked photometric loss
+        # Masked photometric loss (fallback to old formula when using attention mask)
         l1_loss = (rendered_image - target_image).abs()
         ssim_loss = compute_ssim_loss(rendered_image, target_image)
         pixel_loss = 0.85 * ssim_loss + 0.15 * l1_loss
         weighted_loss = M_attn.unsqueeze(1) * pixel_loss
         loss = weighted_loss.mean()
     else:
-        loss = compute_photometric_loss(rendered_image, target_image)
+        loss = compute_photometric_loss(
+            rendered_image, target_image,
+            dynamic_weight_map=dynamic_weight_map,
+            lpips_fn=renderer.lpips_fn,
+            use_lpips=renderer.use_lpips,
+            training_step=step
+        )
 
     return loss
 
@@ -788,13 +864,15 @@ def compute_multi_view_rendering_loss(
     lambda_scale: float = 0.001,
     lambda_opacity: float = 0.001,
     lambda_edge_smooth: float = 0.01,
+    current_observations: Optional[Dict[str, torch.Tensor]] = None,
+    dynamic_weight_boost: float = 3.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Compute multi-view rendering loss with regularization and edge-aware depth smoothness.
 
     Args:
         gaussian_params: 3D Gaussian parameters
-        observations: Dictionary with target images for each view
+        observations: Dictionary with target (future) images for each view
         camera_params_dict: Dictionary of camera parameters for each view
         renderer: GaussianRenderer instance
         M_attn_dict: Optional dictionary of attention masks for each view
@@ -804,6 +882,10 @@ def compute_multi_view_rendering_loss(
         lambda_scale: Weight for scale regularization
         lambda_opacity: Weight for opacity regularization
         lambda_edge_smooth: Weight for edge-aware depth smoothness
+        current_observations: Dictionary with current frame images (same keys as observations).
+            Used to compute dynamic region weighting.
+        dynamic_weight_boost: How much to upweight dynamic regions (default 3.0).
+            Final weight = 1.0 + boost * diff_mask, so static=1.0, dynamic=1.0+boost.
 
     Returns:
         total_loss: Total rendering loss across all views
@@ -820,8 +902,34 @@ def compute_multi_view_rendering_loss(
             camera_params = camera_params_dict[view_name]
             M_attn = M_attn_dict.get(view_name) if M_attn_dict is not None else None
 
+            # Compute dynamic region weight map from current vs future frame difference
+            dynamic_weight_map = None
+            if current_observations is not None:
+                curr_key = f"{view_name}_image"
+                if curr_key in current_observations:
+                    curr_img = current_observations[curr_key]  # [B, 3, H, W]
+                    # Resize if needed
+                    if curr_img.shape[2:] != target_image.shape[2:]:
+                        curr_img = F.interpolate(curr_img, size=target_image.shape[2:], mode="bilinear", align_corners=False)
+                    # Per-pixel L1 difference → soft mask
+                    diff = (target_image - curr_img).abs().mean(dim=1, keepdim=True)  # [B, 1, H, W]
+                    # Normalize to [0, 1] per sample
+                    diff_max = diff.flatten(1).max(dim=1)[0].view(-1, 1, 1, 1).clamp(min=1e-6)
+                    diff_norm = diff / diff_max  # [B, 1, H, W] in [0, 1]
+                    # Weight: static=1.0, dynamic=1.0+boost
+                    dynamic_weight_map = 1.0 + dynamic_weight_boost * diff_norm
+
+                    if step is not None and step % 200 == 0:
+                        import logging
+                        logging.info(
+                            f"[DynamicWeight] {view_name}: diff_mean={diff.mean():.4f}, "
+                            f"weight_mean={dynamic_weight_map.mean():.2f}, "
+                            f"weight_max={dynamic_weight_map.max():.2f}"
+                        )
+
             view_loss = compute_rendering_loss(
-                gaussian_params, target_image, camera_params, renderer, M_attn, step=step
+                gaussian_params, target_image, camera_params, renderer, M_attn,
+                step=step, dynamic_weight_map=dynamic_weight_map,
             )
 
             loss_dict[f"loss_render_{view_name}"] = view_loss
@@ -867,7 +975,7 @@ def compute_multi_view_rendering_loss(
 
     return total_loss, loss_dict
 
-def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params_dict, renderer, view_names, save_dir=None, time_suffix=""):
+def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params_dict, renderer, view_names, save_dir=None, time_suffix="", observation_images=None):
     """
     Helper to visualize Rendered vs GT images.
     Args:
@@ -879,6 +987,7 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
         view_names: List of camera names to visualize
         save_dir: Optional directory to save visualizations. Defaults to "./visualizations/rendering"
         time_suffix: Optional suffix to identify time step (e.g., "_t", "_t1_pred", "_t1_gt")
+        observation_images: Optional dict of observation frames {view_key: [3, C, H, W]} for t-2, t-1, t
     """
     import matplotlib
     # Use non-interactive backend to avoid X11 authorization issues in headless environments
@@ -886,79 +995,88 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
     import matplotlib.pyplot as plt
     import os
     import numpy as np
-    
+
     if save_dir is None:
         save_dir = "./visualizations/rendering"
     os.makedirs(save_dir, exist_ok=True)
-    
+
     # Take first item in batch
     idx = 0
-    
-    fig, axes = plt.subplots(len(view_names), 3, figsize=(15, 5 * len(view_names)))
-    if len(view_names) == 1:
-        axes = axes[None, :] # Ensure 2D array
-        
+
+    has_obs = observation_images is not None and len(observation_images) > 0
+    n_rows = 2 if has_obs else 1
+    fig, axes = plt.subplots(n_rows, 3, figsize=(15, 5 * n_rows))
+    if n_rows == 1:
+        axes = axes[None, :]  # Ensure 2D array
+
     with torch.no_grad():
+        # Row 1: observation GT frames (t-2, t-1, t) if available
+        if has_obs:
+            for i, view_name in enumerate(view_names):
+                view_key = f"{view_name}_image"
+                if view_key in observation_images:
+                    frames = observation_images[view_key]  # [3, C, H, W]
+                    time_labels = ["t-2", "t-1", "t"]
+                    for col in range(min(3, frames.shape[0])):
+                        frame_np = frames[col].permute(1, 2, 0).detach().cpu().numpy()
+                        frame_viz = np.clip(frame_np, 0, 1)
+                        axes[0, col].imshow(frame_viz)
+                        axes[0, col].set_title(f"GT {time_labels[col]}")
+                        axes[0, col].axis('off')
+                break  # Only first view for now
+
+        # Row 2 (or Row 1 if no obs): GT t+1, Rendered t+1, Diff
+        render_row = 1 if has_obs else 0
         for i, view_name in enumerate(view_names):
             # 1. Render
-            # Re-construct raster settings for single item
             cam_params = {k: v[idx:idx+1] if isinstance(v, torch.Tensor) else v for k, v in cam_params_dict[view_name].items()}
-            
-            # Single item slice for gaussians
+
             params_single = {
                "xyz": gaussian_params["xyz"][idx:idx+1],
                "sh": gaussian_params["sh"][idx:idx+1],
                "opacity": gaussian_params["opacity"][idx:idx+1]
             }
-            # Use scales+rotations if available, otherwise fall back to sigma
             if "scales" in gaussian_params:
                 params_single["scales"] = gaussian_params["scales"][idx:idx+1]
                 params_single["rotations"] = gaussian_params["rotations"][idx:idx+1]
             else:
                 params_single["sigma"] = gaussian_params["sigma"][idx:idx+1]
-            
-            rendered_img = renderer(params_single, cam_params) # [1, 3, H, W]
-            rendered_img = rendered_img.float() # Ensure float for plotting
-            
-            rendered_np = rendered_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() # [H, W, 3]
+
+            rendered_img = renderer(params_single, cam_params)
+            rendered_img = rendered_img.float()
+
+            rendered_np = rendered_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
             print(f"[Viz] Rendered {view_name} range: min={rendered_np.min():.4f}, max={rendered_np.max():.4f}, mean={rendered_np.mean():.4f}")
-            
-            # Debug: Check if rendering is all zeros or very small
+
             if rendered_np.max() < 1e-6:
                 print(f"[Viz] WARNING: Rendered image is all zeros or very small (max={rendered_np.max():.6f})!")
-                print(f"[Viz] This suggests: 1) Scale values too small, 2) Opacity too small, 3) SH coefficients wrong, or 4) 3D positions wrong")
-            
-            # Direct clamp to [0,1] — no min-max normalization
-            # Rendered image from SH should already be in ~[0,1] range (SH_C0 * sh + 0.5)
+
             rendered_viz = np.clip(rendered_np, 0, 1)
 
             # 2. GT Image
-            gt_img = target_obs[f"{view_name}_image"][idx] # [3, H, W]
+            gt_img = target_obs[f"{view_name}_image"][idx]
             gt_img = gt_img.float()
-
             gt_np = gt_img.permute(1, 2, 0).detach().cpu().numpy()
-
-            # Direct clamp — GT is already in [0,1] after (img+1)/2
             gt_viz = np.clip(gt_np, 0, 1)
 
-            # 3. Difference (on actual pixel values, not normalized)
+            # 3. Difference
             diff_np = np.abs(rendered_viz - gt_viz)
 
             # Plot
-            axes[i, 0].imshow(gt_viz)
-            axes[i, 0].set_title(f"{view_name} GT")
-            axes[i, 0].axis('off')
+            axes[render_row, 0].imshow(gt_viz)
+            axes[render_row, 0].set_title(f"GT t+1")
+            axes[render_row, 0].axis('off')
 
-            axes[i, 1].imshow(rendered_viz)
-            axes[i, 1].set_title(f"{view_name} Rendered")
-            axes[i, 1].axis('off')
+            axes[render_row, 1].imshow(rendered_viz)
+            axes[render_row, 1].set_title(f"Rendered t+1")
+            axes[render_row, 1].axis('off')
 
-            axes[i, 2].imshow(diff_np)
-            axes[i, 2].set_title(f"{view_name} Diff")
-            axes[i, 2].axis('off')
-            
+            axes[render_row, 2].imshow(diff_np)
+            axes[render_row, 2].set_title(f"Diff")
+            axes[render_row, 2].axis('off')
+            break  # Only first view
+
     plt.tight_layout()
-    # Include time suffix in filename to identify t vs t+1
     if time_suffix:
         save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}.png")
     else:

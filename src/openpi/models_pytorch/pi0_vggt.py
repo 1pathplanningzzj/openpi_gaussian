@@ -428,9 +428,9 @@ class GaussianAdapter(nn.Module):
                 
                 # Pooling
                 # Input: num_frames from agent view
-                # Target: ~100 tokens per frame
-                # 10x10 -> 100 tokens/frame
-                self.pool = nn.AdaptiveAvgPool2d((10, 10))
+                # Target: 576 tokens per frame (balance between info density and memory)
+                # 24x24 -> 576 tokens/frame
+                self.pool = nn.AdaptiveAvgPool2d((24, 24))
                 
                 # Frame Positional Encoding for temporal modeling
                 # Add learnable frame embeddings to distinguish tokens from different frames
@@ -800,28 +800,25 @@ class GaussianAdapter(nn.Module):
                         tokens_reshaped = F.pad(tokens_reshaped, (0, padding), mode='constant', value=0)
                     tokens_2d = tokens_reshaped.view(B, D, spatial_size, spatial_size)
                 
-                # Pool to reduce tokens: [B, D, H, W] -> [B, D, 10, 10]
-                tokens_pooled = self.pool(tokens_2d)  # [B, D, 10, 10]
-                
-                # Flatten: [B, D, 10, 10] -> [B, 100, D]
-                tokens_final = tokens_pooled.view(B, -1, D)  # [B, 100, D]
-                
+                # Pool to reduce tokens: [B, D, H, W] -> [B, D, 24, 24]
+                tokens_pooled = self.pool(tokens_2d)  # [B, D, 24, 24]
+
+                # Flatten: [B, D, 24, 24] -> [B, 576, D]
+                tokens_final = tokens_pooled.view(B, -1, D)  # [B, 576, D]
+
                 # Project to action_expert_width
-                frame_embs = self.proj(tokens_final)  # [B, 100, action_expert_width]
-                
+                frame_embs = self.proj(tokens_final)  # [B, 576, action_expert_width]
+
                 # Add frame positional encoding
                 if hasattr(self, 'frame_embeddings'):
-                    # frame_embeddings: [S, action_expert_width]
-                    # Expand to [B, 100, action_expert_width] and add
                     frame_emb = self.frame_embeddings[frame_idx]  # [action_expert_width]
-                    frame_emb = frame_emb.unsqueeze(0).unsqueeze(0).expand(B, 100, -1)  # [B, 100, action_expert_width]
+                    frame_emb = frame_emb.unsqueeze(0).unsqueeze(0).expand(B, tokens_final.shape[1], -1)
                     frame_embs = frame_embs + frame_emb
-                
+
                 frame_tokens_list.append(frame_embs)
-            
-            # Concatenate frames: [B, 100, D] * S -> [B, S*100, D]
-            # This preserves temporal order: tokens from frame 0, then frame 1, then frame 2
-            gaussian_embs = torch.cat(frame_tokens_list, dim=1)  # [B, S*100, action_expert_width]
+
+            # Concatenate frames: [B, 576, D] * S -> [B, S*576, D]
+            gaussian_embs = torch.cat(frame_tokens_list, dim=1)
             
         else:
             # Option 2: Original approach (flatten all frames together)
@@ -844,17 +841,17 @@ class GaussianAdapter(nn.Module):
             
             tokens_2d = tokens_reshaped.view(B, D, spatial_size, spatial_size)
             
-            # Pool to reduce tokens: [B, D, spatial_size, spatial_size] -> [B, D, 10, 10]
-            tokens_pooled = self.pool(tokens_2d)  # [B, D, 10, 10]
-            
-            # Flatten back: [B, D, 10, 10] -> [B, 100, D]
-            tokens_final = tokens_pooled.view(B, -1, D)  # [B, 100, D]
-            
+            # Pool to reduce tokens: [B, D, spatial_size, spatial_size] -> [B, D, 24, 24]
+            tokens_pooled = self.pool(tokens_2d)  # [B, D, 24, 24]
+
+            # Flatten back: [B, D, 24, 24] -> [B, 576, D]
+            tokens_final = tokens_pooled.view(B, -1, D)  # [B, 576, D]
+
             # Project to action_expert_width
-            gaussian_embs = self.proj(tokens_final)  # [B, 100, action_expert_width]
+            gaussian_embs = self.proj(tokens_final)  # [B, 576, action_expert_width]
         
         # Create mask (all tokens are valid)
-        # If using frame pos encoding, we have S*100 tokens, otherwise 100 tokens
+        # If using frame pos encoding, we have S*576 tokens, otherwise 576 tokens
         g_mask = torch.ones(B, gaussian_embs.shape[1], dtype=torch.bool, device=gaussian_embs.device)
         
         # Apply LGPD if enabled and text embedding is provided

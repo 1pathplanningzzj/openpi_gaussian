@@ -80,7 +80,10 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run --active scripts/train.py pi05_libero 
 uv run --active scripts/serve_policy.py policy:checkpoint --policy.config=pi0_libero_low_mem_finetune --policy.dir=/data1/zhangzj26/pi0_model/checkpoints/pi0_libero_low_mem_finetune/my_experiment/1000
 CUDA_VISIBLE_DEVICES=1 uv run --active scripts/serve_policy.py --env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir /data/zijianzhang/train_ckpts/pi05_libero/my_experiment_0120/1000
 
- CUDA_VISIBLE_DEVICES=0 uv run --active scripts/serve_policy.py --env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir /data/zijianzhang/train_ckpts/pi05_libero/gaussian_world_model_exp0126/14000/
+ CUDA_VISIBLE_DEVICES=7 uv run --active scripts/serve_policy.py --env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir /data/zijianzhang/train_ckpts/pi05_libero/gaussian_world_model_exp0126/14000/
+
+ PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero xvfb-run -a python examples/libero/main.py --args.save-videos
+ 
 Terminal window 2: -->
 ```bash
 # Run the server

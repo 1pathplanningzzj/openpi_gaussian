@@ -124,7 +124,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test1")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test3")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -716,7 +716,7 @@ class PI0Pytorch(nn.Module):
         intrinsics[:, 0, 2] = cx
         intrinsics[:, 1, 2] = cx
 
-        if view_name == "agent":
+        if view_name == "agent": # 
             # Agent camera: identity viewmatrix (no translation)
             # depth2pc already outputs points in camera space (z = depth > 0),
             # so no Z-axis translation is needed. Adding translation would
@@ -823,11 +823,10 @@ class PI0Pytorch(nn.Module):
         
         return total_loss
 
-    def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names, time_suffix=""):
+    def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names, time_suffix="", observation_images=None):
         """Helper to visualize Rendered vs GT images. Delegated to GaussianRenderer."""
-        # Cleanly moved to gaussian_renderer.py
         from openpi.models_pytorch.gaussian_renderer import visualize_rendering_comparison
-        
+
         visualize_rendering_comparison(
             step,
             gaussian_params,
@@ -836,7 +835,8 @@ class PI0Pytorch(nn.Module):
             self.gaussian_renderer,
             view_names,
             save_dir=self.vis_save_dir,
-            time_suffix=time_suffix
+            time_suffix=time_suffix,
+            observation_images=observation_images,
         )
 
     def forward(self, observation, actions, noise=None, time=None, step=None) -> Tensor:
@@ -940,12 +940,14 @@ class PI0Pytorch(nn.Module):
 
         # --- World Model Render Loss (render-only, no forward loss) ---
         if self.use_world_tokens_in_prefix and z_t1_pred_tokens is not None and future_observation is not None:
+            # Detach to prevent render loss gradients from affecting the Transformer
+            # This allows the decoder to learn from render loss while keeping action generation clean
             z_next = z_t1_pred_tokens  # [B, 256, D]
 
             import torch.distributed as dist
             is_main_process = not dist.is_initialized() or dist.get_rank() == 0
 
-            # Decode + render every step for proper gradient flow
+            # Decode + render every step for decoder training (gradients blocked at z_next)
             if self.world_model is not None and self.gaussian_renderer is not None:
                 try:
                     camera_params_for_decode = self._get_camera_params_for_view(
@@ -974,8 +976,10 @@ class PI0Pytorch(nn.Module):
 
                     # Prepare target images for rendering loss
                     target_obs = {}
+                    current_obs = {}  # Current frame images for dynamic region weighting
                     cam_params_dict = {}
                     valid_views = []
+                    matched_obs_keys = {}  # Track which preprocessed_observation key maps to each view
 
                     for k, v in future_observation.images.items():
                         img_tensor = v
@@ -1003,6 +1007,19 @@ class PI0Pytorch(nn.Module):
                                 )
                                 valid_views.append(view_name)
 
+                                # Extract current frame image for dynamic weighting
+                                if preprocessed_observation is not None and hasattr(preprocessed_observation, 'images') and k in preprocessed_observation.images:
+                                    curr_v = preprocessed_observation.images[k]
+                                    if curr_v.ndim == 5:
+                                        # [B, T, H, W, C] — take current frame (second-to-last)
+                                        curr_frame = curr_v[:, -2]  # t frame (t+1 is future)
+                                    else:
+                                        curr_frame = curr_v
+                                    if curr_frame.shape[1] != 3 and curr_frame.shape[-1] == 3:
+                                        curr_frame = curr_frame.permute(0, 3, 1, 2)
+                                    curr_frame = (curr_frame + 1.0) / 2.0
+                                    current_obs[view_key] = curr_frame
+
                     if valid_views:
                         render_views = ["agent"] if "agent" in valid_views else valid_views
 
@@ -1019,7 +1036,7 @@ class PI0Pytorch(nn.Module):
                             lambda_opacity=0.001,
                             lambda_edge_smooth=0.01,
                         )
-                        render_loss_weight = 1.0
+                        render_loss_weight = 0.1
                         if torch.isfinite(render_loss):
                             loss = loss + render_loss_weight * render_loss.to(loss.dtype)
                         
@@ -1042,13 +1059,30 @@ class PI0Pytorch(nn.Module):
                         if should_log and is_main_process:
                             with torch.no_grad():
                                 try:
+                                    # Collect observation images (t-2, t-1, t) for visualization
+                                    obs_images_for_viz = None
+                                    if preprocessed_observation is not None and hasattr(preprocessed_observation, 'images'):
+                                        obs_images_for_viz = {}
+                                        for k, v in preprocessed_observation.images.items():
+                                            view_name = None
+                                            if k == "image" or "agent" in k or "high" in k or "cam_high" in k or "exterior" in k or "base" in k:
+                                                view_name = "agent"
+                                            if view_name and v.ndim == 5:
+                                                # v: [B, T, H, W, C], take first sample, last 3 frames (t-2, t-1, t)
+                                                frames = v[0, -3:]  # [3, H, W, C]
+                                                if frames.shape[-1] == 3:
+                                                    frames = frames.permute(0, 3, 1, 2)  # [3, C, H, W]
+                                                frames = (frames.float() + 1.0) / 2.0
+                                                obs_images_for_viz[f"{view_name}_image"] = frames
+
                                     self._visualize_rendering_comparison(
                                         step,
                                         gaussian_params,
                                         target_obs,
                                         cam_params_dict,
                                         view_names=render_views,
-                                        time_suffix="_t1_pred_vlm"
+                                        time_suffix="_t1_pred_vlm",
+                                        observation_images=obs_images_for_viz,
                                     )
                                 except Exception as viz_e:
                                     logging.warning(f"Step {step}: Visualization failed: {viz_e}")

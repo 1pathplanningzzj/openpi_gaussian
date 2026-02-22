@@ -104,7 +104,7 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/gaussian_world_model_exp0206_2000_goal_2/videos"  # Path to save videos
+    video_out_path: str = "data/gaussian_world_model_exp0221_4000_goal/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -118,6 +118,7 @@ class Args:
     task_id: int = -1  # -1 means all tasks, set to specific task_id to run only that task
     task_description_filter: str = ""  # If set, only run tasks matching this description (partial match)
     csv_filename: str = "eval_metrics.csv"  # per-run metrics filename
+    save_videos: bool = False  # If True, save rollout videos (slower); if False, only save logs (faster)
 
 
 def _get_target_object_pos(env, task_description):
@@ -664,14 +665,15 @@ def eval_libero(args: Args) -> None:
             task_episodes += 1
             total_episodes += 1
 
-            # Save a replay video of the episode
-            suffix = "success" if done else "failure"
-            task_segment = task_description.replace(" ", "_")
-            imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=10,
-            )
+            # Save a replay video of the episode (optional, can be slow)
+            if args.save_videos:
+                suffix = "success" if done else "failure"
+                task_segment = task_description.replace(" ", "_")
+                imageio.mimwrite(
+                    pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                    [np.asarray(x) for x in replay_images],
+                    fps=10,
+                )
 
             # Save per-episode metrics to CSV
             avg_alignment = float(np.mean(alignment_list)) if alignment_list else float("nan")

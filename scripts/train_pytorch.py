@@ -583,15 +583,29 @@ def train_loop(config: _config.TrainConfig):
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
 
+            # Sanitize NaN/Inf gradients before clipping.
+            # The diff-gaussian-rasterization backward pass can produce NaN gradients
+            # (e.g. from degenerate Gaussians, numerical overflow in SH evaluation).
+            # Instead of skipping the entire optimizer step, replace NaN grads with 0
+            # so that the action loss gradients (which are typically fine) can still update.
+            nan_grad_count = 0
+            for param in model.parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    nan_grad_count += 1
+                    param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
+
             # Gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
 
-            # NaN gradient protection: skip optimizer step if gradients are NaN
-            # This prevents weight corruption from unstable render loss backward pass
             if torch.isfinite(grad_norm):
                 optim.step()
             else:
-                logging.warning(f"Step {global_step}: grad_norm is {grad_norm}, skipping optimizer step")
+                # This should rarely happen now since we sanitized NaN grads above
+                logging.warning(f"Step {global_step}: grad_norm is {grad_norm} after sanitization, skipping optimizer step")
+
+            if nan_grad_count > 0 and global_step % 100 == 0:
+                logging.warning(f"Step {global_step}: sanitized NaN grads in {nan_grad_count} params, grad_norm={grad_norm:.4f}")
+
             optim.zero_grad(set_to_none=True)
 
             # Clear gradients more aggressively

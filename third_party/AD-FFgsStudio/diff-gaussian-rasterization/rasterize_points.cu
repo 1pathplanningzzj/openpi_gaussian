@@ -11,6 +11,7 @@
 
 #include <math.h>
 #include <torch/extension.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cstdio>
 #include <sstream>
 #include <iostream>
@@ -54,10 +55,13 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,
 	const bool debug)
 {
+  // Ensure all CUDA operations target the correct device
+  const at::cuda::CUDAGuard device_guard(means3D.device());
+
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
-  
+
   const int P = means3D.size(0);
   const int H = image_height;
   const int W = image_width;
@@ -68,11 +72,11 @@ RasterizeGaussiansCUDA(
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   
-  torch::Device device(torch::kCUDA);
-  torch::TensorOptions options(torch::kByte);
-  torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
-  torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
-  torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+  torch::Device device = means3D.device();
+  torch::TensorOptions options = torch::TensorOptions().dtype(torch::kByte).device(device);
+  torch::Tensor geomBuffer = torch::empty({0}, options);
+  torch::Tensor binningBuffer = torch::empty({0}, options);
+  torch::Tensor imgBuffer = torch::empty({0}, options);
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
@@ -136,8 +140,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const bool debug) 
+	const bool debug)
 {
+  // Ensure all CUDA operations target the correct device
+  const at::cuda::CUDAGuard device_guard(means3D.device());
+
   const int P = means3D.size(0);
   const int H = dL_dout_color.size(1);
   const int W = dL_dout_color.size(2);
