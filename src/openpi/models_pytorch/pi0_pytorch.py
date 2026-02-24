@@ -187,26 +187,14 @@ class PI0Pytorch(nn.Module):
             logging.info(f"Initialized VAE Token Compressor for supervision (beta={vae_beta})")
         else:
             self.vae_compressor = None
-        
+
         # --- GaussianDecoder (replaces CrossAttentionWorldModel) ---
         if hasattr(config, "use_world_model") and config.use_world_model:
             logging.info("Initializing GaussianDecoder...")
-            use_vggt_decoder = (self.gaussian_adapter.use_gaussian and
-                                self.gaussian_adapter.encoder is not None and
-                                hasattr(self.gaussian_adapter.encoder, 'gs_head'))
-            vggt_decoder = self.gaussian_adapter.encoder.gs_head if use_vggt_decoder else None
-            vggt_embed_dim = 1024
-            if use_vggt_decoder and hasattr(self.gaussian_adapter.encoder, 'embed_dim'):
-                vggt_embed_dim = self.gaussian_adapter.encoder.embed_dim
 
             self.world_model = GaussianDecoder(
                 token_dim=paligemma_config.width,
-                use_vggt_decoder=use_vggt_decoder,
-                vggt_decoder=vggt_decoder,
                 input_num_tokens=256,
-                target_num_tokens=1369,
-                vggt_embed_dim=vggt_embed_dim,
-                decode_mode="independent",
             )
 
             # Initialize Gaussian Renderer (sh_degree=0 for DC-only RGB)
@@ -219,6 +207,9 @@ class PI0Pytorch(nn.Module):
         else:
             self.world_model = None
             self.gaussian_renderer = None
+
+        # Initialize render loss weight (can be changed dynamically for staged training)
+        self.render_loss_weight = getattr(config, "render_loss_weight", 0.1)
         # -------------------------------
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
@@ -247,6 +238,35 @@ class PI0Pytorch(nn.Module):
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
 
         logging.info("Disabled gradient checkpointing for PI0Pytorch model")
+
+    def freeze_world_model(self):
+        """Freeze world model (Gaussian Decoder) for stage 1 training (action-only)."""
+        if self.world_model is not None:
+            for param in self.world_model.parameters():
+                param.requires_grad = False
+            logging.info("Froze World Model (Gaussian Decoder) - Stage 1: Action-only training")
+
+        if hasattr(self, 'gaussian_adapter') and self.gaussian_adapter is not None:
+            for param in self.gaussian_adapter.parameters():
+                param.requires_grad = False
+            logging.info("Froze Gaussian Adapter")
+
+    def unfreeze_world_model(self):
+        """Unfreeze world model for stage 2 training (joint training)."""
+        if self.world_model is not None:
+            for param in self.world_model.parameters():
+                param.requires_grad = True
+            logging.info("Unfroze World Model (Gaussian Decoder) - Stage 2: Joint training")
+
+        if hasattr(self, 'gaussian_adapter') and self.gaussian_adapter is not None:
+            for param in self.gaussian_adapter.parameters():
+                param.requires_grad = True
+            logging.info("Unfroze Gaussian Adapter")
+
+    def set_render_loss_weight(self, weight: float):
+        """Dynamically set render loss weight for stage-based training."""
+        self.render_loss_weight = weight
+        logging.info(f"Set render_loss_weight = {weight}")
 
     def is_gradient_checkpointing_enabled(self):
         """Check if gradient checkpointing is enabled."""
@@ -959,7 +979,6 @@ class PI0Pytorch(nn.Module):
                         future_observation=future_observation,
                         gaussian_adapter=self.gaussian_adapter,
                         camera_params=camera_params_for_decode,
-                        return_2d_maps=False,
                         step=step,
                         current_observation=preprocessed_observation,
                     )
@@ -1019,9 +1038,9 @@ class PI0Pytorch(nn.Module):
                             lambda_opacity=0.001,
                             lambda_edge_smooth=0.01,
                         )
-                        render_loss_weight = 1.0
+                        # Use dynamic render_loss_weight (can be changed for staged training)
                         if torch.isfinite(render_loss):
-                            loss = loss + render_loss_weight * render_loss.to(loss.dtype)
+                            loss = loss + self.render_loss_weight * render_loss.to(loss.dtype)
                         
                         # SH DC regularization: encourage neutral gray (sh_dc ≈ 0) to prevent dark rendering
                         # This prevents the model from learning to output negative SH DC values
@@ -1037,7 +1056,7 @@ class PI0Pytorch(nn.Module):
                         should_log = step is not None and step % 40 == 0
                         if should_log:
                             loss_parts = ", ".join(f"{k}={v.item():.6f}" for k, v in render_loss_dict.items())
-                            logging.info(f"Step {step}: Render Loss = {render_loss.item():.4f}, weight={render_loss_weight}, breakdown: {loss_parts}")
+                            logging.info(f"Step {step}: Render Loss = {render_loss.item():.4f}, weight={self.render_loss_weight}, breakdown: {loss_parts}")
 
                         if should_log and is_main_process:
                             with torch.no_grad():

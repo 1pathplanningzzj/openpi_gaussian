@@ -128,7 +128,7 @@ def preprocess_observation_pytorch(
                         image.permute(0, 3, 1, 2),  # [b, h, w, c] -> [b, c, h, w]
                         grid,
                         mode="bilinear",
-                        padding_mode="zeros",
+                        padding_mode="reflection",  # Use reflection instead of zeros to avoid black borders
                         align_corners=False,
                     ).permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
 

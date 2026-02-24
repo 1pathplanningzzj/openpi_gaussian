@@ -547,7 +547,34 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    # Staged training configuration
+    stage1_steps = getattr(config, "stage1_steps", 0)  # 0 means no staged training
+    stage2_render_weight = getattr(config, "stage2_render_weight", 0.1)
+    staged_training_enabled = stage1_steps > 0
+
+    if staged_training_enabled and is_main:
+        logging.info(f"=== Staged Training Enabled ===")
+        logging.info(f"Stage 1 (Action-only): steps 0-{stage1_steps}")
+        logging.info(f"Stage 2 (Joint training): steps {stage1_steps}-{config.num_train_steps}, render_weight={stage2_render_weight}")
+
     while global_step < config.num_train_steps:
+        # Staged training: switch stages at the configured step
+        if staged_training_enabled and global_step == 0:
+            # Stage 1: Freeze world model, disable render loss
+            if hasattr(model, 'freeze_world_model'):
+                model.freeze_world_model()
+                model.set_render_loss_weight(0.0)
+                if is_main:
+                    logging.info(f"=== Stage 1 Started: Action-Only Training ===")
+
+        elif staged_training_enabled and global_step == stage1_steps:
+            # Stage 2: Unfreeze world model, enable render loss with low weight
+            if hasattr(model, 'unfreeze_world_model'):
+                model.unfreeze_world_model()
+                model.set_render_loss_weight(stage2_render_weight)
+                if is_main:
+                    logging.info(f"=== Stage 2 Started: Joint Training (render_weight={stage2_render_weight}) ===")
+
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
@@ -583,15 +610,28 @@ def train_loop(config: _config.TrainConfig):
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
 
+            # NaN gradient sanitization: replace NaN/Inf gradients with 0
+            # This allows action loss gradients (typically fine) to still update
+            # while zeroing out problematic render loss gradients
+            # (e.g. from degenerate Gaussians, numerical overflow in SH evaluation).
+            nan_grad_count = 0
+            for param in model.parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    nan_grad_count += 1
+                    param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
+
             # Gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
 
-            # NaN gradient protection: skip optimizer step if gradients are NaN
-            # This prevents weight corruption from unstable render loss backward pass
             if torch.isfinite(grad_norm):
                 optim.step()
             else:
-                logging.warning(f"Step {global_step}: grad_norm is {grad_norm}, skipping optimizer step")
+                # This should rarely happen now since we sanitized NaN grads above
+                logging.warning(f"Step {global_step}: grad_norm is {grad_norm} after sanitization, skipping optimizer step")
+
+            if nan_grad_count > 0 and global_step % 100 == 0:
+                logging.warning(f"Step {global_step}: sanitized NaN grads in {nan_grad_count} params, grad_norm={grad_norm:.4f}")
+
             optim.zero_grad(set_to_none=True)
 
             # Clear gradients more aggressively
