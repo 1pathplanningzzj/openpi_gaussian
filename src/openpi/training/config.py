@@ -573,6 +573,11 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
+    # Staged training: if > 0, train only action for first stage1_steps, then train both action and world model
+    stage1_steps: int = 0
+    # Render loss weight for stage 2 (after stage1_steps)
+    stage2_render_weight: float = 0.1
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""

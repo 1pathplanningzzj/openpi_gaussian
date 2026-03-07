@@ -1,13 +1,9 @@
 # zijian
 # date 2026.01.24
 # v2 refactored: GaussianDecoder — lightweight decode-only module
-# Todo zijian 2026.0123 ：to fix linear attach anything ？？
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import warnings
-from einops import rearrange
 
 
 class _UpsampleBlock(nn.Module):
@@ -119,8 +115,9 @@ class IndependentGaussianHead(nn.Module):
         # Final projection to output channels
         self.head = nn.Conv2d(128, out_ch, 3, padding=1)
 
-        # Initialize output bias for neutral starting point
-        nn.init.zeros_(self.head.weight)
+        # Initialize output with small random values for better gradient flow
+        # Using Xavier/Glorot initialization scaled down for stability
+        nn.init.xavier_uniform_(self.head.weight, gain=0.01)
         nn.init.zeros_(self.head.bias)
 
     def forward(self, tokens: torch.Tensor, images: torch.Tensor = None) -> torch.Tensor:
@@ -166,76 +163,54 @@ class IndependentGaussianHead(nn.Module):
 class GaussianDecoder(nn.Module):
     """
     Lightweight decoder that converts VLM-predicted latent tokens to 3D Gaussian parameters.
+    Uses independent ConvNet decoder with no VGGT DPT dependency.
 
-    Supports two modes:
-      - "vggt_dpt": inject tokens into VGGT DPT decoder (legacy)
-      - "independent": decode directly via ConvNet (no VGGT DPT dependency)
+    Pipeline:
+    --------
+    VLM Token [B,256,2048]
+        ↓
+    IndependentGaussianHead (ConvNet)
+        ├─ 16×16 → 32×32 → 64×64 → 128×128 (multi-scale)
+        ├─ DPT feature fusion
+        └─ Image feature fusion (current frame)
+        ↓
+    Raw Maps [B,12,128,128]
+        ├─ rot(4) + scale(3) + opacity(1) + RGB(3) + depth_delta(1) = 12 channels
+        ↓
+    Transformations:
+        ├─ rot(4) → normalize → rotations [B,N,4] (quaternions)
+        ├─ scale(3) → softplus → scales [B,N,3]
+        ├─ opacity(1) → sigmoid → opacity [B,N,1]
+        ├─ RGB(3) → tanh*2.0 → sh [B,N,3] (SH DC coefficients)
+        └─ depth_delta(1) + base_depth → final_depth
+        ↓
+    3D Unprojection (depth2pc)
+        final_depth + camera_intrinsics → xyz [B,N,3]
+        ↓
+    Gaussian Point Cloud [B,N=16384,*]
+        ├─ xyz [B,N,3]        - 3D positions
+        ├─ scales [B,N,3]     - Gaussian scales
+        ├─ rotations [B,N,4]  - Rotation quaternions
+        ├─ opacity [B,N,1]    - Alpha values
+        └─ sh [B,N,3]         - Spherical harmonics (DC only)
     """
 
     def __init__(
         self,
         token_dim: int,
-        use_vggt_decoder: bool = False,
-        vggt_decoder=None,
         input_num_tokens: int = 256,
-        target_num_tokens: int = 1369,
-        vggt_embed_dim: int = 1024,
-        upsample_bottleneck: int = 128,
-        decode_mode: str = "vggt_dpt",
-        d_sh: int = 25,
     ):
         super().__init__()
-        self.use_vggt_decoder = use_vggt_decoder
-        self.vggt_decoder = vggt_decoder
-        self.input_num_tokens = input_num_tokens
-        self.target_num_tokens = target_num_tokens
         self.token_dim = token_dim
-        self.vggt_embed_dim = vggt_embed_dim
-        self.decode_mode = decode_mode
-        self.d_sh = d_sh
+        self.input_num_tokens = input_num_tokens
 
-        if decode_mode == "independent":
-            # Independent ConvNet decoder — RGB output, no VGGT DPT dependency
-            grid_size = int(input_num_tokens ** 0.5)  # 256 → 16
-            self.gaussian_head = IndependentGaussianHead(
-                token_dim=token_dim, grid_size=grid_size,
-                use_image_fusion=True,  # Enable image feature fusion
-                img_dim=3,
-            )
-            self.token_proj = None
-            self.upsample_refine = None
-        else:
-            # Legacy: inject into VGGT DPT
-            if use_vggt_decoder and vggt_decoder is not None:
-                target_dim = 2 * vggt_embed_dim  # 2048
-                self.token_proj = nn.Linear(token_dim, target_dim)
-            else:
-                self.token_proj = None
-            self.upsample_refine = nn.Sequential(
-                nn.Conv2d(token_dim, upsample_bottleneck, 1),
-                nn.GELU(),
-                nn.Conv2d(upsample_bottleneck, upsample_bottleneck, 3, padding=1),
-                nn.GELU(),
-                nn.Conv2d(upsample_bottleneck, token_dim, 1),
-            )
-            self.gaussian_head = None
-
-    # ------------------------------------------------------------------
-    # Token upsampling  100 → 1369
-    # ------------------------------------------------------------------
-    def _upsample_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Upsample [B, 100, D] → [B, 1369, D] via bilinear interpolation + learnable refinement."""
-        B, N, D = tokens.shape
-        if N != self.input_num_tokens:
-            return tokens
-        # [B, 100, D] → [B, D, 10, 10]
-        tokens_2d = tokens.permute(0, 2, 1).reshape(B, D, 10, 10)
-        # bilinear upsample → [B, D, 37, 37]
-        tokens_2d = F.interpolate(tokens_2d, size=(37, 37), mode="bilinear", align_corners=False)
-        # learnable refinement (residual) to smooth grid artifacts
-        tokens_2d = tokens_2d + self.upsample_refine(tokens_2d)
-        # → [B, 1369, D]
-        return tokens_2d.permute(0, 2, 3, 1).reshape(B, 37 * 37, D)
+        # Independent ConvNet decoder — RGB output, no VGGT DPT dependency
+        grid_size = int(input_num_tokens ** 0.5)  # 256 → 16
+        self.gaussian_head = IndependentGaussianHead(
+            token_dim=token_dim, grid_size=grid_size,
+            use_image_fusion=True,  # Enable image feature fusion
+            img_dim=3,
+        )
 
     # ------------------------------------------------------------------
     # depth2pc — real-camera unprojection  (adapted from AD-FFgsStudio)
@@ -287,21 +262,14 @@ class GaussianDecoder(nn.Module):
         future_observation=None,
         gaussian_adapter=None,
         camera_params=None,
-        return_2d_maps: bool = False,
         step=None,
         current_observation=None,
     ):
-        """Decode latent tokens → Gaussian parameters. Routes based on decode_mode."""
-        if self.decode_mode == "independent":
-            return self._decode_independent(
-                z, gaussian_adapter=gaussian_adapter, camera_params=camera_params,
-                current_observation=current_observation, future_observation=future_observation,
-                step=step,
-            )
-        return self._decode_vggt_dpt(
-            z, future_observation=future_observation, gaussian_adapter=gaussian_adapter,
-            camera_params=camera_params, return_2d_maps=return_2d_maps, step=step,
-            current_observation=current_observation,
+        """Decode latent tokens → Gaussian parameters."""
+        return self._decode_independent(
+            z, gaussian_adapter=gaussian_adapter, camera_params=camera_params,
+            current_observation=current_observation, future_observation=future_observation,
+            step=step,
         )
 
     # ------------------------------------------------------------------
@@ -364,7 +332,7 @@ class GaussianDecoder(nn.Module):
         ).squeeze(1)  # [B, H_dec, W_dec]
         depth_delta_2d = depth_delta.squeeze(1)  # [B, H_dec, W_dec]
         final_depth = base_depth_resized + depth_delta_2d
-
+        
         # 6. Activations
         B = z.shape[0]
         rot_maps = rot_raw.permute(0, 2, 3, 1)  # [B, H, W, 4]
@@ -434,244 +402,4 @@ class GaussianDecoder(nn.Module):
             "sh": sh_flat,
             "rotations": rot_flat,
             "depth_map": final_depth.unsqueeze(1),  # [B, 1, H, W] for edge-aware smoothness
-        }
-
-    # ------------------------------------------------------------------
-    # Legacy VGGT DPT decode path
-    # ------------------------------------------------------------------
-    def _decode_vggt_dpt(
-        self, z, future_observation=None, gaussian_adapter=None,
-        camera_params=None, return_2d_maps=False, step=None, current_observation=None,
-    ):
-        if not (self.use_vggt_decoder and self.vggt_decoder is not None):
-            raise ValueError(
-                "GaussianDecoder requires use_vggt_decoder=True and a valid vggt_decoder."
-            )
-        # Use current observation (no future leak); fall back to future_observation for compat
-        vggt_obs = current_observation if current_observation is not None else future_observation
-        if vggt_obs is None or gaussian_adapter is None:
-            raise ValueError(
-                "current_observation (or future_observation) and gaussian_adapter are required"
-            )
-
-        # 1. Prepare VGGT inputs from current observation (excludes future frame)
-        #    prepare_inputs selects [t-2, t-1, t] when given [B, T, H, W, C]
-        vggt_inputs = gaussian_adapter.prepare_inputs(
-            vggt_obs, z.device, z.shape[0], is_training=False
-        )
-        if vggt_inputs is None:
-            raise ValueError("Failed to prepare VGGT inputs from observation")
-
-        # 2. Run VGGT aggregator to get multi-layer tokens
-        with torch.no_grad():
-            aggregated_tokens_list, patch_start_idx = gaussian_adapter.encoder.aggregator(
-                vggt_inputs.to(torch.bfloat16)
-            )
-
-        # Ensure all tokens are [B, S, P, C] (4D)
-        B_vggt, S_vggt = vggt_inputs.shape[:2]
-        for i in range(len(aggregated_tokens_list)):
-            if aggregated_tokens_list[i].ndim == 3:
-                _bs, _p, _c = aggregated_tokens_list[i].shape
-                aggregated_tokens_list[i] = aggregated_tokens_list[i].view(B_vggt, S_vggt, _p, _c)
-
-        # 3. Upsample predicted tokens 100 → 1369
-        z_up = self._upsample_tokens(z)  # [B, 1369, D]
-
-        # 4. Replace last-layer patch tokens with predicted tokens
-        self._replace_patch_tokens(aggregated_tokens_list, z_up, patch_start_idx, step)
-
-        # 5. Run VGGT gs_head decoder → raw Gaussian maps
-        raw_gaussian = self.vggt_decoder(
-            aggregated_tokens_list, images=vggt_inputs, patch_start_idx=patch_start_idx
-        )  # [B, S, H, W, C]
-
-        # 6. Run VGGT depth_head → depth maps
-        with torch.no_grad():
-            depth_maps, _ = gaussian_adapter.encoder.depth_head(
-                aggregated_tokens_list, images=vggt_inputs, patch_start_idx=patch_start_idx
-            )
-            depth_maps = torch.sigmoid(torch.log(depth_maps))
-            min_depth = gaussian_adapter.encoder.min_depth
-            max_depth = gaussian_adapter.encoder.max_depth
-            depth_maps = min_depth + (max_depth - min_depth) * depth_maps  # [B, S, H, W, 1]
-
-        # 7. Parse raw Gaussian output
-        d_sh = gaussian_adapter.encoder.d_sh
-        rot_maps, scale_maps, opacity_maps, sh_maps = raw_gaussian.split(
-            (4, 3, 1, 3 * d_sh), dim=-1
-        )
-
-        # Process maps — each activation applied exactly ONCE
-        rot_maps = rot_maps / (rot_maps.norm(dim=-1, keepdim=True) + 1e-8)
-        # softplus output ~0.7 → 2D std ≈ 0.7*194/50 ≈ 2.7 px per Gaussian.
-        # 37×37 grid spacing ≈ 6 px, so ~2.7 px std gives good coverage without
-        # excessive overlap. Clamp max=10.0 downstream ensures gradient flow.
-        scale_maps = F.softplus(scale_maps, beta=1)
-        opacity_maps = torch.sigmoid(opacity_maps)
-        sh_maps = rearrange(sh_maps, "b s h w (i c) -> b s h w i c", i=3, c=d_sh)
-
-        # Apply SH mask (higher-order attenuation)
-        if hasattr(gaussian_adapter.encoder, "sh_mask"):
-            sh_mask = gaussian_adapter.encoder.sh_mask  # [d_sh]
-            sh_maps = sh_maps * sh_mask.view(1, 1, 1, 1, 1, -1)
-
-        if return_2d_maps:
-            return {
-                "rot_maps": rot_maps,
-                "scale_maps": scale_maps,
-                "opacity_maps": opacity_maps,
-                "sh_maps": sh_maps,
-                "depth_maps": depth_maps,
-                "is_2d_maps": True,
-            }
-
-        # 8. Convert 2D maps → 3D Gaussians
-        return self._convert_2d_maps_to_3d_gaussians(
-            depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps,
-            camera_params=camera_params,
-            downsample_factor=4,
-            step=step,
-        )
-
-    # ------------------------------------------------------------------
-    # Replace patch tokens in aggregated_tokens_list
-    # ------------------------------------------------------------------
-    def _replace_patch_tokens(self, aggregated_tokens_list, z_up, patch_start_idx, step=None):
-        """Replace last-layer patch tokens with world-model predicted tokens."""
-        if not aggregated_tokens_list:
-            return
-
-        last = aggregated_tokens_list[-1]
-        is_4d = last.ndim == 4
-
-        # Flatten to [B*S, P, D] for uniform handling
-        if is_4d:
-            B_t, S_t, P, D = last.shape
-            last = last.reshape(B_t * S_t, P, D)
-        elif last.ndim == 3:
-            B_t, S_t = None, None
-            _, P, D = last.shape
-        else:
-            warnings.warn(f"Unexpected last_layer_tokens shape: {last.shape}. Skipping replacement.")
-            return
-
-        B_S = last.shape[0]
-        B = z_up.shape[0]
-        S = B_S // B
-        if S == 0 or B_S % B != 0:
-            warnings.warn(f"Shape mismatch: B_S={B_S}, B={B}. Skipping replacement.")
-            return
-
-        # Expand z_up to match sequence dim
-        if S > 1:
-            z_exp = z_up.unsqueeze(1).expand(B, S, -1, -1).reshape(B * S, -1, z_up.shape[-1])
-        else:
-            z_exp = z_up
-
-        # Project to VGGT dim
-        z_proj = self.token_proj(z_exp) if self.token_proj is not None else z_exp
-
-        expected = P - patch_start_idx
-        actual = z_proj.shape[1]
-
-        if actual != expected:
-            warnings.warn(
-                f"Token count mismatch: predicted {actual}, expected {expected}. Skipping replacement."
-            )
-            return
-        if z_proj.shape[-1] != D:
-            warnings.warn(
-                f"Dim mismatch: projected {z_proj.shape[-1]} vs aggregated {D}. Skipping replacement."
-            )
-            return
-
-        new_last = torch.cat([last[:, :patch_start_idx], z_proj], dim=1)
-
-        if is_4d:
-            aggregated_tokens_list[-1] = new_last.view(B_t, S_t, P, D)
-        else:
-            aggregated_tokens_list[-1] = new_last
-
-    # ------------------------------------------------------------------
-    # 2D maps → 3D Gaussian point cloud
-    # ------------------------------------------------------------------
-    def _convert_2d_maps_to_3d_gaussians(
-        self,
-        depth_maps,      # [B, S, H, W, 1]
-        rot_maps,        # [B, S, H, W, 4]
-        scale_maps,      # [B, S, H, W, 3]  (already activated)
-        opacity_maps,    # [B, S, H, W, 1]  (already activated)
-        sh_maps,         # [B, S, H, W, 3, d_sh]
-        camera_params=None,
-        downsample_factor: int = 4,
-        step=None,
-    ):
-        B, S, H, W, _ = depth_maps.shape
-        device, dtype = depth_maps.device, depth_maps.dtype
-        frame_idx = S - 1  # use last frame
-
-        # Extract single frame
-        depth = depth_maps[:, frame_idx, :, :, 0]   # [B, H, W]
-        rot = rot_maps[:, frame_idx]                 # [B, H, W, 4]
-        scale = scale_maps[:, frame_idx]             # [B, H, W, 3]
-        opacity = opacity_maps[:, frame_idx, :, :, 0]  # [B, H, W]
-        sh = sh_maps[:, frame_idx]                   # [B, H, W, 3, d_sh]
-
-        # Optional downsample
-        if downsample_factor > 1:
-            H_ds, W_ds = H // downsample_factor, W // downsample_factor
-            depth = F.interpolate(depth.unsqueeze(1), (H_ds, W_ds), mode="bilinear", align_corners=False).squeeze(1)
-            rot = F.interpolate(rot.permute(0, 3, 1, 2), (H_ds, W_ds), mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
-            scale = F.interpolate(scale.permute(0, 3, 1, 2), (H_ds, W_ds), mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
-            opacity = F.interpolate(opacity.unsqueeze(1), (H_ds, W_ds), mode="bilinear", align_corners=False).squeeze(1)
-            K_sh, C_sh = sh.shape[-2], sh.shape[-1]
-            sh_flat = sh.permute(0, 3, 4, 1, 2).reshape(B, K_sh * C_sh, H, W)
-            sh_flat = F.interpolate(sh_flat, (H_ds, W_ds), mode="bilinear", align_corners=False)
-            sh = sh_flat.reshape(B, K_sh, C_sh, H_ds, W_ds).permute(0, 3, 4, 1, 2)
-            H, W = H_ds, W_ds
-
-        # Re-normalize rotation after interpolation
-        rot = rot / (rot.norm(dim=-1, keepdim=True) + 1e-8)
-
-        # Depth → 3D positions using real camera intrinsics
-        if camera_params is not None and "fx" in camera_params:
-            xyz = self.depth2pc(
-                depth,
-                fx=camera_params["fx"], fy=camera_params["fy"],
-                cx=camera_params["cx"], cy=camera_params["cy"],
-                downsample_factor=downsample_factor,
-            )
-        else:
-            # Fallback: LIBERO default intrinsics (fx=fy=221.7025, cx=cy=128, 256x256 → VGGT 518x518)
-            # VGGT resizes to 518x518, so scale intrinsics: factor = 518/256 ≈ 2.0234
-            vggt_scale = 518.0 / 256.0
-            xyz = self.depth2pc(
-                depth,
-                fx=221.7025 * vggt_scale, fy=221.7025 * vggt_scale,
-                cx=128.0 * vggt_scale, cy=128.0 * vggt_scale,
-                downsample_factor=downsample_factor,
-            )
-
-        # Flatten all params
-        N = H * W
-        rot_flat = rot.reshape(B, N, 4)
-        scale_flat = scale.reshape(B, N, 3)
-        opacity_flat = opacity.reshape(B, N, 1)
-        sh_flat = sh.reshape(B, N, -1)
-
-        # Sanitize
-        scale_flat = torch.clamp(scale_flat, min=1e-7, max=10.0)
-        xyz = torch.clamp(xyz, min=-100.0, max=100.0)
-        xyz = torch.where(torch.isnan(xyz) | torch.isinf(xyz), torch.zeros_like(xyz), xyz)
-
-        # Pass scales and rotations directly to renderer (like gsplat reference).
-        # Previous code built a diagonal sigma and then decomposed it back,
-        # which discarded the rotation quaternions entirely.
-        return {
-            "xyz": xyz,            # [B, N, 3]
-            "scales": scale_flat,  # [B, N, 3]  — direct scales for rasterizer
-            "opacity": opacity_flat,  # [B, N, 1]
-            "sh": sh_flat,         # [B, N, K*3]
-            "rotations": rot_flat, # [B, N, 4]  — quaternions for rasterizer
         }

@@ -2,6 +2,25 @@
 # date 2026.01.26
 # Description: Gaussian Renderer Module for World Model Supervision
 # Purpose: Integrate AD-FFgsStudio's GaussianRasterizer for rendering loss computation
+# 3D高斯参数 [B,N,*]
+#     ↓
+# 数值清理 (NaN/Inf处理, Clamp)
+#     ↓
+# 相机变换 (viewmatrix, projmatrix)
+#     ↓
+# 光栅化器 (AD-FFgsStudio)
+#     ├─ 投影到2D
+#     ├─ Alpha混合
+#     └─ 球谐着色
+#     ↓
+# 渲染图像 [B,3,H,W]
+#     ↓
+# 损失计算
+#     ├─ SSIM + L1 (光度)
+#     ├─ 边缘感知平滑 (深度)
+#     └─ 正则化 (尺度+不透明度)
+#     ↓
+# 反向传播 → 更新世界模型
 
 import sys
 from pathlib import Path
@@ -25,119 +44,6 @@ try:
 except ImportError:
     print("Warning: GaussianRasterizer not available. Rendering loss will be disabled.")
     RASTERIZER_AVAILABLE = False
-
-
-def convert_sigma_to_scale_rotation(sigma_params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Convert 6D covariance parameters to scales and rotations.
-    转换协方差矩阵 
-    Args:
-        sigma_params: [B, N, 6] - Upper triangle of covariance matrix
-                      [s11, s12, s13, s22, s23, s33]
-
-    Returns:
-        scales: [B, N, 3] - 3D scales
-        rotations: [B, N, 4] - Quaternion rotations (w, x, y, z)
-    """
-    B, N, _ = sigma_params.shape
-    device = sigma_params.device
-
-    # Build 3x3 covariance matrix (symmetric)
-    cov = torch.zeros(B, N, 3, 3, device=device, dtype=sigma_params.dtype)
-    cov[..., 0, 0] = sigma_params[..., 0]  # s11
-    cov[..., 0, 1] = sigma_params[..., 1]  # s12
-    cov[..., 0, 2] = sigma_params[..., 2]  # s13
-    cov[..., 1, 0] = sigma_params[..., 1]  # s21 = s12
-    cov[..., 1, 1] = sigma_params[..., 3]  # s22
-    cov[..., 1, 2] = sigma_params[..., 4]  # s23
-    cov[..., 2, 0] = sigma_params[..., 2]  # s31 = s13
-    cov[..., 2, 1] = sigma_params[..., 4]  # s32 = s23
-    cov[..., 2, 2] = sigma_params[..., 5]  # s33
-
-    # Eigenvalue decomposition: Σ = R S S^T R^T
-    eigenvalues, eigenvectors = torch.linalg.eigh(cov)
-
-    # Scales = sqrt(eigenvalues), clamped to avoid numerical issues
-    scales = torch.sqrt(torch.clamp(eigenvalues, min=1e-6))  # [B, N, 3]
-
-    # Convert rotation matrix to quaternion
-    rotations = rotation_matrix_to_quaternion(eigenvectors)  # [B, N, 4]
-
-    return scales, rotations
-
-
-def rotation_matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
-    """
-    Convert rotation matrices to quaternions.
-
-    Args:
-        R: [B, N, 3, 3] - Rotation matrices
-
-    Returns:
-        q: [B, N, 4] - Quaternions (w, x, y, z)
-    """
-    input_shape = R.shape
-    if len(input_shape) > 3:
-        # Flatten batch and N dimensions for safe processing
-        R = R.reshape(-1, 3, 3)
-    
-    B_flat, _, _ = R.shape
-    device = R.device
-
-    # Extract rotation matrix elements
-    r00, r01, r02 = R[:, 0, 0], R[:, 0, 1], R[:, 0, 2]
-    r10, r11, r12 = R[:, 1, 0], R[:, 1, 1], R[:, 1, 2]
-    r20, r21, r22 = R[:, 2, 0], R[:, 2, 1], R[:, 2, 2]
-
-    # Compute quaternion components
-    trace = r00 + r11 + r22
-
-    q = torch.zeros(B_flat, 4, device=device, dtype=R.dtype)
-
-    # Case 1: trace > 0
-    mask1 = trace > 0
-    if mask1.any():
-        s = torch.sqrt(trace[mask1] + 1.0) * 2  # s = 4 * w
-        q[mask1, 0] = 0.25 * s
-        q[mask1, 1] = (r21[mask1] - r12[mask1]) / s
-        q[mask1, 2] = (r02[mask1] - r20[mask1]) / s
-        q[mask1, 3] = (r10[mask1] - r01[mask1]) / s
-
-    # Case 2: r00 is the largest diagonal element
-    mask2 = (~mask1) & (r00 > r11) & (r00 > r22)
-    if mask2.any():
-        s = torch.sqrt(1.0 + r00[mask2] - r11[mask2] - r22[mask2]) * 2  # s = 4 * x
-        q[mask2, 0] = (r21[mask2] - r12[mask2]) / s
-        q[mask2, 1] = 0.25 * s
-        q[mask2, 2] = (r01[mask2] + r10[mask2]) / s
-        q[mask2, 3] = (r02[mask2] + r20[mask2]) / s
-
-    # Case 3: r11 is the largest diagonal element
-    mask3 = (~mask1) & (~mask2) & (r11 > r22)
-    if mask3.any():
-        s = torch.sqrt(1.0 + r11[mask3] - r00[mask3] - r22[mask3]) * 2  # s = 4 * y
-        q[mask3, 0] = (r02[mask3] - r20[mask3]) / s
-        q[mask3, 1] = (r01[mask3] + r10[mask3]) / s
-        q[mask3, 2] = 0.25 * s
-        q[mask3, 3] = (r12[mask3] + r21[mask3]) / s
-
-    # Case 4: r22 is the largest diagonal element
-    mask4 = (~mask1) & (~mask2) & (~mask3)
-    if mask4.any():
-        s = torch.sqrt(1.0 + r22[mask4] - r00[mask4] - r11[mask4]) * 2  # s = 4 * z
-        q[mask4, 0] = (r10[mask4] - r01[mask4]) / s
-        q[mask4, 1] = (r02[mask4] + r20[mask4]) / s
-        q[mask4, 2] = (r12[mask4] + r21[mask4]) / s
-        q[mask4, 3] = 0.25 * s
-
-    # Normalize quaternion
-    q = F.normalize(q, dim=-1)
-
-    # Reshape back to original shape [B, N, 4]
-    if len(input_shape) > 3:
-        q = q.reshape(*input_shape[:-2], 4)
-
-    return q
 
 
 def validate_camera_params(camera_params: Dict[str, torch.Tensor], batch_idx: int = 0, step: int = None):
@@ -274,73 +180,6 @@ def validate_camera_params(camera_params: Dict[str, torch.Tensor], batch_idx: in
     return is_valid, issues
 
 
-def project_to_2d(
-    xyz: torch.Tensor,
-    camera_params: Dict[str, torch.Tensor]
-) -> torch.Tensor:
-    """
-    Project 3D points to 2D pixel coordinates.
-
-    Args:
-        xyz: [B, N, 3] - 3D points in world coordinates
-        camera_params: Dictionary containing camera parameters
-
-    Returns:
-        pixels_2d: [B, N, 2] - Pixel coordinates (u, v)
-    """
-    B, N, _ = xyz.shape
-    device = xyz.device
-
-    # Transform to camera coordinates
-    viewmatrix = camera_params["viewmatrix"]  # [B, 4, 4]
-
-    # Homogeneous coordinates
-    xyz_homo = torch.cat([
-        xyz,
-        torch.ones(B, N, 1, device=device, dtype=xyz.dtype)
-    ], dim=-1)  # [B, N, 4]
-
-    # Transform to camera space
-    # viewmatrix is [B, 4, 4]. We want (XYZ_homo @ View.T) per batch.
-    # xyz_homo: [B, N, 4]
-    # viewmatrix.transpose(-1, -2): [B, 4, 4] (Row-major camera world-to-cam?)
-    # Usually xyz_cam = xyz_world @ M^T if M is 4x4 multiplying column vectors.
-    # Here M is [B, 4, 4]. We need M^T for "right multiplication".
-    # torch.matmul handles batch dimensions correctly.
-    # [B, N, 4] x [B, 4, 4] -> [B, N, 4]
-    xyz_cam = torch.matmul(xyz_homo, viewmatrix.transpose(-1, -2))  # [B, N, 4]
-
-    # Project to image plane
-    intrinsics = camera_params["intrinsics"]  # [B, 3, 3] or [3, 3]
-    
-    # Handle batched intrinsics
-    if intrinsics.ndim == 3:
-        # [B, 3, 3]
-        fx = intrinsics[:, 0, 0].unsqueeze(1) # [B, 1]
-        fy = intrinsics[:, 1, 1].unsqueeze(1)
-        cx = intrinsics[:, 0, 2].unsqueeze(1)
-        cy = intrinsics[:, 1, 2].unsqueeze(1)
-    else:
-        # [3, 3]
-        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-        cx, cy = intrinsics[0, 2], intrinsics[1, 2]
-
-    # Perspective projection
-    x_cam = xyz_cam[..., 0]
-    y_cam = xyz_cam[..., 1]
-    z_cam = xyz_cam[..., 2].clamp(min=1e-6)  # Avoid division by zero
-
-    u = fx * (x_cam / z_cam) + cx
-    v = fy * (y_cam / z_cam) + cy
-
-    # AD-FFgsStudio's diff-gaussian-rasterization returns [N, 3] gradients for means2D
-    # So we must provide [N, 3] inputs. The 3rd component is likely depth or ignored.
-    # We'll pass z_cam just in case. but ..to be fixed later
-    pixels_2d = torch.stack([u, v, z_cam], dim=-1)  # [B, N, 3]
-
-    return pixels_2d
-
-
 class GaussianRenderer(nn.Module):
     """
     Wrapper for AD-FFgsStudio's GaussianRasterizer.
@@ -422,17 +261,9 @@ class GaussianRenderer(nn.Module):
             opacity_after = gaussian_params["opacity"]
             print(f"[GaussianRenderer] Opacity after clamp: min={opacity_after.min():.6f}, max={opacity_after.max():.6f}, mean={opacity_after.mean():.6f}")
 
-        # --- Get scales and rotations ---
-        # New path: use scales and rotations directly (like gsplat reference in AD-FFgsStudio)
-        # Old path (sigma): decompose covariance → loses rotation info (all become identity)
-        if "scales" in gaussian_params:
-            scales = gaussian_params["scales"]
-            rotations = gaussian_params["rotations"]
-        else:
-            # Legacy fallback: decompose sigma (loses rotation!)
-            scales, rotations = convert_sigma_to_scale_rotation(
-                gaussian_params["sigma"]
-            )
+        # Get scales and rotations directly (no sigma fallback)
+        scales = gaussian_params["scales"]
+        rotations = gaussian_params["rotations"]
 
         # Clamp scales
         if step is not None and step % 40 == 0:
@@ -869,7 +700,7 @@ def compute_multi_view_rendering_loss(
 
 def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params_dict, renderer, view_names, save_dir=None, time_suffix=""):
     """
-    Helper to visualize Rendered vs GT images.
+    Helper to visualize Rendered vs GT images and Gaussian xyz positions.
     Args:
         step: Current training step (int)
         gaussian_params: Dict of gaussian parameters (batched)
@@ -884,50 +715,59 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
     # Use non-interactive backend to avoid X11 authorization issues in headless environments
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
     import os
     import numpy as np
-    
+
     if save_dir is None:
         save_dir = "./visualizations/rendering"
     os.makedirs(save_dir, exist_ok=True)
-    
+
     # Take first item in batch
     idx = 0
-    
-    fig, axes = plt.subplots(len(view_names), 3, figsize=(15, 5 * len(view_names)))
-    if len(view_names) == 1:
-        axes = axes[None, :] # Ensure 2D array
-        
+
+    # Create figure with 3 rows: GT/Rendered/Diff, and 6 Gaussian xyz views
+    fig = plt.figure(figsize=(30, 15))
+
+    # Row 1: GT images (3 columns for different time steps)
+    # Row 2: Rendered/Diff (3 columns)
+    # Row 3: Gaussian xyz positions (6 different views)
+
+    # Create grid: 3 rows, 6 columns
+    gs = fig.add_gridspec(3, 6, hspace=0.3, wspace=0.3)
+    # Create grid: 3 rows, 6 columns
+    gs = fig.add_gridspec(3, 6, hspace=0.3, wspace=0.3)
+
     with torch.no_grad():
+        # Row 1 & 2: Rendering comparison (use first 3 columns)
         for i, view_name in enumerate(view_names):
+            if i >= 1:  # Only show first view to save space
+                break
+
             # 1. Render
             # Re-construct raster settings for single item
             cam_params = {k: v[idx:idx+1] if isinstance(v, torch.Tensor) else v for k, v in cam_params_dict[view_name].items()}
-            
+
             # Single item slice for gaussians
             params_single = {
                "xyz": gaussian_params["xyz"][idx:idx+1],
                "sh": gaussian_params["sh"][idx:idx+1],
-               "opacity": gaussian_params["opacity"][idx:idx+1]
+               "opacity": gaussian_params["opacity"][idx:idx+1],
+               "scales": gaussian_params["scales"][idx:idx+1],
+               "rotations": gaussian_params["rotations"][idx:idx+1]
             }
-            # Use scales+rotations if available, otherwise fall back to sigma
-            if "scales" in gaussian_params:
-                params_single["scales"] = gaussian_params["scales"][idx:idx+1]
-                params_single["rotations"] = gaussian_params["rotations"][idx:idx+1]
-            else:
-                params_single["sigma"] = gaussian_params["sigma"][idx:idx+1]
-            
+
             rendered_img = renderer(params_single, cam_params) # [1, 3, H, W]
             rendered_img = rendered_img.float() # Ensure float for plotting
-            
+
             rendered_np = rendered_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() # [H, W, 3]
             print(f"[Viz] Rendered {view_name} range: min={rendered_np.min():.4f}, max={rendered_np.max():.4f}, mean={rendered_np.mean():.4f}")
-            
+
             # Debug: Check if rendering is all zeros or very small
             if rendered_np.max() < 1e-6:
                 print(f"[Viz] WARNING: Rendered image is all zeros or very small (max={rendered_np.max():.6f})!")
                 print(f"[Viz] This suggests: 1) Scale values too small, 2) Opacity too small, 3) SH coefficients wrong, or 4) 3D positions wrong")
-            
+
             # Direct clamp to [0,1] — no min-max normalization
             # Rendered image from SH should already be in ~[0,1] range (SH_C0 * sh + 0.5)
             rendered_viz = np.clip(rendered_np, 0, 1)
@@ -944,25 +784,133 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
             # 3. Difference (on actual pixel values, not normalized)
             diff_np = np.abs(rendered_viz - gt_viz)
 
-            # Plot
-            axes[i, 0].imshow(gt_viz)
-            axes[i, 0].set_title(f"{view_name} GT")
-            axes[i, 0].axis('off')
+            # Plot in first row (columns 0, 1, 2)
+            ax_gt = fig.add_subplot(gs[0, 0])
+            ax_gt.imshow(gt_viz)
+            ax_gt.set_title(f"{view_name} GT", fontsize=14)
+            ax_gt.axis('off')
 
-            axes[i, 1].imshow(rendered_viz)
-            axes[i, 1].set_title(f"{view_name} Rendered")
-            axes[i, 1].axis('off')
+            ax_rendered = fig.add_subplot(gs[0, 1])
+            ax_rendered.imshow(rendered_viz)
+            ax_rendered.set_title(f"{view_name} Rendered", fontsize=14)
+            ax_rendered.axis('off')
 
-            axes[i, 2].imshow(diff_np)
-            axes[i, 2].set_title(f"{view_name} Diff")
-            axes[i, 2].axis('off')
-            
-    plt.tight_layout()
+            ax_diff = fig.add_subplot(gs[0, 2])
+            ax_diff.imshow(diff_np)
+            ax_diff.set_title(f"{view_name} Diff", fontsize=14)
+            ax_diff.axis('off')
+
+        # Row 3: Gaussian xyz positions (6 different views)
+        xyz = gaussian_params["xyz"][idx].detach().cpu().numpy()  # [N, 3]
+        opacity = gaussian_params["opacity"][idx].detach().cpu().numpy()  # [N, 1]
+
+        # Filter by opacity for better visualization
+        opacity_threshold = 0.1
+        mask = opacity.squeeze() > opacity_threshold
+        xyz_filtered = xyz[mask]
+
+        print(f"[Viz] Gaussian points: {xyz.shape[0]} total, {xyz_filtered.shape[0]} with opacity > {opacity_threshold}")
+
+        # Subsample if too many points
+        max_points = 5000
+        if xyz_filtered.shape[0] > max_points:
+            indices = np.random.choice(xyz_filtered.shape[0], max_points, replace=False)
+            xyz_filtered = xyz_filtered[indices]
+
+        # Define 6 different viewpoints
+        views = [
+            {'elev': 30, 'azim': 45, 'title': 'View 1 (Front-Right)'},
+            {'elev': 30, 'azim': 135, 'title': 'View 2 (Back-Right)'},
+            {'elev': 30, 'azim': 225, 'title': 'View 3 (Back-Left)'},
+            {'elev': 30, 'azim': 315, 'title': 'View 4 (Front-Left)'},
+            {'elev': 90, 'azim': 0, 'title': 'View 5 (Top)'},
+            {'elev': 0, 'azim': 0, 'title': 'View 6 (Side)'},
+        ]
+
+        for col, view in enumerate(views):
+            ax = fig.add_subplot(gs[2, col], projection='3d')
+
+            # Plot points
+            ax.scatter(xyz_filtered[:, 0], xyz_filtered[:, 1], xyz_filtered[:, 2],
+                      c=xyz_filtered[:, 2], cmap='viridis', s=1, alpha=0.6)
+
+            # Set viewpoint
+            ax.view_init(elev=view['elev'], azim=view['azim'])
+
+            # Labels and title
+            ax.set_xlabel('X', fontsize=10)
+            ax.set_ylabel('Y', fontsize=10)
+            ax.set_zlabel('Z', fontsize=10)
+            ax.set_title(view['title'], fontsize=12)
+
+            # Set equal aspect ratio
+            max_range = np.array([xyz_filtered[:, 0].max()-xyz_filtered[:, 0].min(),
+                                 xyz_filtered[:, 1].max()-xyz_filtered[:, 1].min(),
+                                 xyz_filtered[:, 2].max()-xyz_filtered[:, 2].min()]).max() / 2.0
+
+            mid_x = (xyz_filtered[:, 0].max()+xyz_filtered[:, 0].min()) * 0.5
+            mid_y = (xyz_filtered[:, 1].max()+xyz_filtered[:, 1].min()) * 0.5
+            mid_z = (xyz_filtered[:, 2].max()+xyz_filtered[:, 2].min()) * 0.5
+
+            ax.set_xlim(mid_x - max_range, mid_x + max_range)
+            ax.set_ylim(mid_y - max_range, mid_y + max_range)
+            ax.set_zlim(mid_z - max_range, mid_z + max_range)
+
     # Include time suffix in filename to identify t vs t+1
     if time_suffix:
         save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}.png")
+        html_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}_interactive.html")
     else:
         save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}.png")
-    plt.savefig(save_path)
+        html_path = os.path.join(save_dir, f"render_viz_step_{step:06d}_interactive.html")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f"Saved Rendering Visualization to {save_path}")
+    print(f"Saved Rendering Visualization with Gaussian xyz to {save_path}")
+
+    # Create interactive 3D visualization with Plotly
+    try:
+        import plotly.graph_objects as go
+
+        # Create interactive 3D scatter plot
+        fig_interactive = go.Figure(data=[go.Scatter3d(
+            x=xyz_filtered[:, 0],
+            y=xyz_filtered[:, 1],
+            z=xyz_filtered[:, 2],
+            mode='markers',
+            marker=dict(
+                size=2,
+                color=xyz_filtered[:, 2],  # Color by Z (depth)
+                colorscale='Viridis',
+                showscale=True,
+                colorbar=dict(title="Z (Depth)"),
+                opacity=0.6
+            ),
+            text=[f'X: {x:.2f}<br>Y: {y:.2f}<br>Z: {z:.2f}'
+                  for x, y, z in xyz_filtered],
+            hovertemplate='%{text}<extra></extra>'
+        )])
+
+        # Update layout
+        fig_interactive.update_layout(
+            title=f'Gaussian Point Cloud - Step {step}{time_suffix}',
+            scene=dict(
+                xaxis_title='X',
+                yaxis_title='Y',
+                zaxis_title='Z (Depth)',
+                aspectmode='data',
+                camera=dict(
+                    eye=dict(x=1.5, y=1.5, z=1.5)
+                )
+            ),
+            width=1200,
+            height=800,
+            hovermode='closest'
+        )
+
+        # Save as HTML
+        fig_interactive.write_html(html_path)
+        print(f"Saved Interactive 3D Visualization to {html_path}")
+
+    except ImportError:
+        print("Plotly not installed. Skipping interactive visualization. Install with: pip install plotly")
+
