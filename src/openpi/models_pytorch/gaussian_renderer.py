@@ -357,17 +357,19 @@ class GaussianRenderer(nn.Module):
             rasterizer = _GaussianRasterizer(raster_settings)
 
             # Reshape SH to match diff-gaussian-rasterization expectation
-            # Degree 3 -> (3+1)^2 = 16 coeffs. 3 RGB channels = 48 total
+            # For sh_degree=1: (1+1)^2 = 4 coeffs per color, 3 RGB channels = 12 total
+            # Our decoder outputs 9 coeffs (3 DC + 6 for 1st order), need to pad to 12
             shs_val = gaussian_params["sh"][b]
             # Calculate num_coeffs dynamically based on sh_degree
             num_coeffs = (self.sh_degree + 1) ** 2
-            expected_sh_dim = num_coeffs * 3  # 16 * 3 = 48 for sh_degree=3
-            
+            expected_sh_dim = num_coeffs * 3  # For sh_degree=1: 4 * 3 = 12
+
             # Debug: Print SH stats (only every 40 steps)
             if step is not None and step % 40 == 0 and b == 0:
                 print(f"[GaussianRenderer] SH before reshape: shape={shs_val.shape}, min={shs_val.min():.6f}, max={shs_val.max():.6f}, mean={shs_val.mean():.6f}")
-            
-            # Handle different SH dimensions (VGGT may use sh_degree=4 -> 75 dims, we need 48 for sh_degree=3)
+                print(f"[GaussianRenderer] sh_degree={self.sh_degree}, num_coeffs={num_coeffs}, expected_sh_dim={expected_sh_dim}")
+
+            # Handle different SH dimensions
             if shs_val.shape[-1] == expected_sh_dim:
                 # Exact match: reshape to [N, num_coeffs, 3]
                 shs_val = shs_val.view(-1, num_coeffs, 3)
@@ -376,10 +378,11 @@ class GaussianRenderer(nn.Module):
                 shs_val = shs_val[..., :expected_sh_dim].view(-1, num_coeffs, 3)
             else:
                 # Fewer coefficients: pad with zeros
+                # For sh_degree=1: we have 9 coeffs, need 12 (pad 3 zeros)
                 sh_padded = torch.zeros(shs_val.shape[0], expected_sh_dim, device=shs_val.device, dtype=shs_val.dtype)
                 sh_padded[:, :shs_val.shape[-1]] = shs_val
                 shs_val = sh_padded.view(-1, num_coeffs, 3)
-            
+
             # Debug: Print SH stats after reshape (only every 40 steps)
             if step is not None and step % 40 == 0 and b == 0:
                 print(f"[GaussianRenderer] SH after reshape: shape={shs_val.shape}, min={shs_val.min():.6f}, max={shs_val.max():.6f}, mean={shs_val.mean():.6f}")
@@ -698,18 +701,19 @@ def compute_multi_view_rendering_loss(
 
     return total_loss, loss_dict
 
-def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params_dict, renderer, view_names, save_dir=None, time_suffix=""):
+def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params_dict, renderer, view_names, save_dir=None, time_suffix="", temporal_frames=None):
     """
-    Helper to visualize Rendered vs GT images and Gaussian xyz positions.
+    Helper to visualize temporal sequence and rendering comparison.
     Args:
         step: Current training step (int)
         gaussian_params: Dict of gaussian parameters (batched)
-        target_obs: GT target observation dict
+        target_obs: GT target observation dict (t+1 frame)
         cam_params_dict: Camera parameters dict
         renderer: Instance of GaussianRenderer
         view_names: List of camera names to visualize
         save_dir: Optional directory to save visualizations. Defaults to "./visualizations/rendering"
         time_suffix: Optional suffix to identify time step (e.g., "_t", "_t1_pred", "_t1_gt")
+        temporal_frames: Dict of temporal frames {key: [B, T, C, H, W]} where T includes t-2, t-1, t
     """
     import matplotlib
     # Use non-interactive backend to avoid X11 authorization issues in headless environments
@@ -726,29 +730,80 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
     # Take first item in batch
     idx = 0
 
-    # Create figure with 3 rows: GT/Rendered/Diff, and 6 Gaussian xyz views
-    fig = plt.figure(figsize=(30, 15))
-
-    # Row 1: GT images (3 columns for different time steps)
-    # Row 2: Rendered/Diff (3 columns)
-    # Row 3: Gaussian xyz positions (6 different views)
-
-    # Create grid: 3 rows, 6 columns
-    gs = fig.add_gridspec(3, 6, hspace=0.3, wspace=0.3)
-    # Create grid: 3 rows, 6 columns
-    gs = fig.add_gridspec(3, 6, hspace=0.3, wspace=0.3)
+    # Create figure with 2 rows x 3 columns:
+    # Row 1: GT t-2, GT t-1, GT t
+    # Row 2: GT t+1, Rendered t+1, Diff
+    fig = plt.figure(figsize=(18, 12))
+    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
 
     with torch.no_grad():
-        # Row 1 & 2: Rendering comparison (use first 3 columns)
+        # Process temporal sequence + rendering comparison
         for i, view_name in enumerate(view_names):
             if i >= 1:  # Only show first view to save space
                 break
 
-            # 1. Render
-            # Re-construct raster settings for single item
+            # Find matching key in temporal_frames
+            temporal_key = None
+            if temporal_frames:
+                # Try to match view_name with keys in temporal_frames
+                # view_name could be "agent" or "wrist"
+                # keys could be "base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb", etc.
+                for k in temporal_frames.keys():
+                    if view_name == "agent" and ("base" in k or "high" in k or "exterior" in k):
+                        temporal_key = k
+                        break
+                    elif view_name == "wrist" and "wrist" in k:
+                        temporal_key = k
+                        break
+                    elif view_name in k:
+                        temporal_key = k
+                        break
+                
+                # If still not found, just use the first available key
+                if not temporal_key and temporal_frames:
+                    temporal_key = next(iter(temporal_frames.keys()))
+                    print(f"[Viz] Using first available key: {temporal_key} for view {view_name}")
+
+            # Display 4 frames: [t-2, t-1, t, t+1]
+            # Row 1: GT t-2, GT t-1, GT t (columns 0, 1, 2)
+            # Row 2: GT t+1, Rendered t+1, Diff (columns 0, 1, 2)
+            if temporal_key and temporal_key in temporal_frames:
+                frames = temporal_frames[temporal_key][idx]  # [4, H, W, C] for [t-2, t-1, t, t+1]
+                
+                # Row 1: Display first 3 frames (t-2, t-1, t)
+                for t_idx in range(3):
+                    if t_idx < frames.shape[0]:
+                        frame = frames[t_idx]  # [H, W, C]
+                        frame_np = frame.detach().cpu().numpy()
+                        # Normalize from [-1, 1] to [0, 1]
+                        frame_viz = np.clip((frame_np + 1.0) / 2.0, 0, 1)
+
+                        ax = fig.add_subplot(gs[0, t_idx])
+                        ax.imshow(frame_viz)
+                        ax.set_title(f"GT t-{2-t_idx}", fontsize=14)
+                        ax.axis('off')
+                
+                # Row 2, Column 0: Display 4th frame (t+1)
+                if frames.shape[0] >= 4:
+                    frame_t1 = frames[3]  # [H, W, C]
+                    frame_t1_np = frame_t1.detach().cpu().numpy()
+                    frame_t1_viz = np.clip((frame_t1_np + 1.0) / 2.0, 0, 1)
+
+                    ax_gt_t1 = fig.add_subplot(gs[1, 0])
+                    ax_gt_t1.imshow(frame_t1_viz)
+                    ax_gt_t1.set_title(f"GT t+1", fontsize=14)
+                    ax_gt_t1.axis('off')
+            else:
+                # If no temporal frames, show placeholder
+                for row in range(2):
+                    for col in range(3 if row == 0 else 1):
+                        ax = fig.add_subplot(gs[row, col])
+                        ax.text(0.5, 0.5, 'No temporal data', ha='center', va='center', fontsize=12)
+                        ax.axis('off')
+
+            # Row 2, Column 1: Render t+1
             cam_params = {k: v[idx:idx+1] if isinstance(v, torch.Tensor) else v for k, v in cam_params_dict[view_name].items()}
 
-            # Single item slice for gaussians
             params_single = {
                "xyz": gaussian_params["xyz"][idx:idx+1],
                "sh": gaussian_params["sh"][idx:idx+1],
@@ -757,160 +812,39 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
                "rotations": gaussian_params["rotations"][idx:idx+1]
             }
 
-            rendered_img = renderer(params_single, cam_params) # [1, 3, H, W]
-            rendered_img = rendered_img.float() # Ensure float for plotting
-
-            rendered_np = rendered_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() # [H, W, 3]
-            print(f"[Viz] Rendered {view_name} range: min={rendered_np.min():.4f}, max={rendered_np.max():.4f}, mean={rendered_np.mean():.4f}")
-
-            # Debug: Check if rendering is all zeros or very small
-            if rendered_np.max() < 1e-6:
-                print(f"[Viz] WARNING: Rendered image is all zeros or very small (max={rendered_np.max():.6f})!")
-                print(f"[Viz] This suggests: 1) Scale values too small, 2) Opacity too small, 3) SH coefficients wrong, or 4) 3D positions wrong")
-
-            # Direct clamp to [0,1] — no min-max normalization
-            # Rendered image from SH should already be in ~[0,1] range (SH_C0 * sh + 0.5)
+            rendered_img = renderer(params_single, cam_params)  # [1, 3, H, W]
+            rendered_img = rendered_img.float()
+            rendered_np = rendered_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()  # [H, W, 3]
             rendered_viz = np.clip(rendered_np, 0, 1)
 
-            # 2. GT Image
-            gt_img = target_obs[f"{view_name}_image"][idx] # [3, H, W]
-            gt_img = gt_img.float()
-
-            gt_np = gt_img.permute(1, 2, 0).detach().cpu().numpy()
-
-            # Direct clamp — GT is already in [0,1] after (img+1)/2
-            gt_viz = np.clip(gt_np, 0, 1)
-
-            # 3. Difference (on actual pixel values, not normalized)
-            diff_np = np.abs(rendered_viz - gt_viz)
-
-            # Plot in first row (columns 0, 1, 2)
-            ax_gt = fig.add_subplot(gs[0, 0])
-            ax_gt.imshow(gt_viz)
-            ax_gt.set_title(f"{view_name} GT", fontsize=14)
-            ax_gt.axis('off')
-
-            ax_rendered = fig.add_subplot(gs[0, 1])
+            ax_rendered = fig.add_subplot(gs[1, 1])
             ax_rendered.imshow(rendered_viz)
-            ax_rendered.set_title(f"{view_name} Rendered", fontsize=14)
+            ax_rendered.set_title(f"Rendered t+1", fontsize=14)
             ax_rendered.axis('off')
 
-            ax_diff = fig.add_subplot(gs[0, 2])
+            # Row 2, Column 2: Difference
+            # Get GT t+1 for comparison
+            gt_img = target_obs[f"{view_name}_image"][idx]  # [3, H, W]
+            gt_img = gt_img.float()
+            gt_np = gt_img.permute(1, 2, 0).detach().cpu().numpy()
+            gt_viz = np.clip(gt_np, 0, 1)
+            
+            diff_np = np.abs(rendered_viz - gt_viz)
+
+            ax_diff = fig.add_subplot(gs[1, 2])
             ax_diff.imshow(diff_np)
-            ax_diff.set_title(f"{view_name} Diff", fontsize=14)
+            ax_diff.set_title(f"Diff", fontsize=14)
             ax_diff.axis('off')
 
-        # Row 3: Gaussian xyz positions (6 different views)
-        xyz = gaussian_params["xyz"][idx].detach().cpu().numpy()  # [N, 3]
-        opacity = gaussian_params["opacity"][idx].detach().cpu().numpy()  # [N, 1]
+            print(f"[Viz] Rendered {view_name} range: min={rendered_np.min():.4f}, max={rendered_np.max():.4f}, mean={rendered_np.mean():.4f}")
+            if rendered_np.max() < 1e-6:
+                print(f"[Viz] WARNING: Rendered image is all zeros or very small (max={rendered_np.max():.6f})!")
 
-        # Filter by opacity for better visualization
-        opacity_threshold = 0.1
-        mask = opacity.squeeze() > opacity_threshold
-        xyz_filtered = xyz[mask]
-
-        print(f"[Viz] Gaussian points: {xyz.shape[0]} total, {xyz_filtered.shape[0]} with opacity > {opacity_threshold}")
-
-        # Subsample if too many points
-        max_points = 5000
-        if xyz_filtered.shape[0] > max_points:
-            indices = np.random.choice(xyz_filtered.shape[0], max_points, replace=False)
-            xyz_filtered = xyz_filtered[indices]
-
-        # Define 6 different viewpoints
-        views = [
-            {'elev': 30, 'azim': 45, 'title': 'View 1 (Front-Right)'},
-            {'elev': 30, 'azim': 135, 'title': 'View 2 (Back-Right)'},
-            {'elev': 30, 'azim': 225, 'title': 'View 3 (Back-Left)'},
-            {'elev': 30, 'azim': 315, 'title': 'View 4 (Front-Left)'},
-            {'elev': 90, 'azim': 0, 'title': 'View 5 (Top)'},
-            {'elev': 0, 'azim': 0, 'title': 'View 6 (Side)'},
-        ]
-
-        for col, view in enumerate(views):
-            ax = fig.add_subplot(gs[2, col], projection='3d')
-
-            # Plot points
-            ax.scatter(xyz_filtered[:, 0], xyz_filtered[:, 1], xyz_filtered[:, 2],
-                      c=xyz_filtered[:, 2], cmap='viridis', s=1, alpha=0.6)
-
-            # Set viewpoint
-            ax.view_init(elev=view['elev'], azim=view['azim'])
-
-            # Labels and title
-            ax.set_xlabel('X', fontsize=10)
-            ax.set_ylabel('Y', fontsize=10)
-            ax.set_zlabel('Z', fontsize=10)
-            ax.set_title(view['title'], fontsize=12)
-
-            # Set equal aspect ratio
-            max_range = np.array([xyz_filtered[:, 0].max()-xyz_filtered[:, 0].min(),
-                                 xyz_filtered[:, 1].max()-xyz_filtered[:, 1].min(),
-                                 xyz_filtered[:, 2].max()-xyz_filtered[:, 2].min()]).max() / 2.0
-
-            mid_x = (xyz_filtered[:, 0].max()+xyz_filtered[:, 0].min()) * 0.5
-            mid_y = (xyz_filtered[:, 1].max()+xyz_filtered[:, 1].min()) * 0.5
-            mid_z = (xyz_filtered[:, 2].max()+xyz_filtered[:, 2].min()) * 0.5
-
-            ax.set_xlim(mid_x - max_range, mid_x + max_range)
-            ax.set_ylim(mid_y - max_range, mid_y + max_range)
-            ax.set_zlim(mid_z - max_range, mid_z + max_range)
-
-    # Include time suffix in filename to identify t vs t+1
+    # Save visualization
     if time_suffix:
         save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}.png")
-        html_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}_interactive.html")
     else:
         save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}.png")
-        html_path = os.path.join(save_dir, f"render_viz_step_{step:06d}_interactive.html")
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f"Saved Rendering Visualization with Gaussian xyz to {save_path}")
-
-    # Create interactive 3D visualization with Plotly
-    try:
-        import plotly.graph_objects as go
-
-        # Create interactive 3D scatter plot
-        fig_interactive = go.Figure(data=[go.Scatter3d(
-            x=xyz_filtered[:, 0],
-            y=xyz_filtered[:, 1],
-            z=xyz_filtered[:, 2],
-            mode='markers',
-            marker=dict(
-                size=2,
-                color=xyz_filtered[:, 2],  # Color by Z (depth)
-                colorscale='Viridis',
-                showscale=True,
-                colorbar=dict(title="Z (Depth)"),
-                opacity=0.6
-            ),
-            text=[f'X: {x:.2f}<br>Y: {y:.2f}<br>Z: {z:.2f}'
-                  for x, y, z in xyz_filtered],
-            hovertemplate='%{text}<extra></extra>'
-        )])
-
-        # Update layout
-        fig_interactive.update_layout(
-            title=f'Gaussian Point Cloud - Step {step}{time_suffix}',
-            scene=dict(
-                xaxis_title='X',
-                yaxis_title='Y',
-                zaxis_title='Z (Depth)',
-                aspectmode='data',
-                camera=dict(
-                    eye=dict(x=1.5, y=1.5, z=1.5)
-                )
-            ),
-            width=1200,
-            height=800,
-            hovermode='closest'
-        )
-
-        # Save as HTML
-        fig_interactive.write_html(html_path)
-        print(f"Saved Interactive 3D Visualization to {html_path}")
-
-    except ImportError:
-        print("Plotly not installed. Skipping interactive visualization. Install with: pip install plotly")
-
+    print(f"Saved Rendering Visualization to {save_path}")

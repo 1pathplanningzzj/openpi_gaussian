@@ -333,13 +333,13 @@ CUDA_VISIBLE_DEVICES=0 nohup uv run --active scripts/train_pytorch.py pi05_liber
 
 
 # 首次训练（从头开始）
-CUDA_VISIBLE_DEVICES=0,1 nohup uv_venv/bin/torchrun \
+CUDA_VISIBLE_DEVICES=1,2,3,4 nohup uv_venv/bin/torchrun \
     --standalone \
     --nnodes=1 \
     --nproc_per_node=4 \
     scripts/train_pytorch.py pi05_libero \
-    --exp_name gaussian_world_model_exp0211 \
-    --checkpoint_base_dir /data/zijianzhang/train_ckpts > training_exp0211_ddp.log 2>&1 &
+    --exp_name gaussian_world_model_exp0307 \
+    --checkpoint_base_dir /data/zijianzhang/train_ckpts > training_exp0307_ddp.log 2>&1 &
 
 # 从 checkpoint 恢复训练（添加 --resume 参数）
 CUDA_VISIBLE_DEVICES=0,1,2,3 nohup uv_venv/bin/torchrun \
@@ -347,6 +347,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 nohup uv_venv/bin/torchrun \
     --nnodes=1 \
     --nproc_per_node=4 \
     scripts/train_pytorch.py pi05_libero \
-    --exp_name gaussian_world_model_exp0129 \
+    --exp_name gaussian_world_model_exp0224 \
     --checkpoint_base_dir /data/zijianzhang/train_ckpts \
-    --resume > training_exp0129_ddp.log 2>&1 &
+    --resume > training_exp0224_ddp.log 2>&1 &

@@ -124,7 +124,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test1")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test4")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -148,19 +148,47 @@ class PI0Pytorch(nn.Module):
         # Add future query tokens to prefix for unified VLM processing
         self.use_world_tokens_in_prefix = getattr(config, "use_world_model", False) and use_gaussian
         if self.use_world_tokens_in_prefix:
+            # === Priority 1: Aligned Future Query Tokens ===
             # 256 future query tokens (matches 16×16 decoder grid)
             self.future_token_count = 256
+            self.future_grid_size = 16  # 16×16 spatial structure
 
-            # World tokens removed — redundant with Gaussian tokens (300)
+            # World tokens removed — redundant with Gaussian tokens (768)
             self.world_token_count = 0
             self.world_token_proj = None
 
             # Future query tokens: learnable embeddings predicted by VLM
+            # Initialize with spatial structure awareness
             self.future_query_tokens = nn.Parameter(
                 torch.randn(1, self.future_token_count, paligemma_config.width) * 0.02
             )
 
-            logging.info(f"Initialized future query tokens: {self.future_token_count} (coupled mask)")
+            # === NEW: Spatial Positional Encoding (16×16 grid) ===
+            # This gives Future tokens explicit spatial structure
+            # matching the decoder's 16×16 input grid
+            self.future_spatial_pos = nn.Parameter(
+                torch.randn(self.future_grid_size, self.future_grid_size, paligemma_config.width) * 0.02
+            )
+
+            # Optional: Sinusoidal spatial encoding (more stable)
+            self.use_sinusoidal_spatial = True
+            if self.use_sinusoidal_spatial:
+                self.register_buffer(
+                    'future_spatial_sinusoidal',
+                    self._create_2d_sinusoidal_encoding(
+                        self.future_grid_size,
+                        self.future_grid_size,
+                        paligemma_config.width
+                    )
+                )
+
+            logging.info(
+                f"Initialized aligned future query tokens:\n"
+                f"  - Token count: {self.future_token_count}\n"
+                f"  - Spatial structure: {self.future_grid_size}×{self.future_grid_size}\n"
+                f"  - Spatial positional encoding: {'Sinusoidal + Learnable' if self.use_sinusoidal_spatial else 'Learnable only'}\n"
+                f"  - Aligned with VGGT tokens: 768 (3 frames × 256 tokens/frame)"
+            )
         else:
             self.world_token_count = 0
             self.future_token_count = 0
@@ -197,10 +225,10 @@ class PI0Pytorch(nn.Module):
                 input_num_tokens=256,
             )
 
-            # Initialize Gaussian Renderer (sh_degree=0 for DC-only RGB)
+            # Initialize Gaussian Renderer (sh_degree=1 for DC + 1st order SH)
             try:
-                self.gaussian_renderer = GaussianRenderer(image_size=224, sh_degree=0, scale_factor=1.0)
-                logging.info("Gaussian Renderer initialized for World Model supervision.")
+                self.gaussian_renderer = GaussianRenderer(image_size=224, sh_degree=1, scale_factor=1.0)
+                logging.info("Gaussian Renderer initialized with sh_degree=1 (DC + 1st order) for World Model supervision.")
             except ImportError:
                 self.gaussian_renderer = None
                 logging.warning("Gaussian Renderer not available. Skipping rendering loss.")
@@ -209,7 +237,7 @@ class PI0Pytorch(nn.Module):
             self.gaussian_renderer = None
 
         # Initialize render loss weight (can be changed dynamically for staged training)
-        self.render_loss_weight = getattr(config, "render_loss_weight", 0.1)
+        self.render_loss_weight = getattr(config, "render_loss_weight", 0.5)  # 从0.1改为0.5，增强render loss的影响
         # -------------------------------
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
@@ -279,6 +307,43 @@ class PI0Pytorch(nn.Module):
                 func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
             )
         return func(*args, **kwargs)
+
+
+    def _create_2d_sinusoidal_encoding(self, height, width, embed_dim):
+        """Create 2D sinusoidal positional encoding for spatial grid.
+
+        Args:
+            height: Grid height (e.g., 16)
+            width: Grid width (e.g., 16)
+            embed_dim: Embedding dimension
+
+        Returns:
+            [height, width, embed_dim] - 2D positional encoding
+        """
+        # Create position indices
+        y_pos = torch.arange(height).unsqueeze(1).float()  # [H, 1]
+        x_pos = torch.arange(width).unsqueeze(0).float()   # [1, W]
+
+        # Expand to grid
+        y_grid = y_pos.expand(height, width)  # [H, W]
+        x_grid = x_pos.expand(height, width)  # [H, W]
+
+        # Frequency bands
+        half_dim = embed_dim // 4  # Split embed_dim into 4 parts (y_sin, y_cos, x_sin, x_cos)
+        div_term = torch.exp(torch.arange(0, half_dim).float() * -(math.log(10000.0) / half_dim))
+
+        # Compute sinusoidal encoding for y and x
+        pe = torch.zeros(height, width, embed_dim)
+
+        # Y position encoding (first half of embed_dim)
+        pe[:, :, 0:half_dim] = torch.sin(y_grid.unsqueeze(-1) * div_term)
+        pe[:, :, half_dim:2*half_dim] = torch.cos(y_grid.unsqueeze(-1) * div_term)
+
+        # X position encoding (second half of embed_dim)
+        pe[:, :, 2*half_dim:3*half_dim] = torch.sin(x_grid.unsqueeze(-1) * div_term)
+        pe[:, :, 3*half_dim:4*half_dim] = torch.cos(x_grid.unsqueeze(-1) * div_term)
+
+        return pe
 
     def _prepare_attention_masks_4d(self, att_2d_masks):
         """Helper method to prepare 4D attention masks for transformer."""
@@ -589,11 +654,26 @@ class PI0Pytorch(nn.Module):
             # World tokens can attend to all previous tokens (images, language, gaussian)
             att_masks += [0] * self.world_token_count
         
-        # --- Add Future Query Tokens (Coupled Mask) ---
+        # --- Add Future Query Tokens (Coupled Mask) with Spatial Positional Encoding ---
         if self.use_world_tokens_in_prefix and self.future_query_tokens is not None:
             B = pad_masks[0].shape[0] if pad_masks else 1
             device = pad_masks[0].device if pad_masks else next(self.parameters()).device
+
+            # 1. Expand future query tokens to batch
             future_tokens = self.future_query_tokens.expand(B, -1, -1)  # [B, 256, D]
+
+            # 2. Add spatial positional encoding (16×16 grid structure)
+            # Reshape spatial pos: [16, 16, D] -> [256, D]
+            spatial_pos = self.future_spatial_pos.reshape(1, self.future_token_count, -1)  # [1, 256, D]
+
+            # Add sinusoidal encoding if enabled
+            if hasattr(self, 'use_sinusoidal_spatial') and self.use_sinusoidal_spatial:
+                sinusoidal_pos = self.future_spatial_sinusoidal.reshape(1, self.future_token_count, -1)  # [1, 256, D]
+                spatial_pos = spatial_pos + sinusoidal_pos
+
+            # Add spatial positional encoding to future tokens
+            future_tokens = future_tokens + spatial_pos  # [B, 256, D]
+
             future_mask = torch.ones(B, self.future_token_count, dtype=torch.bool, device=device)
 
             embs.append(future_tokens)
@@ -843,11 +923,11 @@ class PI0Pytorch(nn.Module):
         
         return total_loss
 
-    def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names, time_suffix=""):
+    def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names, time_suffix="", temporal_frames=None):
         """Helper to visualize Rendered vs GT images. Delegated to GaussianRenderer."""
         # Cleanly moved to gaussian_renderer.py
         from openpi.models_pytorch.gaussian_renderer import visualize_rendering_comparison
-        
+
         visualize_rendering_comparison(
             step,
             gaussian_params,
@@ -856,7 +936,8 @@ class PI0Pytorch(nn.Module):
             self.gaussian_renderer,
             view_names,
             save_dir=self.vis_save_dir,
-            time_suffix=time_suffix
+            time_suffix=time_suffix,
+            temporal_frames=temporal_frames
         )
 
     def forward(self, observation, actions, noise=None, time=None, step=None) -> Tensor:
@@ -954,7 +1035,7 @@ class PI0Pytorch(nn.Module):
             future_end = future_start + segment_lengths['future']
             z_t1_pred_tokens = prefix_out[:, future_start:future_end, :]  # [B, future_token_count, D]
             
-            if step is not None and step % 40 == 0:
+            if step is not None and step % 100 == 0:
                 print(f"[DEBUG] Extracted future tokens: shape={z_t1_pred_tokens.shape}, "
                       f"start={future_start}, end={future_end}, segment_lengths={segment_lengths}")
 
@@ -1035,7 +1116,7 @@ class PI0Pytorch(nn.Module):
                             step=step,
                             depth_map=depth_map,
                             lambda_scale=0.001,
-                            lambda_opacity=0.001,
+                            lambda_opacity=0.01,  # 增大10倍: 0.001 → 0.01 (防止opacity过大导致模糊)
                             lambda_edge_smooth=0.01,
                         )
                         # Use dynamic render_loss_weight (can be changed for staged training)
@@ -1049,11 +1130,11 @@ class PI0Pytorch(nn.Module):
                             # L2 regularization: penalize SH DC deviating from 0 (neutral gray)
                             sh_dc_reg = (sh_dc ** 2).mean() * 0.01  # Small weight to avoid over-constraining
                             loss = loss + sh_dc_reg
-                            if step is not None and step % 40 == 0:
+                            if step is not None and step % 100 == 0:
                                 logging.info(f"Step {step}: SH DC Reg = {sh_dc_reg.item():.6f}, SH DC mean = {sh_dc.mean().item():.6f}")
 
                         # Periodic logging + visualization
-                        should_log = step is not None and step % 40 == 0
+                        should_log = step is not None and step % 100 == 0
                         if should_log:
                             loss_parts = ", ".join(f"{k}={v.item():.6f}" for k, v in render_loss_dict.items())
                             logging.info(f"Step {step}: Render Loss = {render_loss.item():.4f}, weight={self.render_loss_weight}, breakdown: {loss_parts}")
@@ -1061,13 +1142,24 @@ class PI0Pytorch(nn.Module):
                         if should_log and is_main_process:
                             with torch.no_grad():
                                 try:
+                                    # Extract temporal frames from preprocessed_observation
+                                    # Expected: 4 consecutive frames [t-2, t-1, t, t+1]
+                                    temporal_frames = {}
+                                    if hasattr(preprocessed_observation, 'images'):
+                                        for k, v in preprocessed_observation.images.items():
+                                            # v shape: [B, T, H, W, C] where T=4 for [t-2, t-1, t, t+1]
+                                            if v.ndim == 5 and v.shape[1] == 4:  # Has 4 temporal frames
+                                                temporal_frames[k] = v  # Keep all 4 frames [B, 4, H, W, C]
+                                                logging.info(f"[Viz] Extracted {k} with shape {v.shape}")
+
                                     self._visualize_rendering_comparison(
                                         step,
                                         gaussian_params,
                                         target_obs,
                                         cam_params_dict,
                                         view_names=render_views,
-                                        time_suffix="_t1_pred_vlm"
+                                        time_suffix="_t1_pred_vlm",
+                                        temporal_frames=temporal_frames
                                     )
                                 except Exception as viz_e:
                                     logging.warning(f"Step {step}: Visualization failed: {viz_e}")

@@ -811,7 +811,7 @@ _CONFIGS = [
             extra_delta_transform=False,
         ),
         # batch_size=256,
-        batch_size=8,  # Reduced from 16 to save GPU memory (OOM with world model + rendering)
+        batch_size=4,  # Reduced from 8 to save GPU memory (OOM with world model + rendering + multi-scale features)
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,

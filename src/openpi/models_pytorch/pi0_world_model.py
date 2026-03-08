@@ -72,46 +72,58 @@ class _FeatureFusionBlock(nn.Module):
 class IndependentGaussianHead(nn.Module):
     """
     Decodes VLM future tokens [B, 256, D] directly to dense Gaussian parameter maps.
-    
+
     Architecture: DPT-style multi-scale feature fusion + image feature fusion.
-    - Multi-scale features: 16×16 → 32×32 → 64×64 → 128×128
+    - Multi-scale features: 16×16 → 32×32 → 64×64 → 128×128 → 256×256
     - Image feature fusion: Residual connection with input image features
-    Output: rot(4) + scale(3) + opacity(1) + RGB(3) + depth_delta(1) = 12 channels
+    - Output: rot(4) + scale(3) + opacity(1) + SH(9) = 17 channels
+    - SH(9): DC(3) + 1st order(6) for view-dependent appearance
+
+    Reference: AD-FFgsStudio architecture (without depth prediction)
     """
 
-    def __init__(self, token_dim: int = 2048, grid_size: int = 16, 
+    def __init__(self, token_dim: int = 2048, grid_size: int = 16,
                  use_image_fusion: bool = True, img_dim: int = 3):
         super().__init__()
         self.grid_size = grid_size
         self.use_image_fusion = use_image_fusion
-        out_ch = 4 + 3 + 1 + 3 + 1  # rot + scale + opacity + RGB + depth_delta
-        
+
+        # Output channels: rot(4) + scale(3) + opacity(1) + SH(9)
+        # SH(9) = DC(3) + 1st order(6) for basic view-dependent effects
+        out_ch = 4 + 3 + 1 + 9
+
         # Multi-scale feature extraction (DPT-style)
         # Layer 1: 16×16 → 32×32
         self.layer1 = _UpsampleBlock(token_dim, 512)
-        
+
         # Layer 2: 32×32 → 64×64
         self.layer2 = _UpsampleBlock(512, 256)
-        
+
         # Layer 3: 64×64 → 128×128
         self.layer3 = _UpsampleBlock(256, 128)
-        
-        # DPT-style feature fusion blocks
-        # All fusion blocks output 128 channels for consistency
+
+        # Layer 4: 128×128 → 256×256 (NEW: higher resolution)
+        self.layer4 = _UpsampleBlock(128, 128)
+
+        # DPT-style feature fusion blocks (4 layers now)
+        # All fusion blocks expect 128 channels for both input and residual
         self.fusion1 = _FeatureFusionBlock(128, has_residual=False)  # Final layer
-        # Project residual features to 128 channels before fusion
-        self.fusion2_proj = nn.Conv2d(256, 128, 1)  # Project layer2 (256) → 128
-        self.fusion2 = _FeatureFusionBlock(128, has_residual=True)   # Fuse layer2
-        self.fusion3_proj = nn.Conv2d(512, 128, 1)  # Project layer1 (512) → 128
-        self.fusion3 = _FeatureFusionBlock(128, has_residual=True)   # Fuse layer1
-        
+        self.fusion2 = _FeatureFusionBlock(128, has_residual=True)   # Fuse layer3 (128 ch)
+        self.fusion3 = _FeatureFusionBlock(128, has_residual=True)   # Fuse layer2 (256 ch)
+        self.fusion4 = _FeatureFusionBlock(128, has_residual=True)   # Fuse layer1 (512 ch)
+
+        # Projection layers to unify channel dimensions to 128
+        # Required because layer2 has 256 channels and layer1 has 512 channels
+        self.proj_feat2 = nn.Conv2d(256, 128, 1)  # Project layer2: 256 → 128
+        self.proj_feat1 = nn.Conv2d(512, 128, 1)  # Project layer1: 512 → 128
+
         # Image feature fusion (if enabled)
         if use_image_fusion:
             self.img_merger = nn.Sequential(
                 nn.Conv2d(img_dim, 128, 7, padding=3),
                 nn.GELU(),
             )
-        
+
         # Final projection to output channels
         self.head = nn.Conv2d(128, out_ch, 3, padding=1)
 
@@ -120,43 +132,53 @@ class IndependentGaussianHead(nn.Module):
         nn.init.xavier_uniform_(self.head.weight, gain=0.01)
         nn.init.zeros_(self.head.bias)
 
+        # SH mask for attenuating higher-order coefficients (following AD-FFgsStudio)
+        # DC (degree 0): weight = 1.0
+        # 1st order (degree 1): weight = 0.1 * 0.25 = 0.025
+        self.register_buffer(
+            "sh_mask",
+            torch.tensor([1.0, 1.0, 1.0,  # DC (3 coefficients)
+                         0.025, 0.025, 0.025, 0.025, 0.025, 0.025],  # 1st order (6 coefficients)
+                        dtype=torch.float32),
+            persistent=False,
+        )
+
     def forward(self, tokens: torch.Tensor, images: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             tokens: [B, 256, D] VLM future tokens
             images: [B, 3, H, W] Optional input images for feature fusion
         Returns:
-            [B, 12, 128, 128] raw Gaussian parameter maps
+            [B, 17, 256, 256] raw Gaussian parameter maps
+            - rot(4) + scale(3) + opacity(1) + SH(9)
         """
         B, N, D = tokens.shape
         g = self.grid_size
         x = tokens.permute(0, 2, 1).reshape(B, D, g, g)  # [B, D, 16, 16]
-        
-        # Multi-scale feature extraction
+
+        # Multi-scale feature extraction (4 layers)
         feat1 = self.layer1(x)      # [B, 512, 32, 32]
         feat2 = self.layer2(feat1)  # [B, 256, 64, 64]
         feat3 = self.layer3(feat2)  # [B, 128, 128, 128]
-        
-        # DPT-style feature fusion (bottom-up)
+        feat4 = self.layer4(feat3)  # [B, 128, 256, 256]
+
+        # DPT-style feature fusion (bottom-up, 4 layers)
         # Start from deepest layer and fuse with shallower layers
-        fused = self.fusion1(feat3)                    # [B, 128, 128, 128]
-        # Fuse with layer2: project to 128 channels first
-        feat2_proj = self.fusion2_proj(feat2)         # [B, 256, 64, 64] → [B, 128, 64, 64]
-        fused = self.fusion2(fused, residual=feat2_proj)  # [B, 128, 128, 128]
-        # Fuse with layer1: project to 128 channels first
-        feat1_proj = self.fusion3_proj(feat1)         # [B, 512, 32, 32] → [B, 128, 32, 32]
-        fused = self.fusion3(fused, residual=feat1_proj)  # [B, 128, 128, 128]
-        
+        fused = self.fusion1(feat4)                              # [B, 128, 256, 256]
+        fused = self.fusion2(fused, residual=feat3)              # [B, 128, 256, 256] feat3: 128 ch
+        fused = self.fusion3(fused, residual=self.proj_feat2(feat2))  # [B, 128, 256, 256] feat2: 256→128
+        fused = self.fusion4(fused, residual=self.proj_feat1(feat1))  # [B, 128, 256, 256] feat1: 512→128
+
         # Image feature fusion (residual connection)
         if self.use_image_fusion and images is not None:
-            # Ensure images are at correct resolution
+            # Ensure images are at correct resolution (256×256)
             if images.shape[2:] != fused.shape[2:]:
                 images = F.interpolate(images, size=fused.shape[2:], mode='bilinear', align_corners=True)
-            img_feat = self.img_merger(images)  # [B, 128, 128, 128]
+            img_feat = self.img_merger(images)  # [B, 128, 256, 256]
             fused = fused + img_feat  # Residual connection
-        
+
         # Final projection
-        x = self.head(fused)  # [B, 12, 128, 128]
+        x = self.head(fused)  # [B, 17, 256, 256]
         return x
 
 
@@ -302,61 +324,64 @@ class GaussianDecoder(nn.Module):
                 _bs, _p, _c = aggregated_tokens_list[i].shape
                 aggregated_tokens_list[i] = aggregated_tokens_list[i].view(B_vggt, S_vggt, _p, _c)
 
-        # 3. Depth from unmodified VGGT features (trainable depth head)
-        # Use AD-FFgsStudio style depth normalization: sigmoid(log(depth)) for stability
-        depth_maps, _ = gaussian_adapter.encoder.depth_head(
+        # 3. Depth from VGGT depth head (following AD-FFgsStudio)
+        # Use sigmoid(log(depth)) for stable depth normalization
+        depth_maps, depth_conf = gaussian_adapter.encoder.depth_head(
             aggregated_tokens_list, images=vggt_inputs, patch_start_idx=patch_start_idx
         )
         # AD-FFgsStudio style: sigmoid(log(depth)) ensures positive depth values
-        depth_maps = torch.sigmoid(torch.log(depth_maps))
+        depth_maps = torch.sigmoid(torch.log(depth_maps + 1e-6))  # Add epsilon for numerical stability
         min_depth = gaussian_adapter.encoder.min_depth
         max_depth = gaussian_adapter.encoder.max_depth
         depth_maps = min_depth + (max_depth - min_depth) * depth_maps  # [B, S, H, W, 1]
 
-        # 4. Independent decoder: VLM tokens → Gaussian params (RGB) + depth_delta
-        # Extract current frame image for feature fusion
+        # 4. Independent decoder: VLM tokens → Gaussian params (17 channels, no depth)
+        # Extract current frame image for residual feature fusion
         frame_idx = S_vggt - 1
         current_frame_img = vggt_inputs[:, frame_idx]  # [B, 3, H_vggt, W_vggt]
-        # Resize to decoder resolution if needed (will be handled inside gaussian_head)
-        raw = self.gaussian_head(z, images=current_frame_img)  # [B, 12, 128, 128]
-        rot_raw, scale_raw, opa_raw, rgb_raw, depth_delta = raw.split(
-            [4, 3, 1, 3, 1], dim=1
-        )
 
-        # 5. Combine depth: base (VGGT, t-time) + delta (predicted motion)
+        # Decode to 256×256 resolution with 17 channels
+        raw = self.gaussian_head(z, images=current_frame_img)  # [B, 17, 256, 256]
+        rot_raw, scale_raw, opa_raw, sh_raw = raw.split([4, 3, 1, 9], dim=1)
+
+        # 5. Use VGGT depth directly (no delta prediction)
+        # Extract depth for current frame and resize to decoder resolution
         frame_idx = S_vggt - 1
-        base_depth = depth_maps[:, frame_idx, :, :, 0]  # [B, H_vggt, W_vggt]
-        H_dec, W_dec = raw.shape[2], raw.shape[3]
-        base_depth_resized = F.interpolate(
-            base_depth.unsqueeze(1), size=(H_dec, W_dec), mode="bilinear", align_corners=False
-        ).squeeze(1)  # [B, H_dec, W_dec]
-        depth_delta_2d = depth_delta.squeeze(1)  # [B, H_dec, W_dec]
-        final_depth = base_depth_resized + depth_delta_2d
-        
+        final_depth = depth_maps[:, frame_idx, :, :, 0]  # [B, H_vggt, W_vggt]
+        H_dec, W_dec = raw.shape[2], raw.shape[3]  # 256, 256
+        final_depth = F.interpolate(
+            final_depth.unsqueeze(1), size=(H_dec, W_dec), mode="bilinear", align_corners=False
+        ).squeeze(1)  # [B, 256, 256]
+
         # 6. Activations
         B = z.shape[0]
+
+        # Rotation: normalize quaternions
         rot_maps = rot_raw.permute(0, 2, 3, 1)  # [B, H, W, 4]
         rot_maps = rot_maps / (rot_maps.norm(dim=-1, keepdim=True) + 1e-8)
-        scale_maps = F.softplus(scale_raw.permute(0, 2, 3, 1), beta=1)  # [B, H, W, 3]
+
+        # Scale: softplus for positive values (following AD-FFgsStudio)
+        # Changed from 0.001 to 0.01 to improve rendering quality (larger Gaussians)
+        scale_maps = F.softplus(scale_raw.permute(0, 2, 3, 1), beta=1) * 0.01  # [B, H, W, 3]
+
+        # Opacity: sigmoid to [0, 1]
         opacity_maps = torch.sigmoid(opa_raw.permute(0, 2, 3, 1))  # [B, H, W, 1]
-        # RGB: Directly predict SH DC coefficients (more stable than RGB → SH DC conversion)
-        # Renderer computes: color = SH_C0 * sh_dc + 0.5
-        # We predict sh_dc directly, which allows for both positive (bright) and negative (dark) values
-        # But we initialize to output neutral gray (sh_dc ≈ 0) by default
-        SH_C0 = 0.28209479177387814
-        # Option 1: Direct SH DC prediction (tanh → [-1, 1] range, then scale)
-        # This gives us control over brightness: sh_dc = 0 → color = 0.5 (neutral gray)
-        sh_dc = torch.tanh(rgb_raw.permute(0, 2, 3, 1)) * 2.0  # [B, H, W, 3], range [-2, 2]
-        # Clamp to reasonable range to avoid extreme colors
-        sh_dc = torch.clamp(sh_dc, min=-1.5, max=1.5)
-        
-        # For visualization/debugging: convert back to RGB
-        rgb_maps = SH_C0 * sh_dc + 0.5  # [B, H, W, 3], range [0, 1]
-        rgb_maps = torch.clamp(rgb_maps, min=0.0, max=1.0)
+
+        # Spherical Harmonics: 9 coefficients (DC + 1st order)
+        # Reshape to [B, H, W, 9] and apply SH mask (following AD-FFgsStudio)
+        sh_maps = sh_raw.permute(0, 2, 3, 1)  # [B, H, W, 9]
+        sh_mask = self.gaussian_head.sh_mask.view(1, 1, 1, 9)  # [1, 1, 1, 9]
+        sh_maps = sh_maps * sh_mask  # Attenuate higher-order coefficients
+
+        # Reshape to [B, H, W, 3, 3] for rendering (3 colors × 3 SH basis per color)
+        # Note: For 1st order SH, we have DC(3) + 1st(6) = 9 total
+        # Renderer expects [B, H, W, K, 3] where K = (sh_degree+1)^2 / 3
+        # For degree 1: K = 4 (DC + 3 for 1st order), but we have 9 coefficients
+        # We'll keep it as [B, H, W, 9] and reshape in rendering if needed
 
         # 7. Depth → xyz
         # LIBERO original camera: 256×256, fx=fy=221.7025, cx=cy=128.0
-        # Scale intrinsics to match decoder output resolution (H_dec × W_dec)
+        # No scaling needed since decoder outputs 256×256
         if camera_params is not None and "fx" in camera_params:
             xyz = self.depth2pc(
                 final_depth,
@@ -365,26 +390,20 @@ class GaussianDecoder(nn.Module):
                 downsample_factor=1,
             )
         else:
-            # Scale LIBERO intrinsics from 256×256 to decoder output resolution
-            decoder_scale = H_dec / 256.0  # 128/256 = 0.5
+            # LIBERO intrinsics for 256×256 resolution
             xyz = self.depth2pc(
                 final_depth,
-                fx=221.7025 * decoder_scale, fy=221.7025 * decoder_scale,
-                cx=128.0 * decoder_scale, cy=128.0 * decoder_scale,
+                fx=221.7025, fy=221.7025,
+                cx=128.0, cy=128.0,
                 downsample_factor=1,
             )
 
         # 8. Flatten and sanitize
-        N = H_dec * W_dec
+        N = H_dec * W_dec  # 256 * 256 = 65536
         rot_flat = rot_maps.reshape(B, N, 4)
         scale_flat = scale_maps.reshape(B, N, 3)
         opacity_flat = opacity_maps.reshape(B, N, 1)
-        sh_flat = sh_dc.reshape(B, N, 3)  # [B, N, 3] — DC-only SH
-        
-        # Note: Currently using SH DC only (degree 0). If future support for higher-order SH:
-        # - sh_flat would be [B, N, K*3] where K = (sh_degree+1)^2
-        # - Apply SH mask: sh_mask = [1.0, 0.1*0.25^1, 0.1*0.25^2, ...] for degrees 0,1,2,...
-        # - sh_flat = sh_flat * sh_mask.view(1, 1, -1)  # Attenuate higher-order coefficients
+        sh_flat = sh_maps.reshape(B, N, 9)  # [B, N, 9] — DC + 1st order SH
 
         scale_flat = torch.clamp(scale_flat, min=1e-7, max=10.0)
         xyz = torch.clamp(xyz, min=-100.0, max=100.0)
@@ -392,14 +411,16 @@ class GaussianDecoder(nn.Module):
 
         if step is not None and step % 40 == 0:
             import logging
-            logging.info(f"[IndependentDecoder] Step {step}: depth_delta=[{depth_delta_2d.min():.3f}, {depth_delta_2d.max():.3f}], "
-                         f"scales=[{scale_flat.min():.3f}, {scale_flat.max():.3f}], rgb=[{rgb_maps.min():.3f}, {rgb_maps.max():.3f}], N={N}")
+            logging.info(f"[IndependentDecoder] Step {step}: "
+                         f"depth=[{final_depth.min():.3f}, {final_depth.max():.3f}], "
+                         f"scales=[{scale_flat.min():.3f}, {scale_flat.max():.3f}], "
+                         f"sh=[{sh_flat.min():.3f}, {sh_flat.max():.3f}], N={N}")
 
         return {
             "xyz": xyz,
             "scales": scale_flat,
             "opacity": opacity_flat,
-            "sh": sh_flat,
+            "sh": sh_flat,  # [B, N, 9] for 1st order SH
             "rotations": rot_flat,
             "depth_map": final_depth.unsqueeze(1),  # [B, 1, H, W] for edge-aware smoothness
         }

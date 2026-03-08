@@ -48,6 +48,166 @@ def apply_lora_to_model(model: nn.Module, target_names=("qkv", "proj"), rank: in
                 count += 1
     return count
 
+
+# ---------------------------------------------------------------------------
+# Enhanced Temporal Encoding Modules (Priority 1 Improvements)
+# ---------------------------------------------------------------------------
+
+class TemporalConv3DEncoder(nn.Module):
+    """3D Convolutional encoder for temporal-spatial feature extraction.
+
+    Preserves temporal structure while downsampling spatial dimensions.
+    Input: [B, C, T, H, W] where T is number of frames
+    Output: [B, C_out, T, H', W'] where H', W' are downsampled
+    """
+
+    def __init__(self, in_channels=2048, out_channels=512, num_frames=3):
+        super().__init__()
+
+        # 3D Conv layers: preserve temporal dimension, downsample spatial
+        self.conv1 = nn.Sequential(
+            nn.Conv3d(in_channels, 1024, kernel_size=(3, 3, 3),
+                     stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.GroupNorm(32, 1024),
+            nn.GELU(),
+        )
+
+        self.conv2 = nn.Sequential(
+            nn.Conv3d(1024, out_channels, kernel_size=(3, 3, 3),
+                     stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.GroupNorm(32, out_channels),
+            nn.GELU(),
+        )
+
+        # Output: [B, 512, T, H/4, W/4]
+        # For 37×37 input: [B, 512, 3, 9, 9]
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, C, T, H, W] - Temporal-spatial features
+        Returns:
+            [B, C_out, T, H', W'] - Downsampled features
+        """
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return x
+
+
+class CausalTemporalAttention(nn.Module):
+    """Causal temporal attention for modeling t-2, t-1 → t dependencies.
+
+    Each frame can only attend to itself and previous frames (causal mask).
+    This enforces temporal causality: future frames cannot influence past frames.
+    """
+
+    def __init__(self, embed_dim=512, num_heads=8, num_frames=3):
+        super().__init__()
+
+        self.num_frames = num_frames
+        self.embed_dim = embed_dim
+
+        # Multi-head attention
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=0.1
+        )
+
+        # Layer norm
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(embed_dim * 4, embed_dim),
+            nn.Dropout(0.1),
+        )
+
+    def _generate_causal_mask(self, num_frames, tokens_per_frame, device):
+        """Generate causal mask: frame t can only see frames 0...t.
+
+        Returns:
+            mask: [total_tokens, total_tokens] bool tensor
+                  True = cannot attend, False = can attend
+        """
+        total_tokens = num_frames * tokens_per_frame
+        mask = torch.ones(total_tokens, total_tokens, dtype=torch.bool, device=device)
+
+        for t in range(num_frames):
+            start_t = t * tokens_per_frame
+            end_t = (t + 1) * tokens_per_frame
+
+            # Frame t can see all previous frames (0...t-1) and itself
+            for prev_t in range(t + 1):
+                start_prev = prev_t * tokens_per_frame
+                end_prev = (prev_t + 1) * tokens_per_frame
+                mask[start_t:end_t, start_prev:end_prev] = False  # False = can attend
+
+        return mask
+
+    def forward(self, x, tokens_per_frame):
+        """
+        Args:
+            x: [B, T*N, D] - Temporal tokens (T frames, N tokens per frame)
+            tokens_per_frame: int - Number of tokens per frame
+        Returns:
+            [B, T*N, D] - Attended features with temporal dependencies
+        """
+        B, total_tokens, D = x.shape
+        num_frames = total_tokens // tokens_per_frame
+
+        # Generate causal mask
+        attn_mask = self._generate_causal_mask(num_frames, tokens_per_frame, x.device)
+
+        # Self-attention with causal mask
+        x_norm = self.norm1(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=attn_mask)
+        x = x + attn_out
+
+        # FFN
+        x = x + self.ffn(self.norm2(x))
+
+        return x
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for temporal frames.
+
+    Combines fixed sinusoidal encoding with learnable scaling.
+    """
+
+    def __init__(self, num_frames, embed_dim):
+        super().__init__()
+
+        # Generate sinusoidal encoding
+        position = torch.arange(num_frames).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, embed_dim, 2).float() *
+                            -(math.log(10000.0) / embed_dim))
+
+        pe = torch.zeros(num_frames, embed_dim)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        self.register_buffer('pe', pe)
+
+        # Learnable scaling
+        self.scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, frame_idx):
+        """
+        Args:
+            frame_idx: int - Frame index (0, 1, 2, ...)
+        Returns:
+            [embed_dim] - Positional encoding for this frame
+        """
+        return self.pe[frame_idx] * self.scale
+
+
 # Add AD-FFgsStudio to python path
 _root_path = Path(__file__).resolve().parents[3]
 _ad_ffgs_path = _root_path / "third_party" / "AD-FFgsStudio"
@@ -280,32 +440,99 @@ class GaussianAdapter(nn.Module):
                         f"({100*lora_params/total_params:.2f}%)"
                     )
                 
-                # Projection and Head
-                # VGGT embed_dim: The aggregator seems to return 2048 dim (concatenated? or large DINO)
-                self.gaussian_feat_dim = 2048 
-                self.proj = nn.Linear(self.gaussian_feat_dim, action_expert_width)
-                
-                # Pooling
-                # Input: num_frames from agent view
-                # Target: ~100 tokens per frame
-                # 10x10 -> 100 tokens/frame
-                self.pool = nn.AdaptiveAvgPool2d((10, 10))
-                
-                # Frame Positional Encoding for temporal modeling
-                # Add learnable frame embeddings to distinguish tokens from different frames
-                # This helps the model understand temporal structure when predicting future frames
-                self.use_frame_pos_encoding = True
-                if self.use_frame_pos_encoding:
-                    # Learnable frame embeddings: [num_frames, action_expert_width]
-                    # Each frame gets a unique embedding that will be added to its tokens
-                    # This allows the model to distinguish tokens from frame t-2, t-1, t
+                # === Priority 1 & 2 Improvements: Enhanced Temporal Encoding + Multi-Scale Features ===
+
+                # Configuration
+                self.gaussian_feat_dim = 2048  # VGGT output dimension
+                self.tokens_per_frame = 256  # 16×16 = 256 tokens per frame (was 100)
+                self.use_enhanced_temporal = True  # Enable enhanced temporal encoding
+                self.use_multi_scale = True  # Enable multi-scale feature extraction
+
+                if self.use_enhanced_temporal:
+                    # === Multi-Scale Feature Extraction (Priority 2) ===
+                    if self.use_multi_scale:
+                        # Extract features from layers [11, 17, 23] instead of just [23]
+                        self.layer_indices = [11, 17, 23]
+
+                        # Project each layer to unified dimension (512)
+                        self.layer_projs = nn.ModuleList([
+                            nn.Linear(2048, 512) for _ in self.layer_indices
+                        ])
+
+                        # FPN-style fusion (bottom-up)
+                        self.fusion_blocks = nn.ModuleList([
+                            nn.Sequential(
+                                nn.Linear(512, 512),
+                                nn.LayerNorm(512),
+                                nn.GELU(),
+                            ) for _ in range(len(self.layer_indices) - 1)
+                        ])
+
+                        # Project fused features back to 2048 for temporal_conv
+                        self.fused_to_2048 = nn.Linear(512, 2048)
+
+                        logging.info(
+                            f"Multi-scale feature extraction enabled:\n"
+                            f"  - Layers: {self.layer_indices}\n"
+                            f"  - Fusion: FPN-style bottom-up\n"
+                            f"  - Projection: 512 → 2048 for temporal conv"
+                        )
+                    else:
+                        self.layer_indices = [23]  # Only last layer
+                        self.layer_projs = None
+                        self.fusion_blocks = None
+                        self.fused_to_2048 = None
+
+                    # 1. 3D Conv for temporal-spatial feature extraction
+                    self.temporal_conv = TemporalConv3DEncoder(
+                        in_channels=2048,
+                        out_channels=512,
+                        num_frames=num_frames
+                    )
+                    # Output: [B, 512, 3, 9, 9] for 37×37 input
+
+                    # 2. Spatial pooling to 16×16 (256 tokens per frame)
+                    self.spatial_pool = nn.AdaptiveAvgPool2d((16, 16))
+
+                    # 3. Causal temporal attention
+                    self.temporal_attn = CausalTemporalAttention(
+                        embed_dim=512,
+                        num_heads=8,
+                        num_frames=num_frames
+                    )
+
+                    # 4. Frame positional encoding (sinusoidal + learnable)
+                    self.frame_pos_encoding = nn.ModuleList([
+                        SinusoidalPositionalEncoding(num_frames, 512)
+                        for _ in range(num_frames)
+                    ])
+                    self.frame_embeddings = nn.Parameter(
+                        torch.randn(num_frames, 512) * 0.02
+                    )
+
+                    # 5. Projection to action_expert_width
+                    self.proj = nn.Linear(512, action_expert_width)
+
+                    logging.info(
+                        f"Enhanced Temporal Encoding enabled:\n"
+                        f"  - 3D Conv: 2048 → 512 channels\n"
+                        f"  - Spatial resolution: 37×37 → 16×16\n"
+                        f"  - Tokens per frame: {self.tokens_per_frame}\n"
+                        f"  - Total tokens: {num_frames * self.tokens_per_frame}\n"
+                        f"  - Causal temporal attention: {num_frames} frames"
+                    )
+                else:
+                    # Original implementation (fallback)
+                    self.proj = nn.Linear(self.gaussian_feat_dim, action_expert_width)
+                    self.pool = nn.AdaptiveAvgPool2d((10, 10))
+                    self.tokens_per_frame = 100
+
+                    # Original frame positional encoding
+                    self.use_frame_pos_encoding = True
                     self.frame_embeddings = nn.Parameter(
                         torch.randn(num_frames, action_expert_width) * 0.02
                     )
-                    logging.info(f"Initialized frame positional encoding with {num_frames} frame embeddings")
-                    logging.info(f"Output tokens will be [B, {num_frames}*100, action_expert_width] = [B, {num_frames*100}, action_expert_width]")
-                    # Alternative: Use sinusoidal positional encoding (more interpretable)
-                    # self.frame_pos_encoding_type = "learnable"  # or "sinusoidal"
+                    logging.info(f"Using original temporal encoding with {num_frames} frames, 100 tokens/frame")
                 
                 # LGPD Module
                 if self.use_lgpd:
@@ -600,12 +827,8 @@ class GaussianAdapter(nn.Module):
             # Clear cache after encoding to free memory
             torch.cuda.empty_cache()
 
-            if isinstance(aggregated_tokens_list, (list, tuple)):
-                raw_tokens = aggregated_tokens_list[-1]
-            else:
-                raw_tokens = aggregated_tokens_list
-            
-        if raw_tokens is None:
+        # Check if we got valid features
+        if aggregated_tokens_list is None or (isinstance(aggregated_tokens_list, (list, tuple)) and len(aggregated_tokens_list) == 0):
             logging.warning("No features extracted from Gaussian Encoder.")
             return (None, None) if not return_gaussian_params else (None, None, None)
         
@@ -627,25 +850,122 @@ class GaussianAdapter(nn.Module):
             visualize_gate = True
         
         # Process tokens with temporal awareness
-        # Strategy: Process each frame separately, then add frame positional encoding
-        B, S, N_patches, D = raw_tokens.shape
-        
+        # Strategy: Enhanced temporal encoding with 3D Conv + Causal Attention
+
+        # === Priority 3: Multi-scale Feature Extraction ===
+        if hasattr(self, 'use_multi_scale') and self.use_multi_scale:
+            # Extract features from layers [11, 17, 23]
+            multi_scale_features = []
+            for idx, layer_idx in enumerate(self.layer_indices):
+                layer_tokens = aggregated_tokens_list[layer_idx]  # [B, S, N_patches, 2048]
+
+                # Remove camera + register tokens
+                if hasattr(self.encoder, 'aggregator') and hasattr(self.encoder.aggregator, 'patch_start_idx'):
+                    patch_start_idx_val = self.encoder.aggregator.patch_start_idx
+                    if layer_tokens.shape[2] > 1369:
+                        layer_tokens = layer_tokens[:, :, patch_start_idx_val:]
+
+                # Project to 512 dims
+                layer_tokens = self.layer_projs[idx](layer_tokens)  # [B, S, 1369, 512]
+                multi_scale_features.append(layer_tokens)
+
+            # FPN-style bottom-up fusion: [11] <- [17] <- [23]
+            fused_features = multi_scale_features[-1]  # Start with layer 23
+            for i in range(len(multi_scale_features) - 2, -1, -1):
+                # Fuse current layer with previous
+                fused_features = fused_features + multi_scale_features[i]
+                if i > 0:  # Apply fusion block except for the last iteration
+                    B_f, S_f, N_f, D_f = fused_features.shape
+                    fused_features = self.fusion_blocks[i](
+                        fused_features.reshape(B_f * S_f * N_f, D_f)
+                    ).reshape(B_f, S_f, N_f, D_f)
+
+            # Project fused features back to 2048 for temporal_conv
+            B_f, S_f, N_f, D_f = fused_features.shape
+            fused_features = self.fused_to_2048(
+                fused_features.reshape(B_f * S_f * N_f, D_f)
+            ).reshape(B_f, S_f, N_f, 2048)
+
+            raw_tokens = fused_features  # [B, S, 1369, 2048]
+            B, S, N_patches, D = raw_tokens.shape
+        else:
+            # Original single-layer extraction
+            if isinstance(aggregated_tokens_list, (list, tuple)):
+                raw_tokens = aggregated_tokens_list[-1]
+            else:
+                raw_tokens = aggregated_tokens_list
+
+            B, S, N_patches, D = raw_tokens.shape
+
+            # Remove camera + register tokens (if not already removed)
+            if hasattr(self.encoder, 'aggregator') and hasattr(self.encoder.aggregator, 'patch_start_idx'):
+                patch_start_idx_val = self.encoder.aggregator.patch_start_idx
+                if N_patches > 1369:  # Has camera + register tokens
+                    raw_tokens = raw_tokens[:, :, patch_start_idx_val:]
+                    B, S, N_patches, D = raw_tokens.shape
+
         # Initialize variables to ensure they're defined in all code paths
         gaussian_embs = None
         tokens_flat = None  # Initialize to avoid UnboundLocalError
-        
-        # Option 1: Per-frame processing with frame embeddings (preserves temporal structure)
-        if hasattr(self, 'use_frame_pos_encoding') and self.use_frame_pos_encoding:
+
+        # === Priority 1: Enhanced Temporal Encoding ===
+        if hasattr(self, 'use_enhanced_temporal') and self.use_enhanced_temporal:
+            # 1. Reshape to 3D: [B, S, 1369, D] -> [B, D, S, 37, 37]
+            tokens_3d = raw_tokens.permute(0, 3, 1, 2).reshape(B, D, S, 37, 37)
+
+            # 2. 3D Conv (temporal-spatial encoding)
+            tokens_conv = self.temporal_conv(tokens_3d)  # [B, 512, S, 9, 9]
+
+            # 3. Spatial pooling to 16×16
+            B_conv, C_conv, S_conv, H_conv, W_conv = tokens_conv.shape
+            tokens_conv = tokens_conv.permute(0, 2, 1, 3, 4).reshape(B*S, C_conv, H_conv, W_conv)
+            tokens_pooled = self.spatial_pool(tokens_conv)  # [B*S, 512, 16, 16]
+            tokens_pooled = tokens_pooled.reshape(B, S, C_conv, 16, 16)
+
+            # 4. Flatten spatial dimensions: [B, S, 512, 16, 16] -> [B, S, 256, 512]
+            tokens_flat = tokens_pooled.permute(0, 1, 3, 4, 2).reshape(B, S, 256, C_conv)
+
+            # 5. Add frame positional encoding
+            frame_tokens_list = []
+            for frame_idx in range(S):
+                frame_tokens = tokens_flat[:, frame_idx]  # [B, 256, 512]
+
+                # Sinusoidal + learnable positional encoding
+                frame_pos = self.frame_pos_encoding[frame_idx](frame_idx)  # [512]
+                frame_pos = frame_pos + self.frame_embeddings[frame_idx]  # [512]
+                frame_pos = frame_pos.unsqueeze(0).unsqueeze(0)  # [1, 1, 512]
+
+                frame_tokens = frame_tokens + frame_pos  # [B, 256, 512]
+                frame_tokens_list.append(frame_tokens)
+
+            # 6. Concatenate frames: [B, S, 256, 512] -> [B, S*256, 512]
+            temporal_tokens = torch.cat(frame_tokens_list, dim=1)  # [B, 768, 512] for S=3
+
+            # 7. Causal temporal attention
+            temporal_tokens = self.temporal_attn(temporal_tokens, tokens_per_frame=256)
+
+            # 8. Project to action_expert_width
+            gaussian_embs = self.proj(temporal_tokens)  # [B, 768, action_expert_width]
+
+            if step is not None and step % 100 == 0:
+                logging.info(
+                    f"[Enhanced Temporal] Step {step}: "
+                    f"tokens shape={gaussian_embs.shape}, "
+                    f"frames={S}, tokens_per_frame={self.tokens_per_frame}"
+                )
+
+        # === Fallback: Original Per-frame Processing ===
+        elif hasattr(self, 'use_frame_pos_encoding') and self.use_frame_pos_encoding:
             # Process each frame separately to maintain temporal structure
             frame_tokens_list = []
             for frame_idx in range(S):
                 # Extract tokens for this frame: [B, N_patches, D]
                 frame_tokens = raw_tokens[:, frame_idx, :, :]
-                
+
                 # Reshape for pooling: [B, N_patches, D] -> [B, D, sqrt(N), sqrt(N)]
                 patch_h = int(np.sqrt(N_patches))
                 patch_w = N_patches // patch_h if patch_h > 0 else 1
-                
+
                 # Reshape to 2D: [B, N_patches, D] -> [B, D, patch_h, patch_w]
                 if patch_h * patch_w == N_patches:
                     tokens_2d = frame_tokens.permute(0, 2, 1).view(B, D, patch_h, patch_w)
@@ -658,16 +978,16 @@ class GaussianAdapter(nn.Module):
                         padding = spatial_size * spatial_size - N_patches
                         tokens_reshaped = F.pad(tokens_reshaped, (0, padding), mode='constant', value=0)
                     tokens_2d = tokens_reshaped.view(B, D, spatial_size, spatial_size)
-                
+
                 # Pool to reduce tokens: [B, D, H, W] -> [B, D, 10, 10]
                 tokens_pooled = self.pool(tokens_2d)  # [B, D, 10, 10]
-                
+
                 # Flatten: [B, D, 10, 10] -> [B, 100, D]
                 tokens_final = tokens_pooled.view(B, -1, D)  # [B, 100, D]
-                
+
                 # Project to action_expert_width
                 frame_embs = self.proj(tokens_final)  # [B, 100, action_expert_width]
-                
+
                 # Add frame positional encoding
                 if hasattr(self, 'frame_embeddings'):
                     # frame_embeddings: [S, action_expert_width]
@@ -675,13 +995,13 @@ class GaussianAdapter(nn.Module):
                     frame_emb = self.frame_embeddings[frame_idx]  # [action_expert_width]
                     frame_emb = frame_emb.unsqueeze(0).unsqueeze(0).expand(B, 100, -1)  # [B, 100, action_expert_width]
                     frame_embs = frame_embs + frame_emb
-                
+
                 frame_tokens_list.append(frame_embs)
-            
+
             # Concatenate frames: [B, 100, D] * S -> [B, S*100, D]
             # This preserves temporal order: tokens from frame 0, then frame 1, then frame 2
             gaussian_embs = torch.cat(frame_tokens_list, dim=1)  # [B, S*100, action_expert_width]
-            
+
         else:
             # Option 2: Original approach (flatten all frames together)
             # This loses temporal structure but maintains backward compatibility
