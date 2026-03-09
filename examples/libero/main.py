@@ -104,7 +104,7 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/gaussian_world_model_exp0309_5000_goal/videos"  # Path to save videos
+    video_out_path: str = "data/gaussian_world_model_exp0309_12000_goal/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
 

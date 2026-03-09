@@ -65,7 +65,7 @@ xvfb-run -a python examples/libero/main.py
 nohup xvfb-run -a python examples/libero/main.py > /dev/null 2>&1 &
 
 # Or redirect both to a custom log file (optional, script also saves to data directory):
-nohup xvfb-run -a python examples/libero/main.py > custom_run.log 2>&1 &
+nohup xvfb-run -a python examples/libero/main.py > goal_run_0309.log 2>&1 &
 
 # Or with screen (detachable session):
 screen -S libero
