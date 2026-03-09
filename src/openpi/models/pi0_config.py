@@ -39,6 +39,10 @@ class Pi0Config(_model.BaseModelConfig):
     unfreeze_vggt_decoder_only: bool = True  # If True (default), only unfreeze decoder (gs_head) while keeping encoder frozen
     # Current frame reconstruction loss weight (for training VGGT encoder+decoder)
     current_frame_recon_loss_weight: float = 0.5  # Weight for current frame reconstruction loss
+    # Render loss weight for 3DGS rendering supervision
+    render_loss_weight: float = 0.1  # Weight for rendering loss (RGB + regularization) - reduced to let action loss dominate
+    # Depth supervision loss weight
+    depth_loss_weight: float = 0.02  # Weight for depth supervision loss (from Depth Anything V2) - reduced to let action loss dominate
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 

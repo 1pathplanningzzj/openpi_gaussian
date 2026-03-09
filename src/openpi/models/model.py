@@ -94,6 +94,10 @@ class Observation(Generic[ArrayT]):
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
 
+    # Depth maps (optional, for depth supervision)
+    # Use different dimension names (dh, dw) to avoid conflict with image dimensions (h, w)
+    depth: at.Float[ArrayT, "*b 1 dh dw"] | None = None
+
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
     # Tokenized prompt mask.
@@ -278,6 +282,7 @@ class Observation(Generic[ArrayT]):
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
+            depth=data.get("depth"),  # Optional depth data
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),

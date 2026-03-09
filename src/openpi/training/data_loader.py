@@ -196,6 +196,16 @@ def create_torch_dataset(
     else:
         print(f"WARNING: Could not find state key in dataset features. Available keys: {list(dataset_meta.features.keys())}")
 
+    # Add depth data for all 4 frames (same as images) to match batch shape
+    # We'll only use t+1 frame for depth supervision loss, but load all 4 for shape consistency
+    depth_keys_to_try = ["depth", "observation.depth", "observation/depth"]
+    for depth_key in depth_keys_to_try:
+        if depth_key in dataset_meta.features:
+            # Request 4 frames [t-2, t-1, t, t+1] to match image temporal dimension
+            delta_timestamps[depth_key] = [-0.2, -0.1, 0.0, round(1.0 / image_fps, 2)]  # [t-2, t-1, t, t+1]
+            print(f"DEBUG: Added depth data with key: {depth_key} (4 frames for shape consistency, will use t+1 for loss)")
+            break
+
     print(f"DEBUG: delta_timestamps: {delta_timestamps}")
 
     dataset = lerobot_dataset.LeRobotDataset(
@@ -524,14 +534,29 @@ class TorchDataLoader:
                 if self._sharding is not None:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
-                    yield jax.tree.map(torch.as_tensor, batch)
-
-
+                    # Convert to tensors, but skip bytes (will be handled by custom transforms)
+                    def to_tensor_safe(x):
+                        if isinstance(x, bytes):
+                            return x  # Keep bytes as-is for custom transforms
+                        # Check if it's a numpy array with bytes dtype
+                        if isinstance(x, np.ndarray):
+                            if x.dtype == np.object_ or x.dtype.kind == 'O':
+                                # Check if it contains bytes
+                                if len(x) > 0 and isinstance(x.flat[0], bytes):
+                                    return x  # Keep bytes array as-is
+                        return torch.as_tensor(x)
+                    yield jax.tree.map(to_tensor_safe, batch)
+ 
 def _collate_fn(items):
     """Collate the batch elements into batched numpy arrays."""
     # Make sure to convert to numpy arrays before stacking since some of the incoming elements
     # may be JAX arrays.
-    return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    def collate_arrays(*xs):
+        # Check if any element is bytes - if so, keep as list
+        if any(isinstance(x, bytes) for x in xs):
+            return list(xs)
+        return np.stack([np.asarray(x) for x in xs], axis=0)
+    return jax.tree.map(collate_arrays, *items)
 
 
 def _worker_init_fn(worker_id: int) -> None:

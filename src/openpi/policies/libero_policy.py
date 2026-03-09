@@ -18,10 +18,34 @@ def make_libero_example() -> dict:
 
 
 def _parse_image(image) -> np.ndarray:
-    image = np.asarray(image)
+    # Handle dict format from LIBERO dataset: {'bytes': ..., 'path': ...}
+    if isinstance(image, dict):
+        if 'bytes' in image:
+            from PIL import Image
+            import io
+            image = Image.open(io.BytesIO(image['bytes']))
+            image = np.array(image)
+        else:
+            raise ValueError(f"Unexpected dict format for image: {image.keys()}")
+    # Handle list of dicts (temporal frames)
+    elif isinstance(image, (list, tuple)) and len(image) > 0 and isinstance(image[0], dict):
+        from PIL import Image
+        import io
+        frames = []
+        for img_dict in image:
+            if 'bytes' in img_dict:
+                img = Image.open(io.BytesIO(img_dict['bytes']))
+                frames.append(np.array(img))
+            else:
+                raise ValueError(f"Unexpected dict format for image: {img_dict.keys()}")
+        image = np.stack(frames, axis=0)  # Stack to (T, H, W, C)
+        return image  # Already in correct format
+    else:
+        image = np.asarray(image)
+
     if np.issubdtype(image.dtype, np.floating):
         image = (255 * image).astype(np.uint8)
-    
+
     # Handle single frame (C, H, W) -> (H, W, C)
     if image.ndim == 3 and image.shape[0] == 3:
         image = einops.rearrange(image, "c h w -> h w c")
@@ -85,6 +109,16 @@ class LiberoInputs(transforms.DataTransformFn):
         # stored in "prompt"; the output dict always needs to have the key "prompt").
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
+        # Add depth data if available (for World Model depth supervision)
+        if "observation/depth" in data:
+            inputs["depth"] = data["observation/depth"]
+            # Debug: log depth info
+            import logging
+            if hasattr(data["observation/depth"], 'shape'):
+                logging.info(f"[LiberoInputs] depth shape: {data['observation/depth'].shape}")
+            else:
+                logging.info(f"[LiberoInputs] depth type: {type(data['observation/depth'])}")
 
         return inputs
 

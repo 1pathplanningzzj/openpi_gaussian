@@ -83,10 +83,12 @@ class IndependentGaussianHead(nn.Module):
     """
 
     def __init__(self, token_dim: int = 2048, grid_size: int = 16,
-                 use_image_fusion: bool = True, img_dim: int = 3):
+                 use_image_fusion: bool = True, img_dim: int = 3,
+                 predict_depth: bool = True):
         super().__init__()
         self.grid_size = grid_size
         self.use_image_fusion = use_image_fusion
+        self.predict_depth = predict_depth
 
         # Output channels: rot(4) + scale(3) + opacity(1) + SH(9)
         # SH(9) = DC(3) + 1st order(6) for basic view-dependent effects
@@ -127,6 +129,28 @@ class IndependentGaussianHead(nn.Module):
         # Final projection to output channels
         self.head = nn.Conv2d(128, out_ch, 3, padding=1)
 
+        # Independent depth prediction branch (方案 A - 借鉴 VGGT DPT)
+        if predict_depth:
+            # Lightweight refinement network for depth prediction
+            self.depth_refine = nn.Sequential(
+                # First refinement block
+                nn.Conv2d(128, 64, 3, padding=1),
+                nn.GroupNorm(min(32, 64), 64),
+                nn.GELU(),
+                # Second refinement block with residual
+                nn.Conv2d(64, 64, 3, padding=1),
+                nn.GroupNorm(min(32, 64), 64),
+                nn.GELU(),
+                # Final projection to depth
+                nn.Conv2d(64, 1, 3, padding=1),
+            )
+            # Initialize depth refinement layers
+            for m in self.depth_refine.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.xavier_uniform_(m.weight, gain=0.01)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+
         # Initialize output with small random values for better gradient flow
         # Using Xavier/Glorot initialization scaled down for stability
         nn.init.xavier_uniform_(self.head.weight, gain=0.01)
@@ -143,14 +167,15 @@ class IndependentGaussianHead(nn.Module):
             persistent=False,
         )
 
-    def forward(self, tokens: torch.Tensor, images: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, images: torch.Tensor = None):
         """
         Args:
             tokens: [B, 256, D] VLM future tokens
             images: [B, 3, H, W] Optional input images for feature fusion
         Returns:
-            [B, 17, 256, 256] raw Gaussian parameter maps
-            - rot(4) + scale(3) + opacity(1) + SH(9)
+            dict with:
+                - 'gaussian_params': [B, 17, 256, 256] - rot(4) + scale(3) + opacity(1) + SH(9)
+                - 'depth': [B, 1, 256, 256] - predicted depth (if predict_depth=True)
         """
         B, N, D = tokens.shape
         g = self.grid_size
@@ -177,9 +202,16 @@ class IndependentGaussianHead(nn.Module):
             img_feat = self.img_merger(images)  # [B, 128, 256, 256]
             fused = fused + img_feat  # Residual connection
 
-        # Final projection
-        x = self.head(fused)  # [B, 17, 256, 256]
-        return x
+        # Final projection to Gaussian parameters
+        gaussian_params = self.head(fused)  # [B, 17, 256, 256]
+
+        # Independent depth prediction with refinement (方案 A - 借鉴 VGGT DPT)
+        result = {'gaussian_params': gaussian_params}
+        if self.predict_depth:
+            depth_raw = self.depth_refine(fused)  # [B, 1, 256, 256]
+            result['depth'] = depth_raw
+
+        return result
 
 
 class GaussianDecoder(nn.Module):
@@ -221,10 +253,24 @@ class GaussianDecoder(nn.Module):
         self,
         token_dim: int,
         input_num_tokens: int = 256,
+        action_dim: int = 7,
+        use_action_conditioning: bool = True,
+        predict_depth: bool = True,
     ):
         super().__init__()
         self.token_dim = token_dim
         self.input_num_tokens = input_num_tokens
+        self.action_dim = action_dim
+        self.use_action_conditioning = use_action_conditioning
+        self.predict_depth = predict_depth
+
+        # Action embedding projection
+        if use_action_conditioning:
+            self.action_proj = nn.Sequential(
+                nn.Linear(action_dim, 128),
+                nn.GELU(),
+                nn.Linear(128, token_dim),  # 输出维度应该匹配 token_dim (2048)
+            )
 
         # Independent ConvNet decoder — RGB output, no VGGT DPT dependency
         grid_size = int(input_num_tokens ** 0.5)  # 256 → 16
@@ -232,6 +278,7 @@ class GaussianDecoder(nn.Module):
             token_dim=token_dim, grid_size=grid_size,
             use_image_fusion=True,  # Enable image feature fusion
             img_dim=3,
+            predict_depth=predict_depth,
         )
 
     # ------------------------------------------------------------------
@@ -286,12 +333,13 @@ class GaussianDecoder(nn.Module):
         camera_params=None,
         step=None,
         current_observation=None,
+        actions=None,
     ):
         """Decode latent tokens → Gaussian parameters."""
         return self._decode_independent(
             z, gaussian_adapter=gaussian_adapter, camera_params=camera_params,
             current_observation=current_observation, future_observation=future_observation,
-            step=step,
+            step=step, actions=actions,
         )
 
     # ------------------------------------------------------------------
@@ -299,59 +347,74 @@ class GaussianDecoder(nn.Module):
     # ------------------------------------------------------------------
     def _decode_independent(
         self, z, gaussian_adapter=None, camera_params=None,
-        current_observation=None, future_observation=None, step=None,
+        current_observation=None, future_observation=None, step=None, actions=None,
     ):
         """Decode VLM tokens via independent ConvNet head + VGGT depth."""
         vggt_obs = current_observation if current_observation is not None else future_observation
         if vggt_obs is None or gaussian_adapter is None:
             raise ValueError("current_observation and gaussian_adapter are required")
 
-        # 1. Prepare VGGT inputs from current frames
+        # Action conditioning: embed actions and add to VLM tokens
+        if self.use_action_conditioning and actions is not None:
+            # Transform actions to camera frame
+            action_cam = self._transform_action_to_camera(actions, camera_params)
+            # Extract only first 7 meaningful dimensions for projection
+            action_cam_7d = action_cam[:, :7]  # [B, 7]
+            # Embed and add to tokens
+            action_embed = self.action_proj(action_cam_7d)  # [B, token_dim]
+            z = z + action_embed.unsqueeze(1)  # [B, 256, D] + [B, 1, D] → [B, 256, D]
+
+        # Prepare VGGT inputs for image feature fusion
         vggt_inputs = gaussian_adapter.prepare_inputs(
             vggt_obs, z.device, z.shape[0], is_training=False
         )
         if vggt_inputs is None:
             raise ValueError("Failed to prepare VGGT inputs")
 
-        # 2. VGGT aggregator → unmodified features (for depth only)
-        with torch.no_grad():
-            aggregated_tokens_list, patch_start_idx = gaussian_adapter.encoder.aggregator(
-                vggt_inputs.to(torch.bfloat16)
-            )
-        B_vggt, S_vggt = vggt_inputs.shape[:2]
-        for i in range(len(aggregated_tokens_list)):
-            if aggregated_tokens_list[i].ndim == 3:
-                _bs, _p, _c = aggregated_tokens_list[i].shape
-                aggregated_tokens_list[i] = aggregated_tokens_list[i].view(B_vggt, S_vggt, _p, _c)
-
-        # 3. Depth from VGGT depth head (following AD-FFgsStudio)
-        # Use sigmoid(log(depth)) for stable depth normalization
-        depth_maps, depth_conf = gaussian_adapter.encoder.depth_head(
-            aggregated_tokens_list, images=vggt_inputs, patch_start_idx=patch_start_idx
-        )
-        # AD-FFgsStudio style: sigmoid(log(depth)) ensures positive depth values
-        depth_maps = torch.sigmoid(torch.log(depth_maps + 1e-6))  # Add epsilon for numerical stability
-        min_depth = gaussian_adapter.encoder.min_depth
-        max_depth = gaussian_adapter.encoder.max_depth
-        depth_maps = min_depth + (max_depth - min_depth) * depth_maps  # [B, S, H, W, 1]
-
-        # 4. Independent decoder: VLM tokens → Gaussian params (17 channels, no depth)
         # Extract current frame image for residual feature fusion
+        B_vggt, S_vggt = vggt_inputs.shape[:2]
         frame_idx = S_vggt - 1
         current_frame_img = vggt_inputs[:, frame_idx]  # [B, 3, H_vggt, W_vggt]
 
-        # Decode to 256×256 resolution with 17 channels
-        raw = self.gaussian_head(z, images=current_frame_img)  # [B, 17, 256, 256]
+        # Decode VLM tokens → Gaussian params + depth
+        decoder_output = self.gaussian_head(z, images=current_frame_img)
+        raw = decoder_output['gaussian_params']  # [B, 17, 256, 256]
         rot_raw, scale_raw, opa_raw, sh_raw = raw.split([4, 3, 1, 9], dim=1)
 
-        # 5. Use VGGT depth directly (no delta prediction)
-        # Extract depth for current frame and resize to decoder resolution
-        frame_idx = S_vggt - 1
-        final_depth = depth_maps[:, frame_idx, :, :, 0]  # [B, H_vggt, W_vggt]
-        H_dec, W_dec = raw.shape[2], raw.shape[3]  # 256, 256
-        final_depth = F.interpolate(
-            final_depth.unsqueeze(1), size=(H_dec, W_dec), mode="bilinear", align_corners=False
-        ).squeeze(1)  # [B, 256, 256]
+        # Get depth: use predicted depth if available, otherwise fallback to VGGT
+        if self.predict_depth and 'depth' in decoder_output:
+            # Use predicted depth from decoder (方案 A)
+            depth_raw = decoder_output['depth']  # [B, 1, 256, 256]
+            # Apply sigmoid + scaling to match GT depth range from Depth Anything V2
+            # GT depth statistics: min=-0.21, max=7.53, mean=3.30, P5-P95: 0.24-6.58
+            # Use slightly wider range to allow model flexibility: 0.0 to 8.0 meters
+            min_depth = 0.0
+            max_depth = 8.0
+            final_depth = min_depth + (max_depth - min_depth) * torch.sigmoid(depth_raw.squeeze(1))  # [B, 256, 256]
+            H_dec, W_dec = final_depth.shape[1], final_depth.shape[2]  # Get spatial dimensions
+        else:
+            # Fallback: use VGGT depth from current frame (old behavior)
+            with torch.no_grad():
+                aggregated_tokens_list, patch_start_idx = gaussian_adapter.encoder.aggregator(
+                    vggt_inputs.to(torch.bfloat16)
+                )
+            for i in range(len(aggregated_tokens_list)):
+                if aggregated_tokens_list[i].ndim == 3:
+                    _bs, _p, _c = aggregated_tokens_list[i].shape
+                    aggregated_tokens_list[i] = aggregated_tokens_list[i].view(B_vggt, S_vggt, _p, _c)
+
+            depth_maps, depth_conf = gaussian_adapter.encoder.depth_head(
+                aggregated_tokens_list, images=vggt_inputs, patch_start_idx=patch_start_idx
+            )
+            depth_maps = torch.sigmoid(torch.log(depth_maps + 1e-6))
+            min_depth = gaussian_adapter.encoder.min_depth
+            max_depth = gaussian_adapter.encoder.max_depth
+            depth_maps = min_depth + (max_depth - min_depth) * depth_maps
+            final_depth = depth_maps[:, frame_idx, :, :, 0]  # [B, H_vggt, W_vggt]
+            H_dec, W_dec = raw.shape[2], raw.shape[3]
+            final_depth = F.interpolate(
+                final_depth.unsqueeze(1), size=(H_dec, W_dec), mode="bilinear", align_corners=False
+            ).squeeze(1)  # [B, 256, 256]
 
         # 6. Activations
         B = z.shape[0]
@@ -424,3 +487,74 @@ class GaussianDecoder(nn.Module):
             "rotations": rot_flat,
             "depth_map": final_depth.unsqueeze(1),  # [B, 1, H, W] for edge-aware smoothness
         }
+
+    def _transform_action_to_camera(self, actions, camera_params):
+        """
+        Transform actions from world frame to camera frame.
+
+        Args:
+            actions: [B, action_dim] - padded actions (may be 32-dim, but only first 7 are used)
+                     (delta_x, delta_y, delta_z, quat_w, quat_x, quat_y, quat_z, ...)
+            camera_params: dict with camera_pos and camera_quat
+        Returns:
+            action_cam: [B, action_dim] - actions in camera frame with X-axis flipped
+        """
+        if camera_params is None or "camera_pos" not in camera_params:
+            # No transformation, return as-is
+            return actions
+
+        B = actions.shape[0]
+        device = actions.device
+        action_dim = actions.shape[1]
+
+        # Extract camera pose
+        cam_pos = torch.tensor(camera_params["camera_pos"], device=device, dtype=torch.float32)
+        cam_quat = torch.tensor(camera_params["camera_quat"], device=device, dtype=torch.float32)
+
+        # Build camera rotation matrix from quaternion
+        cam_rot = self._quat_to_rotation_matrix(cam_quat)  # [3, 3]
+
+        # Handle temporal dimension: actions could be [B, T, D] or [B, D]
+        if actions.ndim == 3:
+            # actions is [B, T, D], take the first timestep
+            actions = actions[:, 0, :]  # [B, D]
+
+        # Extract position and rotation from actions (only first 7 dims are meaningful)
+        eef_pos = actions[:, :3]  # [B, 3] - delta position in world frame
+        eef_quat = actions[:, 3:7]  # [B, 4] - quaternion (w, x, y, z)
+
+        # Transform position to camera frame
+        eef_pos_cam = torch.matmul(eef_pos, cam_rot.T)  # [B, 3]
+
+        # CRITICAL: Flip X-axis to match image coordinate convention
+        eef_pos_cam[:, 0] = -eef_pos_cam[:, 0]
+
+        # For rotation, we keep it as-is (quaternion transformation is complex)
+        # In practice, position is more important for action conditioning
+
+        # Reconstruct action with transformed position
+        action_cam = actions.clone()
+        action_cam[:, :3] = eef_pos_cam
+        # Keep quaternion and padding unchanged
+
+        return action_cam
+
+    @staticmethod
+    def _quat_to_rotation_matrix(quat):
+        """
+        Convert quaternion to rotation matrix.
+
+        Args:
+            quat: [4] - (w, x, y, z)
+        Returns:
+            R: [3, 3] rotation matrix
+        """
+        w, x, y, z = quat[0], quat[1], quat[2], quat[3]
+
+        R = torch.stack([
+            torch.stack([1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z, 2*x*z + 2*w*y]),
+            torch.stack([2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x]),
+            torch.stack([2*x*z - 2*w*y, 2*y*z + 2*w*x, 1 - 2*x*x - 2*y*y]),
+        ])
+
+        return R

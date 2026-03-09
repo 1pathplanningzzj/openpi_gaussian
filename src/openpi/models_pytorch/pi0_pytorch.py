@@ -124,7 +124,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test4")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test5")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -133,12 +133,14 @@ class PI0Pytorch(nn.Module):
         # Option to unfreeze VGGT encoder/decoder for reconstruction loss training
         unfreeze_vggt_encoder = getattr(config, "unfreeze_vggt_encoder", False)
         unfreeze_vggt_decoder_only = getattr(config, "unfreeze_vggt_decoder_only", True)  # Default: train decoder only
+        use_lora = getattr(config, "use_lora", True)  # Default: use LoRA for VGGT encoder
         self.gaussian_adapter = GaussianAdapter(
-            use_gaussian, 
-            paligemma_config.width, 
+            use_gaussian,
+            paligemma_config.width,
             use_lgpd=False,
             unfreeze_encoder=unfreeze_vggt_encoder,
-            unfreeze_decoder_only=unfreeze_vggt_decoder_only
+            unfreeze_decoder_only=unfreeze_vggt_decoder_only,
+            use_lora=use_lora
         )
         
         # Current frame reconstruction loss weight
@@ -237,7 +239,9 @@ class PI0Pytorch(nn.Module):
             self.gaussian_renderer = None
 
         # Initialize render loss weight (can be changed dynamically for staged training)
-        self.render_loss_weight = getattr(config, "render_loss_weight", 0.5)  # 从0.1改为0.5，增强render loss的影响
+        self.render_loss_weight = getattr(config, "render_loss_weight", 0.1)  # 降低render loss权重，让action loss主导
+        # Initialize depth supervision loss weight
+        self.depth_loss_weight = getattr(config, "depth_loss_weight", 0.02)  # 降低depth loss权重，让action loss主导
         # -------------------------------
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
@@ -453,20 +457,40 @@ class PI0Pytorch(nn.Module):
                             curr_prompt_mask = curr_prompt_mask.unsqueeze(1).expand(-1, time_dim, -1)  # [B, T, L]
                             fut_prompt_mask = observation.tokenized_prompt_mask  # Keep [B, L] for future
 
+                    # Handle depth data if available
+                    fut_depth = None
+                    curr_depth = None
+                    if hasattr(observation, 'depth') and observation.depth is not None:
+                        # observation.depth: [B, T, 1, H, W] or [B, 1, H, W]
+                        if observation.depth.ndim == 5:  # [B, T, 1, H, W]
+                            if observation.depth.shape[1] == time_dim:
+                                # For current observation: keep full temporal dimension [B, T, 1, H, W]
+                                # For future observation: extract single frame [B, 1, H, W]
+                                curr_depth = observation.depth  # Keep [B, T, 1, H, W] for VGGT
+                                fut_depth = observation.depth[:, idx_fut]  # [B, 1, H, W]
+                        elif observation.depth.ndim == 4:  # [B, 1, H, W]
+                            # Single frame depth, use as is for both
+                            curr_depth = observation.depth
+                            fut_depth = observation.depth
+                        else:
+                            logging.warning(f"Unexpected depth shape: {observation.depth.shape}, ndim={observation.depth.ndim}")
+
                     future_observation = observation.replace(
-                        images=fut_imgs, 
+                        images=fut_imgs,
                         state=fut_state,
                         image_masks=fut_masks,
                         tokenized_prompt=fut_prompt,
-                        tokenized_prompt_mask=fut_prompt_mask
+                        tokenized_prompt_mask=fut_prompt_mask,
+                        depth=fut_depth  # Set depth directly to avoid type check error
                     )
                     # Update current observation
                     observation = observation.replace(
-                        images=curr_imgs, 
+                        images=curr_imgs,
                         state=curr_state,
                         image_masks=curr_masks,
                         tokenized_prompt=curr_prompt,
-                        tokenized_prompt_mask=curr_prompt_mask
+                        tokenized_prompt_mask=curr_prompt_mask,
+                        depth=curr_depth  # Set depth for current frame
                     )
                     
                     # Also preprocess future observation (normalization etc)
@@ -853,13 +877,23 @@ class PI0Pytorch(nn.Module):
         viewmatrix_inv = torch.inverse(viewmatrix)  # [B, 4, 4]
         campos = viewmatrix_inv[:, :3, 3]  # [B, 3] - camera position in world coordinates
 
+        # LIBERO canonical_agentview camera pose (for action coordinate transformation)
+        camera_pos = [0.5386131746834771, 0.0, 0.7903500240372423]
+        camera_quat = [0.6380177736282349, 0.3048497438430786, 0.30484986305236816, 0.6380177736282349]  # [w, x, y, z]
+
         return {
             "viewmatrix": viewmatrix,
             "projmatrix": projmatrix,
             "tanfovx": tanfov,
             "tanfovy": tanfov,
             "campos": campos,  # Now correctly computed from viewmatrix
-            "intrinsics": intrinsics
+            "intrinsics": intrinsics,
+            "fx": fx,
+            "fy": fx,
+            "cx": cx,
+            "cy": cx,
+            "camera_pos": camera_pos,
+            "camera_quat": camera_quat,
         }
     
     def _compute_2d_maps_loss(self, pred_2d_maps, gt_2d_maps):
@@ -1057,6 +1091,7 @@ class PI0Pytorch(nn.Module):
                     # Decode predicted tokens to 3D Gaussians (with gradients)
                     gaussian_params = self.world_model.decode(
                         z_next_float32,
+                        actions=actions,  # NEW: Pass ground-truth actions for conditioning
                         future_observation=future_observation,
                         gaussian_adapter=self.gaussian_adapter,
                         camera_params=camera_params_for_decode,
@@ -1066,6 +1101,39 @@ class PI0Pytorch(nn.Module):
 
                     # Sanitize Gaussian params
                     depth_map = gaussian_params.pop("depth_map", None)  # [B, 1, H, W]
+
+                    # --- Depth Supervision Loss (NEW) ---
+                    depth_loss = None
+                    # Debug: check if depth data is available
+                    if step is not None and step % 100 == 0:
+                        logging.info(f"Step {step}: depth_map={depth_map is not None}, "
+                                   f"has_depth_attr={hasattr(future_observation, 'depth')}, "
+                                   f"depth_value={future_observation.depth is not None if hasattr(future_observation, 'depth') else 'N/A'}")
+
+                    if depth_map is not None and hasattr(future_observation, 'depth') and future_observation.depth is not None:
+                        # future_observation.depth: [B, 1, H, W] - ground truth depth from Depth Anything V2
+                        gt_depth = future_observation.depth
+
+                        # Resize predicted depth to match GT depth if needed
+                        if depth_map.shape != gt_depth.shape:
+                            depth_map_resized = F.interpolate(
+                                depth_map, size=gt_depth.shape[-2:], mode='bilinear', align_corners=False
+                            )
+                        else:
+                            depth_map_resized = depth_map
+
+                        # Compute L1 loss for depth (more robust than L2 for depth estimation)
+                        depth_loss = F.l1_loss(depth_map_resized, gt_depth)
+
+                        # Add depth loss to total loss with weight
+                        depth_loss_weight = getattr(self, 'depth_loss_weight', 0.1)
+                        if torch.isfinite(depth_loss):
+                            loss = loss + depth_loss_weight * depth_loss
+
+                        # Logging
+                        if step is not None and step % 100 == 0:
+                            logging.info(f"Step {step}: Depth Loss = {depth_loss.item():.6f}, weight={depth_loss_weight}")
+
                     for k, v in gaussian_params.items():
                         if torch.isnan(v).any() or torch.isinf(v).any():
                             gaussian_params[k] = torch.where(

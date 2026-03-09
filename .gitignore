@@ -194,3 +194,10 @@ uv_venv/
 
 
 third_party/AD-FFgsStudio/diff-gaussian-rasterization/build/
+
+# Large files that shouldn't be in git
+Miniconda3-latest-Linux-x86_64.sh
+visualizations/
+serve_policy_2000log
+*_log
+*.log

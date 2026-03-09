@@ -24,6 +24,7 @@ import openpi.policies.robocasa_policy as robocasa_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.depth_transform as depth_transform
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
@@ -309,6 +310,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                         "observation/state": "state",
                         "actions": "actions",
                         "prompt": "prompt",
+                        "observation/depth": "depth",  # Depth mapping for depth-augmented dataset
                     }
                 )
             ]
@@ -321,7 +323,10 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # how to modify the transforms to match your dataset. Once you created your own transforms, you can
         # replace the transforms below with your own.
         data_transforms = _transforms.Group(
-            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            inputs=[
+                depth_transform.LoadDepthTransform(use_depth=True, depth_key="observation/depth"),
+                libero_policy.LiberoInputs(model_type=model_config.model_type),
+            ],
             outputs=[libero_policy.LiberoOutputs()],
         )
 
@@ -807,7 +812,8 @@ _CONFIGS = [
             repo_id="physical-intelligence/libero",
             # zijian ‘s users data is located at /data/zijianzhang/LIBERA/physical-intelligence/libero
             # If the data is directly at /data/zijianzhang/LIBERA, you might need to adjust the path or repo_id.
-            base_config=DataConfig(prompt_from_task=True, dataset_root="/data/zijianzhang/LIBERA"),
+            # Using depth-augmented dataset with fixed LeRobot data loading
+            base_config=DataConfig(prompt_from_task=True, dataset_root="/data/zijianzhang/LIBERA/data_with_depth"),
             extra_delta_transform=False,
         ),
         # batch_size=256,

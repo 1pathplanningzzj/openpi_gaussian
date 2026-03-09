@@ -423,23 +423,27 @@ class GaussianAdapter(nn.Module):
                     self.encoder.eval()
                     logging.info("VGGT encoder is FROZEN (original behavior)")
 
-                # Apply LoRA to encoder backbone (after freezing)
+                # Unfreeze LoRA parameters in encoder backbone (if use_lora=True)
+                # VGGT pretrained model already has LoRA layers (lora_down, lora_up)
                 if use_lora and not unfreeze_encoder:
                     aggregator = self.encoder.aggregator
-                    n_lora = apply_lora_to_model(
-                        aggregator, target_names=lora_targets,
-                        rank=lora_rank, alpha=lora_alpha,
-                    )
+                    n_lora = 0
+                    for name, param in aggregator.named_parameters():
+                        # Unfreeze LoRA parameters (lora_down, lora_up)
+                        if 'lora_down' in name or 'lora_up' in name:
+                            param.requires_grad = True
+                            n_lora += 1
+
                     lora_params = sum(
                         p.numel() for p in aggregator.parameters() if p.requires_grad
                     )
                     total_params = sum(p.numel() for p in aggregator.parameters())
                     logging.info(
-                        f"LoRA applied: {n_lora} layers, rank={lora_rank}, "
+                        f"LoRA unfrozen: {n_lora} parameters, rank={lora_rank}, "
                         f"trainable={lora_params:,} / {total_params:,} "
                         f"({100*lora_params/total_params:.2f}%)"
                     )
-                
+
                 # === Priority 1 & 2 Improvements: Enhanced Temporal Encoding + Multi-Scale Features ===
 
                 # Configuration
