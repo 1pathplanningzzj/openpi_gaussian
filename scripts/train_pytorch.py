@@ -26,6 +26,7 @@ Multi-Node Training:
 import dataclasses
 import gc
 import logging
+import math
 import os
 import platform
 import shutil
@@ -320,6 +321,37 @@ def log_memory_usage(device, step, phase="unknown"):
     )
 
 
+def compute_lora_grad_stats(model: torch.nn.Module) -> dict[str, float | int]:
+    """Compute grad/param norms for trainable LoRA parameters."""
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        model = model.module
+
+    grad_sq_sum = 0.0
+    param_sq_sum = 0.0
+    lora_param_count = 0
+    lora_with_grad_count = 0
+
+    for name, param in model.named_parameters():
+        if "lora" not in name.lower():
+            continue
+        if not param.requires_grad:
+            continue
+
+        lora_param_count += 1
+        param_sq_sum += float(param.detach().float().pow(2).sum().item())
+
+        if param.grad is not None:
+            lora_with_grad_count += 1
+            grad_sq_sum += float(param.grad.detach().float().pow(2).sum().item())
+
+    return {
+        "lora_grad_norm": math.sqrt(grad_sq_sum) if grad_sq_sum > 0 else 0.0,
+        "lora_param_norm": math.sqrt(param_sq_sum) if param_sq_sum > 0 else 0.0,
+        "lora_param_count": lora_param_count,
+        "lora_with_grad_count": lora_with_grad_count,
+    }
+
+
 def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
@@ -605,6 +637,17 @@ def train_loop(config: _config.TrainConfig):
 
             # Backward pass
             loss.backward()
+
+            if is_main and global_step % 100 == 0:
+                lora_stats = compute_lora_grad_stats(model)
+                logging.info(
+                    "Step %d: LoRA grad_norm=%.6f param_norm=%.6f params_with_grad=%d/%d",
+                    global_step,
+                    lora_stats["lora_grad_norm"],
+                    lora_stats["lora_param_norm"],
+                    lora_stats["lora_with_grad_count"],
+                    lora_stats["lora_param_count"],
+                )
 
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():

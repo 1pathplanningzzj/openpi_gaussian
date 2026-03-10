@@ -829,6 +829,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
+        save_interval=3000,  # Changed from default 1000 to 3000
     ),
     #
     # Fine-tuning Aloha configs.
