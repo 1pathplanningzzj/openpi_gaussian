@@ -790,46 +790,49 @@ class GaussianAdapter(nn.Module):
                 gaussian_inputs
             )
         
-        # Ensure encoder is in eval mode and disable gradient computation
-        self.encoder.eval()
-        with torch.no_grad():
-            # Clear cache before encoding to save memory
-            torch.cuda.empty_cache()
-            
-            # Use inference mode for better memory efficiency
-            with torch.inference_mode():
-                outputs = self.encoder(gaussian_inputs)
-                
-                # Extract all outputs from VGGT
-                # outputs: depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, aggregated_tokens_list, patch_start_idx
-                depth_maps = outputs[0]  # [B, S, H, W, 1]
-                rot_maps = outputs[1]     # [B, S, H, W, 4]
-                scale_maps = outputs[2]  # [B, S, H, W, 3]
-                opacity_maps = outputs[3] # [B, S, H, W, 1]
-                sh_maps = outputs[4]      # [B, S, H, W, K, 3] where K = (sh_degree+1)^2
-                aggregated_tokens_list = outputs[-2]
-                patch_start_idx = outputs[-1]
-            
-            # Fix NaN: Check VGGT encoder outputs immediately after encoding
-            # This helps identify if NaN comes from encoder itself
-            if torch.isnan(depth_maps).any() or torch.isnan(rot_maps).any() or torch.isnan(scale_maps).any():
-                import warnings
-                warnings.warn("NaN detected in VGGT encoder outputs! This may be due to: 1) Input NaN, 2) Encoder weights NaN, 3) Numerical instability in attention/normalization.")
-                # Log which outputs have NaN for debugging
-                nan_info = {
-                    "depth_maps": torch.isnan(depth_maps).any().item(),
-                    "rot_maps": torch.isnan(rot_maps).any().item(),
-                    "scale_maps": torch.isnan(scale_maps).any().item(),
-                    "opacity_maps": torch.isnan(opacity_maps).any().item(),
-                    "sh_maps": torch.isnan(sh_maps).any().item(),
-                }
-                logging.warning(f"NaN in VGGT outputs: {nan_info}")
-            
-            # Explicitly delete outputs to free memory
-            del outputs
-            
-            # Clear cache after encoding to free memory
-            torch.cuda.empty_cache()
+        # IMPORTANT: only run VGGT in no_grad when fully frozen.
+        # If LoRA/decoder params are trainable, we must keep autograd enabled.
+        encoder_trainable = self.training and any(p.requires_grad for p in self.encoder.parameters())
+
+        if encoder_trainable:
+            self.encoder.train()
+            outputs = self.encoder(gaussian_inputs)
+        else:
+            self.encoder.eval()
+            with torch.no_grad():
+                # Keep the original low-memory path for frozen VGGT.
+                torch.cuda.empty_cache()
+                with torch.inference_mode():
+                    outputs = self.encoder(gaussian_inputs)
+                torch.cuda.empty_cache()
+
+        # Extract all outputs from VGGT
+        # outputs: depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, aggregated_tokens_list, patch_start_idx
+        depth_maps = outputs[0]  # [B, S, H, W, 1]
+        rot_maps = outputs[1]     # [B, S, H, W, 4]
+        scale_maps = outputs[2]  # [B, S, H, W, 3]
+        opacity_maps = outputs[3] # [B, S, H, W, 1]
+        sh_maps = outputs[4]      # [B, S, H, W, K, 3] where K = (sh_degree+1)^2
+        aggregated_tokens_list = outputs[-2]
+        patch_start_idx = outputs[-1]
+
+        # Fix NaN: Check VGGT encoder outputs immediately after encoding
+        # This helps identify if NaN comes from encoder itself
+        if torch.isnan(depth_maps).any() or torch.isnan(rot_maps).any() or torch.isnan(scale_maps).any():
+            import warnings
+            warnings.warn("NaN detected in VGGT encoder outputs! This may be due to: 1) Input NaN, 2) Encoder weights NaN, 3) Numerical instability in attention/normalization.")
+            # Log which outputs have NaN for debugging
+            nan_info = {
+                "depth_maps": torch.isnan(depth_maps).any().item(),
+                "rot_maps": torch.isnan(rot_maps).any().item(),
+                "scale_maps": torch.isnan(scale_maps).any().item(),
+                "opacity_maps": torch.isnan(opacity_maps).any().item(),
+                "sh_maps": torch.isnan(sh_maps).any().item(),
+            }
+            logging.warning(f"NaN in VGGT outputs: {nan_info}")
+
+        # Explicitly delete outputs to free memory
+        del outputs
 
         # Check if we got valid features
         if aggregated_tokens_list is None or (isinstance(aggregated_tokens_list, (list, tuple)) and len(aggregated_tokens_list) == 0):

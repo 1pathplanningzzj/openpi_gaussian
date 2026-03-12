@@ -2,7 +2,7 @@
 import torch
 import jax.numpy as jnp
 from openpi.models.model import Observation
-from openpi.models_pytorch.pi0_pytorch import PI0Pytorch as Pi0
+from openpi.models_pytorch.pi0_pytorch import Pi0
 import numpy as np
 
 def test_depth_slicing():

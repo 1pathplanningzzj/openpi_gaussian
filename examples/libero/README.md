@@ -65,7 +65,7 @@ xvfb-run -a python examples/libero/main.py
 nohup xvfb-run -a python examples/libero/main.py > /dev/null 2>&1 &
 
 # Or redirect both to a custom log file (optional, script also saves to data directory):
-nohup xvfb-run -a python examples/libero/main.py > goal_run_0309.log 2>&1 &
+nohup xvfb-run -a python examples/libero/main.py > goal_run_0310.log 2>&1 &
 
 # Or with screen (detachable session):
 screen -S libero
@@ -83,6 +83,9 @@ uv run --active scripts/serve_policy.py policy:checkpoint --policy.config=pi0_li
 CUDA_VISIBLE_DEVICES=7 uv run --active scripts/serve_policy.py --env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir /data/zijianzhang/train_ckpts/pi05_libero/my_experiment_0120/1000
 
  CUDA_VISIBLE_DEVICES=7 uv run --active scripts/serve_policy.py --env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir /data/zijianzhang/train_ckpts/pi05_libero/gaussian_world_model_exp0126/14000/
+
+CUDA_VISIBLE_DEVICES=7 nohup uv run --active scripts/serve_policy.py --env LIBERO policy:checkpoint --policy.config pi05_libero --policy.dir /data/zijianzhang/train_ckpts/pi05_libero/gaussian_world_model_exp0310/15000/ > serve_policy_0310.log 2>&1 &
+
 Terminal window 2: -->
 ```bash
 # Run the server

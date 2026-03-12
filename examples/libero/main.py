@@ -83,14 +83,14 @@ class Args:
     # Model server parameters
     #################################################################################################################
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 8001
     resize_size: int = 224
 
     # [Plan C] Modified for High Frequency Inference (Closed-Loop)
     # Reducing replan_steps from 2 (or 5) to 1 means we query the expert policy at every single step.
     # This maximizes the response frequency to ~20Hz (Libero native), allowing the robot to react
     # immediately if the object enters the field of view or slips.
-    replan_steps: int = 5
+    replan_steps: int = 10
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -104,7 +104,7 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/gaussian_world_model_exp0309_12000_goal/videos"  # Path to save videos
+    video_out_path: str = "data/gaussian_world_model_exp0310_14000_goal/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
 
