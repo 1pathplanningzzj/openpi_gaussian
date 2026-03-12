@@ -322,7 +322,7 @@ We will collect common issues and their solutions here. If you encounter an issu
 | Action dimensions mismatch                | Verify your data processing transforms match the expected input/output dimensions of your robot. Check the action space definitions in your policy classes.                                  |
 | Diverging training loss                            | Check the `q01`, `q99`, and `std` values in `norm_stats.json` for your dataset. Certain dimensions that are rarely used can end up with very small `q01`, `q99`, or `std` values, leading to huge states and actions after normalization. You can manually adjust the norm stats as a workaround. |
 
-CUDA_VISIBLE_DEVICES=1 uv run --active scripts/train_pytorch.py pi05_libero \
+CUDA_VISIBLE_DEVICES=6 uv run --active scripts/train_pytorch.py pi05_libero \
     --exp-name=my_experiment \
     --overwrite \
     --checkpoint_base_dir=/data/zijianzhang/train_ckpts/
@@ -348,8 +348,8 @@ CUDA_VISIBLE_DEVICES=1,2,3,4 nohup uv_venv/bin/torchrun \
     --nnodes=1 \
     --nproc_per_node=4 \
     scripts/train_pytorch.py pi05_libero \
-    --exp_name gaussian_world_model_exp0310 \
-    --checkpoint_base_dir /data/zijianzhang/train_ckpts > training_exp0310_ddp.log 2>&1 &
+    --exp_name gaussian_world_model_exp0312 \
+    --checkpoint_base_dir /data/zijianzhang/train_ckpts > training_exp0312_ddp.log 2>&1 &
 
 # 从 checkpoint 恢复训练（添加 --resume 参数）
 CUDA_VISIBLE_DEVICES=0,1,2,3 nohup uv_venv/bin/torchrun \

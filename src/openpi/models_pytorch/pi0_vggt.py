@@ -400,28 +400,21 @@ class GaussianAdapter(nn.Module):
                 self.encoder = VGGT3DGSModel(sh_degree=4, min_depth=1.5, max_depth=100.0)
                 
                 # Freeze/Unfreeze Encoder based on configuration
+                # NOTE: gs_head/gs_feathead/depth_head are no longer run in forward()
+                # (only aggregator is used), so we freeze the entire encoder by default
+                # and only selectively unfreeze LoRA in the aggregator.
                 if unfreeze_encoder:
                     # Unfreeze entire encoder for end-to-end training
                     for param in self.encoder.parameters():
                         param.requires_grad = True
                     self.encoder.train()
-                    logging.info("VGGT encoder is UNFROZEN - will be trained with reconstruction loss")
-                elif unfreeze_decoder_only:
-                    # Freeze encoder backbone, but unfreeze decoder (gs_head) and depth_head
-                    for name, param in self.encoder.named_parameters():
-                        if 'gs_head' in name or 'gs_feathead' in name or 'depth_head' in name:
-                            param.requires_grad = True
-                        else:
-                            param.requires_grad = False
-                    # Set encoder to train mode so decoder/depth_head can be trained
-                    self.encoder.train()
-                    logging.info("VGGT encoder backbone is FROZEN, but decoder (gs_head) and depth_head are UNFROZEN")
+                    logging.info("VGGT encoder is UNFROZEN - will be trained end-to-end")
                 else:
-                    # Fully freeze encoder (original behavior)
+                    # Freeze entire encoder (gs_head/depth_head are skipped in forward)
                     for param in self.encoder.parameters():
                         param.requires_grad = False
                     self.encoder.eval()
-                    logging.info("VGGT encoder is FROZEN (original behavior)")
+                    logging.info("VGGT encoder is FROZEN (only aggregator LoRA will be unfrozen if use_lora=True)")
 
                 # Unfreeze LoRA parameters in encoder backbone (if use_lora=True)
                 # VGGT pretrained model already has LoRA layers (lora_down, lora_up)
@@ -790,66 +783,40 @@ class GaussianAdapter(nn.Module):
                 gaussian_inputs
             )
         
-        # IMPORTANT: only run VGGT in no_grad when fully frozen.
-        # If LoRA/decoder params are trainable, we must keep autograd enabled.
+        # Only run VGGT aggregator (backbone) — skip depth_head/gs_head
+        # since depth & Gaussian params are predicted by the independent
+        # GaussianDecoder (world_model) later.  This saves significant
+        # GPU memory and compute.
         encoder_trainable = self.training and any(p.requires_grad for p in self.encoder.parameters())
 
         if encoder_trainable:
             self.encoder.train()
-            outputs = self.encoder(gaussian_inputs)
+            with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                aggregated_tokens_list, patch_start_idx = self.encoder.aggregator(
+                    gaussian_inputs.to(torch.bfloat16)
+                )
         else:
             self.encoder.eval()
             with torch.no_grad():
-                # Keep the original low-memory path for frozen VGGT.
                 torch.cuda.empty_cache()
                 with torch.inference_mode():
-                    outputs = self.encoder(gaussian_inputs)
+                    with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                        aggregated_tokens_list, patch_start_idx = self.encoder.aggregator(
+                            gaussian_inputs.to(torch.bfloat16)
+                        )
                 torch.cuda.empty_cache()
-
-        # Extract all outputs from VGGT
-        # outputs: depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, aggregated_tokens_list, patch_start_idx
-        depth_maps = outputs[0]  # [B, S, H, W, 1]
-        rot_maps = outputs[1]     # [B, S, H, W, 4]
-        scale_maps = outputs[2]  # [B, S, H, W, 3]
-        opacity_maps = outputs[3] # [B, S, H, W, 1]
-        sh_maps = outputs[4]      # [B, S, H, W, K, 3] where K = (sh_degree+1)^2
-        aggregated_tokens_list = outputs[-2]
-        patch_start_idx = outputs[-1]
-
-        # Fix NaN: Check VGGT encoder outputs immediately after encoding
-        # This helps identify if NaN comes from encoder itself
-        if torch.isnan(depth_maps).any() or torch.isnan(rot_maps).any() or torch.isnan(scale_maps).any():
-            import warnings
-            warnings.warn("NaN detected in VGGT encoder outputs! This may be due to: 1) Input NaN, 2) Encoder weights NaN, 3) Numerical instability in attention/normalization.")
-            # Log which outputs have NaN for debugging
-            nan_info = {
-                "depth_maps": torch.isnan(depth_maps).any().item(),
-                "rot_maps": torch.isnan(rot_maps).any().item(),
-                "scale_maps": torch.isnan(scale_maps).any().item(),
-                "opacity_maps": torch.isnan(opacity_maps).any().item(),
-                "sh_maps": torch.isnan(sh_maps).any().item(),
-            }
-            logging.warning(f"NaN in VGGT outputs: {nan_info}")
-
-        # Explicitly delete outputs to free memory
-        del outputs
 
         # Check if we got valid features
         if aggregated_tokens_list is None or (isinstance(aggregated_tokens_list, (list, tuple)) and len(aggregated_tokens_list) == 0):
             logging.warning("No features extracted from Gaussian Encoder.")
             return (None, None) if not return_gaussian_params else (None, None, None)
-        
-        # Store decoded Gaussian parameters if requested
+
+        # VGGT depth/gs heads are no longer run here — Gaussian params
+        # are predicted by the independent GaussianDecoder (world_model).
         gaussian_params_dict = None
         if return_gaussian_params:
-            gaussian_params_dict = {
-                "depth_maps": depth_maps,      # [B, S, H, W, 1]
-                "rot_maps": rot_maps,          # [B, S, H, W, 4]
-                "scale_maps": scale_maps,      # [B, S, H, W, 3]
-                "opacity_maps": opacity_maps,  # [B, S, H, W, 1]
-                "sh_maps": sh_maps             # [B, S, H, W, K, 3]
-            }
-        
+            logging.warning("return_gaussian_params=True but VGGT heads are skipped. Returning None.")
+
         # Visualize if requested and step is a multiple of 100
         # Note: LGPD gate will be available after LGPD is applied below
         visualize_gate = False

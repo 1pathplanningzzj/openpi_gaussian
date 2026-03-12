@@ -225,6 +225,9 @@ class PI0Pytorch(nn.Module):
             self.world_model = GaussianDecoder(
                 token_dim=paligemma_config.width,
                 input_num_tokens=256,
+                # Disable action conditioning for future-query decoding.
+                # This removes the action coupling path while keeping future-query tokens enabled.
+                use_action_conditioning=False,
             )
 
             # Initialize Gaussian Renderer (sh_degree=1 for DC + 1st order SH)
@@ -812,11 +815,16 @@ class PI0Pytorch(nn.Module):
 
     def _get_camera_params_for_view(self, view_name, device, batch_size):
         """Get camera parameters for specific view (agent or wrist)."""
-        fov_deg = 60.0
+        # LIBERO camera intrinsics for 256×256 depth resolution
+        # Must match depth2pc input size (256×256), NOT the image encoder size (224)
+        W = 256.0
+        H = 256.0
+        fx = 221.7025
+        fy = 221.7025
+        cx = W / 2.0   # 128.0
+        cy = H / 2.0   # 128.0
+        fov_deg = 2.0 * math.degrees(math.atan(W / (2.0 * fx)))  # ~60° derived from fx
         tanfov = math.tan(0.5 * math.radians(fov_deg))
-        W = 224.0
-        fx = W / (2.0 * tanfov)
-        cx = W / 2.0
         
         # Helper for Projection Matrix (OpenGL style)
         def getProjectionMatrix(znear, zfar, fovX, fovY):
@@ -836,9 +844,9 @@ class PI0Pytorch(nn.Module):
         # Intrinsics (same for both views)
         intrinsics = torch.eye(3, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
         intrinsics[:, 0, 0] = fx
-        intrinsics[:, 1, 1] = fx
+        intrinsics[:, 1, 1] = fy
         intrinsics[:, 0, 2] = cx
-        intrinsics[:, 1, 2] = cx
+        intrinsics[:, 1, 2] = cy
 
         if view_name == "agent":
             # Agent camera: identity viewmatrix (no translation)
@@ -889,9 +897,9 @@ class PI0Pytorch(nn.Module):
             "campos": campos,  # Now correctly computed from viewmatrix
             "intrinsics": intrinsics,
             "fx": fx,
-            "fy": fx,
+            "fy": fy,
             "cx": cx,
-            "cy": cx,
+            "cy": cy,
             "camera_pos": camera_pos,
             "camera_quat": camera_quat,
         }
@@ -1091,7 +1099,6 @@ class PI0Pytorch(nn.Module):
                     # Decode predicted tokens to 3D Gaussians (with gradients)
                     gaussian_params = self.world_model.decode(
                         z_next_float32,
-                        actions=actions,  # NEW: Pass ground-truth actions for conditioning
                         future_observation=future_observation,
                         gaussian_adapter=self.gaussian_adapter,
                         camera_params=camera_params_for_decode,
