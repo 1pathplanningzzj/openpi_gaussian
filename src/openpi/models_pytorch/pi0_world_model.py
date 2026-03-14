@@ -472,7 +472,7 @@ class GaussianDecoder(nn.Module):
         xyz = torch.clamp(xyz, min=-100.0, max=100.0)
         xyz = torch.where(torch.isnan(xyz) | torch.isinf(xyz), torch.zeros_like(xyz), xyz)
 
-        if step is not None and step % 40 == 0:
+        if step is not None and step % 100 == 0:
             import logging
             logging.info(f"[IndependentDecoder] Step {step}: "
                          f"depth=[{final_depth.min():.3f}, {final_depth.max():.3f}], "

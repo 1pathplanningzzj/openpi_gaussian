@@ -594,27 +594,6 @@ def train_loop(config: _config.TrainConfig):
     raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
 
     while global_step < config.num_train_steps:
-        # Staged training: apply correct stage based on current global_step
-        if staged_training_enabled and global_step < stage1_steps:
-            # Stage 1: Freeze action expert, train only render+depth path
-            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
-                if hasattr(raw_model, 'freeze_action_expert'):
-                    raw_model.freeze_action_expert()
-                    raw_model.set_render_loss_weight(stage1_render_weight)
-                    raw_model._stage_applied = 1
-                    if is_main:
-                        logging.info(f"=== Stage 1 Active: Render+Depth Only (render_weight={stage1_render_weight}) ===")
-
-        elif staged_training_enabled and global_step >= stage1_steps:
-            # Stage 2: Unfreeze action expert, joint training with lower render weight
-            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 2:
-                if hasattr(raw_model, 'unfreeze_action_expert'):
-                    raw_model.unfreeze_action_expert()
-                    raw_model.set_render_loss_weight(stage2_render_weight)
-                    raw_model._stage_applied = 2
-                    if is_main:
-                        logging.info(f"=== Stage 2 Started: Joint Training (render_weight={stage2_render_weight}) ===")
-
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
@@ -623,6 +602,27 @@ def train_loop(config: _config.TrainConfig):
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
+
+            # Staged training: apply correct stage based on current global_step (checked every step)
+            if staged_training_enabled and global_step < stage1_steps:
+                # Stage 1: Freeze action expert, train only render+depth path
+                if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
+                    if hasattr(raw_model, 'freeze_action_expert'):
+                        raw_model.freeze_action_expert()
+                        raw_model.set_render_loss_weight(stage1_render_weight)
+                        raw_model._stage_applied = 1
+                        if is_main:
+                            logging.info(f"=== Stage 1 Active: Render+Depth Only (render_weight={stage1_render_weight}) ===")
+
+            elif staged_training_enabled and global_step >= stage1_steps:
+                # Stage 2: Unfreeze action expert, joint training with lower render weight
+                if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 2:
+                    if hasattr(raw_model, 'unfreeze_action_expert'):
+                        raw_model.unfreeze_action_expert()
+                        raw_model.set_render_loss_weight(stage2_render_weight)
+                        raw_model._stage_applied = 2
+                        if is_main:
+                            logging.info(f"=== Stage 2 Started: Joint Training (render_weight={stage2_render_weight}) ===")
 
             # The unified data loader returns (observation, actions) tuple
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901

@@ -818,6 +818,8 @@ _CONFIGS = [
             use_world_model=True,
             render_loss_weight=0.2,
             depth_loss_weight=0.1,
+            use_lpips=True,  # Enable LPIPS perceptual loss
+            lpips_weight=0.1,  # Weight for LPIPS loss
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
@@ -841,7 +843,7 @@ _CONFIGS = [
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
         save_interval=3000,  # Changed from default 1000 to 3000
-        stage1_steps=10_000,  # Stage 1: render+depth only (freeze action expert)
+        stage1_steps=5_000,  # Stage 1: render+depth only (freeze action expert)
         stage1_render_weight=0.2,  # Lower render weight to encourage colorful predictions
         stage2_render_weight=0.1,  # Lower render weight for joint training
     ),

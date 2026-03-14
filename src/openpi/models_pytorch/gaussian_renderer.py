@@ -538,11 +538,40 @@ def compute_ssim_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return torch.clamp((1 - ssim_map) / 2, 0, 1)
 
 
-def compute_photometric_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Combined photometric loss: 0.85 * SSIM + 0.15 * L1. Returns scalar."""
+def compute_photometric_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    lpips_fn: Optional[callable] = None,
+    lpips_weight: float = 0.1
+) -> torch.Tensor:
+    """
+    Combined photometric loss: 0.85 * SSIM + 0.15 * L1 + optional LPIPS.
+
+    Args:
+        pred: [B, 3, H, W] predicted image
+        target: [B, 3, H, W] target image
+        lpips_fn: Optional LPIPS loss function
+        lpips_weight: Weight for LPIPS loss (default 0.1)
+
+    Returns:
+        Scalar loss
+    """
     l1_loss = (target - pred).abs().mean(1, True)
     ssim_loss = compute_ssim_loss(pred, target).mean(1, True)
-    return (0.85 * ssim_loss + 0.15 * l1_loss).mean()
+    base_loss = (0.85 * ssim_loss + 0.15 * l1_loss).mean()
+
+    # Add LPIPS perceptual loss if available
+    if lpips_fn is not None:
+        # Clamp inputs to [0, 1] range to ensure valid input domain
+        pred_clamped = torch.clamp(pred, 0.0, 1.0)
+        target_clamped = torch.clamp(target, 0.0, 1.0)
+        # LPIPS expects input in [-1, 1] range
+        pred_norm = pred_clamped * 2.0 - 1.0
+        target_norm = target_clamped * 2.0 - 1.0
+        lpips_loss = lpips_fn(pred_norm, target_norm).mean()
+        return base_loss + lpips_weight * lpips_loss
+
+    return base_loss
 
 
 def compute_edge_smooth_loss(rgb: torch.Tensor, disp_map: torch.Tensor) -> torch.Tensor:
@@ -579,10 +608,12 @@ def compute_rendering_loss(
     camera_params: Dict[str, torch.Tensor],
     renderer: GaussianRenderer,
     M_attn: Optional[torch.Tensor] = None,
-    step: Optional[int] = None
+    step: Optional[int] = None,
+    lpips_fn: Optional[callable] = None,
+    lpips_weight: float = 0.1
 ) -> torch.Tensor:
     """
-    Compute rendering loss (L1 + SSIM photometric) with optional attention masking.
+    Compute rendering loss (L1 + SSIM photometric + optional LPIPS) with optional attention masking.
 
     Args:
         gaussian_params: 3D Gaussian parameters
@@ -590,6 +621,9 @@ def compute_rendering_loss(
         camera_params: Camera parameters
         renderer: GaussianRenderer instance
         M_attn: [B, H, W] - Optional attention mask
+        step: Current training step
+        lpips_fn: Optional LPIPS loss function
+        lpips_weight: Weight for LPIPS loss
 
     Returns:
         loss: Scalar rendering loss
@@ -598,14 +632,27 @@ def compute_rendering_loss(
     rendered_image = renderer(gaussian_params, camera_params, step=step)
 
     if M_attn is not None:
-        # Masked photometric loss
+        # Masked photometric loss (base: SSIM + L1)
         l1_loss = (rendered_image - target_image).abs()
         ssim_loss = compute_ssim_loss(rendered_image, target_image)
         pixel_loss = 0.85 * ssim_loss + 0.15 * l1_loss
         weighted_loss = M_attn.unsqueeze(1) * pixel_loss
-        loss = weighted_loss.mean()
+        base_loss = weighted_loss.mean()
+
+        # Add LPIPS perceptual loss if available (applied to full images, not masked)
+        if lpips_fn is not None:
+            # Clamp inputs to [0, 1] range
+            pred_clamped = torch.clamp(rendered_image, 0.0, 1.0)
+            target_clamped = torch.clamp(target_image, 0.0, 1.0)
+            # LPIPS expects input in [-1, 1] range
+            pred_norm = pred_clamped * 2.0 - 1.0
+            target_norm = target_clamped * 2.0 - 1.0
+            lpips_loss = lpips_fn(pred_norm, target_norm).mean()
+            loss = base_loss + lpips_weight * lpips_loss
+        else:
+            loss = base_loss
     else:
-        loss = compute_photometric_loss(rendered_image, target_image)
+        loss = compute_photometric_loss(rendered_image, target_image, lpips_fn, lpips_weight)
 
     return loss
 
@@ -622,6 +669,8 @@ def compute_multi_view_rendering_loss(
     lambda_scale: float = 0.001,
     lambda_opacity: float = 0.001,
     lambda_edge_smooth: float = 0.01,
+    lpips_fn: Optional[callable] = None,
+    lpips_weight: float = 0.1,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Compute multi-view rendering loss with regularization and edge-aware depth smoothness.
@@ -638,6 +687,8 @@ def compute_multi_view_rendering_loss(
         lambda_scale: Weight for scale regularization
         lambda_opacity: Weight for opacity regularization
         lambda_edge_smooth: Weight for edge-aware depth smoothness
+        lpips_fn: Optional LPIPS loss function
+        lpips_weight: Weight for LPIPS perceptual loss
 
     Returns:
         total_loss: Total rendering loss across all views
@@ -655,7 +706,8 @@ def compute_multi_view_rendering_loss(
             M_attn = M_attn_dict.get(view_name) if M_attn_dict is not None else None
 
             view_loss = compute_rendering_loss(
-                gaussian_params, target_image, camera_params, renderer, M_attn, step=step
+                gaussian_params, target_image, camera_params, renderer, M_attn, step=step,
+                lpips_fn=lpips_fn, lpips_weight=lpips_weight
             )
 
             loss_dict[f"loss_render_{view_name}"] = view_loss

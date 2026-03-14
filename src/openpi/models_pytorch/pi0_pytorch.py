@@ -124,7 +124,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0313_0.2_0.1")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0314_lpips")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -251,6 +251,22 @@ class PI0Pytorch(nn.Module):
             except ImportError:
                 self.gaussian_renderer = None
                 logging.warning("Gaussian Renderer not available. Skipping rendering loss.")
+
+            # Initialize LPIPS perceptual loss (optional)
+            self.lpips_fn = None
+            self.lpips_weight = getattr(config, "lpips_weight", 0.1)
+            if getattr(config, "use_lpips", False):
+                try:
+                    import lpips
+                    # Initialize LPIPS and move to the same device as the model
+                    self.lpips_fn = lpips.LPIPS(net='vgg')
+                    # Set to eval mode and freeze parameters
+                    self.lpips_fn.eval()
+                    for param in self.lpips_fn.parameters():
+                        param.requires_grad = False
+                    logging.info(f"LPIPS perceptual loss initialized with weight={self.lpips_weight}")
+                except ImportError:
+                    logging.warning("lpips package not installed. Install with: pip install lpips")
         else:
             self.world_model = None
             self.gaussian_renderer = None
@@ -1062,6 +1078,12 @@ class PI0Pytorch(nn.Module):
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         images, img_masks, lang_tokens, lang_masks, state, future_observation, preprocessed_observation = self._preprocess_observation(observation, train=True)
 
+        # Move LPIPS to the correct device if initialized
+        if self.lpips_fn is not None and hasattr(self.lpips_fn, 'net'):
+            device = actions.device
+            if next(self.lpips_fn.parameters()).device != device:
+                self.lpips_fn = self.lpips_fn.to(device)
+
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -1289,6 +1311,8 @@ class PI0Pytorch(nn.Module):
                             lambda_scale=0.001,
                             lambda_opacity=0.01,  # 增大10倍: 0.001 → 0.01 (防止opacity过大导致模糊)
                             lambda_edge_smooth=0.01,
+                            lpips_fn=self.lpips_fn,
+                            lpips_weight=self.lpips_weight,
                         )
                         # Use dynamic render_loss_weight (can be changed for staged training)
                         if torch.isfinite(render_loss):

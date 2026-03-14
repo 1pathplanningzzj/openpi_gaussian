@@ -83,7 +83,7 @@ class Args:
     # Model server parameters
     #################################################################################################################
     host: str = "0.0.0.0"
-    port: int = 8001
+    port: int = 8000
     resize_size: int = 224
 
     # [Plan C] Modified for High Frequency Inference (Closed-Loop)
@@ -96,7 +96,7 @@ class Args:
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = (
-        "libero_10"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+        "libero_goal"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
@@ -104,7 +104,7 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/gaussian_world_model_exp0312_15000_libero_10/videos"  # Path to save videos
+    video_out_path: str = "data/gaussian_world_model_exp0314_12000_goal/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
 

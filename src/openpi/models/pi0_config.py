@@ -43,6 +43,9 @@ class Pi0Config(_model.BaseModelConfig):
     render_loss_weight: float = 0.1  # Weight for rendering loss (RGB + regularization) - reduced to let action loss dominate
     # Depth supervision loss weight
     depth_loss_weight: float = 0.02  # Weight for depth supervision loss (from Depth Anything V2) - reduced to let action loss dominate
+    # LPIPS perceptual loss options
+    use_lpips: bool = False  # Whether to use LPIPS perceptual loss for rendering
+    lpips_weight: float = 0.1  # Weight for LPIPS perceptual loss
     # Regularization weight for future-token delta magnitude (encourages stable delta prediction).
     future_delta_reg_weight: float = 1e-4
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
