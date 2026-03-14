@@ -371,8 +371,13 @@ class GaussianDecoder(nn.Module):
         if vggt_inputs is None:
             raise ValueError("Failed to prepare VGGT inputs")
 
-        # Decode VLM tokens → Gaussian params + depth (without image residual)
-        decoder_output = self.gaussian_head(z, images=None)
+        # Extract current frame image for residual feature fusion
+        B_vggt, S_vggt = vggt_inputs.shape[:2]
+        frame_idx = S_vggt - 1
+        current_frame_img = vggt_inputs[:, frame_idx]  # [B, 3, H_vggt, W_vggt]
+
+        # Decode VLM tokens → Gaussian params + depth (with current frame residual)
+        decoder_output = self.gaussian_head(z, images=current_frame_img)
         raw = decoder_output['gaussian_params']  # [B, 17, 256, 256]
         rot_raw, scale_raw, opa_raw, sh_raw = raw.split([4, 3, 1, 9], dim=1)
 
@@ -485,6 +490,7 @@ class GaussianDecoder(nn.Module):
 
     def _transform_action_to_camera(self, actions, camera_params):
         """
+        quit ** 0313
         Transform actions from world frame to camera frame.
 
         Args:

@@ -357,6 +357,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 nohup uv_venv/bin/torchrun \
     --nnodes=1 \
     --nproc_per_node=4 \
     scripts/train_pytorch.py pi05_libero \
-    --exp_name gaussian_world_model_exp0309 \
+    --exp_name gaussian_world_model_exp0313 \
     --checkpoint_base_dir /data/zijianzhang/train_ckpts \
-    --resume > training_exp0309_ddp.log 2>&1 &
+    --resume > training_exp0313_ddp.log 2>&1 &

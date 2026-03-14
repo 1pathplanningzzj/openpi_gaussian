@@ -578,9 +578,12 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
-    # Staged training: if > 0, train only action for first stage1_steps, then train both action and world model
+    # Staged training: if > 0, Stage 1 trains render+depth only (freeze action expert),
+    # Stage 2 unfreezes action expert for joint training
     stage1_steps: int = 0
-    # Render loss weight for stage 2 (after stage1_steps)
+    # Render loss weight for stage 1 (render+depth only, lower to encourage colorful predictions)
+    stage1_render_weight: float = 0.2
+    # Render loss weight for stage 2 (joint training, lower so action loss dominates)
     stage2_render_weight: float = 0.1
 
     @property
@@ -807,7 +810,15 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False, use_gaussian=True, use_world_model=True),
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            use_gaussian=True,
+            use_world_model=True,
+            render_loss_weight=0.2,
+            depth_loss_weight=0.1,
+        ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             # zijian ‘s users data is located at /data/zijianzhang/LIBERA/physical-intelligence/libero
@@ -830,6 +841,9 @@ _CONFIGS = [
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
         save_interval=3000,  # Changed from default 1000 to 3000
+        stage1_steps=10_000,  # Stage 1: render+depth only (freeze action expert)
+        stage1_render_weight=0.2,  # Lower render weight to encourage colorful predictions
+        stage2_render_weight=0.1,  # Lower render weight for joint training
     ),
     #
     # Fine-tuning Aloha configs.

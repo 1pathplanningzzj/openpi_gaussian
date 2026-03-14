@@ -124,7 +124,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0310")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0313_0.2_0.1")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -160,9 +160,23 @@ class PI0Pytorch(nn.Module):
             self.world_token_proj = None
 
             # Future query tokens: learnable embeddings predicted by VLM
-            # Initialize with spatial structure awareness
+            # These represent "delta queries" for predicting changes from current frame
             self.future_query_tokens = nn.Parameter(
                 torch.randn(1, self.future_token_count, paligemma_config.width) * 0.02
+            )
+
+            # Temporal base weights: learnable weights for combining [t-2, t-1, t] to form base
+            # Initialized to favor recent frames: [0.1, 0.2, 0.7]
+            self.temporal_base_w = nn.Parameter(torch.tensor([0.1, 0.2, 0.7]))
+
+            # Delta scale raw parameter. We optimize a raw scalar and map it via softplus
+            # so the effective scale stays positive. Initialize so softplus(raw) = 0.3.
+            init_delta_scale = torch.tensor(0.3, dtype=torch.float32)
+            self.delta_scale = nn.Parameter(torch.log(torch.expm1(init_delta_scale)))
+
+            # Delta role embedding: signals that future tokens predict changes, not full state
+            self.future_delta_embed = nn.Parameter(
+                torch.randn(1, 1, paligemma_config.width) * 0.02
             )
 
             # === NEW: Spatial Positional Encoding (16×16 grid) ===
@@ -243,8 +257,11 @@ class PI0Pytorch(nn.Module):
 
         # Initialize render loss weight (can be changed dynamically for staged training)
         self.render_loss_weight = getattr(config, "render_loss_weight", 0.1)  # 降低render loss权重，让action loss主导
-        # Initialize depth supervision loss weight
-        self.depth_loss_weight = getattr(config, "depth_loss_weight", 0.02)  # 降低depth loss权重，让action loss主导
+        # Initialize depth supervision loss weight (higher to prioritize geometry)
+        self.depth_loss_weight = getattr(config, "depth_loss_weight", 0.1)  # 提高depth loss权重，优先学习几何
+        # Keep future-token edits bounded to stabilize base+delta learning.
+        self.future_delta_reg_weight = getattr(config, "future_delta_reg_weight", 1e-4)
+        self._action_loss_enabled = True  # Can be toggled by freeze/unfreeze_action_expert
         # -------------------------------
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
@@ -297,6 +314,33 @@ class PI0Pytorch(nn.Module):
             for param in self.gaussian_adapter.parameters():
                 param.requires_grad = True
             logging.info("Unfroze Gaussian Adapter")
+
+    def _get_action_mlp_modules(self):
+        """Get the time/state MLP modules based on pi05 mode."""
+        if self.pi05:
+            return [self.time_mlp_in, self.time_mlp_out]
+        else:
+            return [self.state_proj, self.action_time_mlp_in, self.action_time_mlp_out]
+
+    def freeze_action_expert(self):
+        """Freeze action expert and related projections for Stage 1 (render+depth only)."""
+        for param in self.paligemma_with_expert.gemma_expert.parameters():
+            param.requires_grad = False
+        for module in [self.action_in_proj, self.action_out_proj] + self._get_action_mlp_modules():
+            for param in module.parameters():
+                param.requires_grad = False
+        self._action_loss_enabled = False
+        logging.info("Froze Action Expert + projections, disabled action loss")
+
+    def unfreeze_action_expert(self):
+        """Unfreeze action expert for Stage 2 (joint training)."""
+        for param in self.paligemma_with_expert.gemma_expert.parameters():
+            param.requires_grad = True
+        for module in [self.action_in_proj, self.action_out_proj] + self._get_action_mlp_modules():
+            for param in module.parameters():
+                param.requires_grad = True
+        self._action_loss_enabled = True
+        logging.info("Unfroze Action Expert + projections, enabled action loss")
 
     def set_render_loss_weight(self, weight: float):
         """Dynamically set render loss weight for stage-based training."""
@@ -681,15 +725,47 @@ class PI0Pytorch(nn.Module):
             # World tokens can attend to all previous tokens (images, language, gaussian)
             att_masks += [0] * self.world_token_count
         
-        # --- Add Future Query Tokens (Coupled Mask) with Spatial Positional Encoding ---
+        # --- Add Future Query Tokens (Coupled Mask) with Temporal Base ---
         if self.use_world_tokens_in_prefix and self.future_query_tokens is not None:
             B = pad_masks[0].shape[0] if pad_masks else 1
             device = pad_masks[0].device if pad_masks else next(self.parameters()).device
+            token_dim = self.future_query_tokens.shape[-1]
+            future_dtype = self.future_query_tokens.dtype
 
-            # 1. Expand future query tokens to batch
-            future_tokens = self.future_query_tokens.expand(B, -1, -1)  # [B, 256, D]
+            # 1. Construct temporal base from gaussian_embs
+            if gaussian_embs is not None:
+                num_tokens = gaussian_embs.shape[1]
+                D = gaussian_embs.shape[-1]
 
-            # 2. Add spatial positional encoding (16×16 grid structure)
+                if num_tokens == 768:  # 3 frames * 256 tokens (training)
+                    # Reshape to [B, 3, 256, D] for [t-2, t-1, t]
+                    g = gaussian_embs.view(B, 3, 256, -1)
+                    z_t2, z_t1, z_t = g[:, 0], g[:, 1], g[:, 2]  # Each [B, 256, D]
+
+                    # Learnable temporal weighting (softmax to ensure sum=1, stable)
+                    w = torch.softmax(self.temporal_base_w, dim=0)  # [3]
+                    z_base = w[0] * z_t2 + w[1] * z_t1 + w[2] * z_t  # [B, 256, D]
+
+                elif num_tokens == 256:  # Single frame (inference fallback)
+                    # Use the single frame as base
+                    z_base = gaussian_embs  # [B, 256, D]
+
+                else:
+                    # Unexpected shape: use zero base
+                    z_base = torch.zeros(B, self.future_token_count, D, device=device, dtype=future_dtype)
+            else:
+                # No gaussian_embs: use zero base
+                z_base = torch.zeros(B, self.future_token_count, token_dim, device=device, dtype=future_dtype)
+
+            # 2. Delta query tokens (learnable, predict changes)
+            delta_q = self.future_query_tokens.expand(B, -1, -1)  # [B, 256, D]
+            z_base = z_base.to(delta_q.dtype)
+            delta_scale = F.softplus(self.delta_scale)
+
+            # 3. Combine: future = base + scaled_delta + role_embed
+            future_tokens = z_base + delta_scale * delta_q + self.future_delta_embed  # [B, 256, D]
+
+            # 4. Add spatial positional encoding (16×16 grid structure)
             # Reshape spatial pos: [16, 16, D] -> [256, D]
             spatial_pos = self.future_spatial_pos.reshape(1, self.future_token_count, -1)  # [1, 256, D]
 
@@ -1056,7 +1132,12 @@ class PI0Pytorch(nn.Module):
         suffix_out = self.action_out_proj(suffix_out)
         
         # Base Action Loss (Flow Matching)
-        loss = F.mse_loss(suffix_out, u_t)
+        if self._action_loss_enabled:
+            loss = F.mse_loss(suffix_out, u_t)
+        else:
+            # Use suffix_out * 0 to keep grad_fn alive even when action loss is disabled,
+            # so backward() won't fail if render/depth branches are skipped for a batch.
+            loss = (suffix_out * 0).sum()
         
         # --- Extract Future Frame Tokens from Prefix Output (NEW) ---
         z_t1_pred_tokens = None
@@ -1080,6 +1161,21 @@ class PI0Pytorch(nn.Module):
             if step is not None and step % 100 == 0:
                 print(f"[DEBUG] Extracted future tokens: shape={z_t1_pred_tokens.shape}, "
                       f"start={future_start}, end={future_end}, segment_lengths={segment_lengths}")
+
+            # Future-delta regularization: keep z_t1 close to current-frame token base unless needed.
+            gaussian_len = segment_lengths.get("gaussian", 0)
+            if gaussian_len >= self.future_token_count:
+                gaussian_end = gaussian_len
+                z_t_base_tokens = prefix_out[:, gaussian_end - self.future_token_count:gaussian_end, :]
+                delta_tokens = z_t1_pred_tokens - z_t_base_tokens
+                delta_reg = self.future_delta_reg_weight * delta_tokens.float().pow(2).mean()
+                if torch.isfinite(delta_reg):
+                    loss = loss + delta_reg.to(loss.dtype)
+                if step is not None and step % 100 == 0:
+                    logging.info(
+                        f"Step {step}: Future Delta Reg = {delta_reg.item():.6f}, "
+                        f"weight={self.future_delta_reg_weight}"
+                    )
 
         # --- World Model Render Loss (render-only, no forward loss) ---
         if self.use_world_tokens_in_prefix and z_t1_pred_tokens is not None and future_observation is not None:

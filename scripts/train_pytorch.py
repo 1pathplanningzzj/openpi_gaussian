@@ -581,31 +581,39 @@ def train_loop(config: _config.TrainConfig):
 
     # Staged training configuration
     stage1_steps = getattr(config, "stage1_steps", 0)  # 0 means no staged training
-    stage2_render_weight = getattr(config, "stage2_render_weight", 0.1)
+    stage1_render_weight = getattr(config, "stage1_render_weight", 0.5)  # render weight for stage 1 (render+depth only)
+    stage2_render_weight = getattr(config, "stage2_render_weight", 0.1)  # render weight for stage 2 (joint)
     staged_training_enabled = stage1_steps > 0
 
     if staged_training_enabled and is_main:
         logging.info(f"=== Staged Training Enabled ===")
-        logging.info(f"Stage 1 (Action-only): steps 0-{stage1_steps}")
+        logging.info(f"Stage 1 (Render+Depth only): steps 0-{stage1_steps}, render_weight={stage1_render_weight}")
         logging.info(f"Stage 2 (Joint training): steps {stage1_steps}-{config.num_train_steps}, render_weight={stage2_render_weight}")
 
-    while global_step < config.num_train_steps:
-        # Staged training: switch stages at the configured step
-        if staged_training_enabled and global_step == 0:
-            # Stage 1: Freeze world model, disable render loss
-            if hasattr(model, 'freeze_world_model'):
-                model.freeze_world_model()
-                model.set_render_loss_weight(0.0)
-                if is_main:
-                    logging.info(f"=== Stage 1 Started: Action-Only Training ===")
+    # Get the underlying model (unwrap DDP if needed)
+    raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
 
-        elif staged_training_enabled and global_step == stage1_steps:
-            # Stage 2: Unfreeze world model, enable render loss with low weight
-            if hasattr(model, 'unfreeze_world_model'):
-                model.unfreeze_world_model()
-                model.set_render_loss_weight(stage2_render_weight)
-                if is_main:
-                    logging.info(f"=== Stage 2 Started: Joint Training (render_weight={stage2_render_weight}) ===")
+    while global_step < config.num_train_steps:
+        # Staged training: apply correct stage based on current global_step
+        if staged_training_enabled and global_step < stage1_steps:
+            # Stage 1: Freeze action expert, train only render+depth path
+            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
+                if hasattr(raw_model, 'freeze_action_expert'):
+                    raw_model.freeze_action_expert()
+                    raw_model.set_render_loss_weight(stage1_render_weight)
+                    raw_model._stage_applied = 1
+                    if is_main:
+                        logging.info(f"=== Stage 1 Active: Render+Depth Only (render_weight={stage1_render_weight}) ===")
+
+        elif staged_training_enabled and global_step >= stage1_steps:
+            # Stage 2: Unfreeze action expert, joint training with lower render weight
+            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 2:
+                if hasattr(raw_model, 'unfreeze_action_expert'):
+                    raw_model.unfreeze_action_expert()
+                    raw_model.set_render_loss_weight(stage2_render_weight)
+                    raw_model._stage_applied = 2
+                    if is_main:
+                        logging.info(f"=== Stage 2 Started: Joint Training (render_weight={stage2_render_weight}) ===")
 
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
