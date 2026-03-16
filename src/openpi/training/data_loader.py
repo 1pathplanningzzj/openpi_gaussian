@@ -128,9 +128,15 @@ class FakeDataset(Dataset):
 
 
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig,
+    use_single_frame_mode: bool = False
 ) -> Dataset:
-    """Create a dataset for training."""
+    """Create a dataset for training.
+
+    Args:
+        use_single_frame_mode: If True, only load [t, t+1] frames (single frame for encoding).
+                               If False, load [t-2, t-1, t, t+1] frames (3 frames for VGGT).
+    """
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
@@ -163,23 +169,34 @@ def create_torch_dataset(
         
     print(f"DEBUG: Found image keys: {image_keys} with FPS: {dataset_meta.fps}")
 
-    # Request frames for images: [t-2, t-1, t, t+1]
-    # - [t-2, t-1, t] for VGGT encoding (current + 2 past frames, 3 frames total)
-    # - [t+1] for World Model training (future frame)
-    # Reduced from 5 frames to 3 frames to save memory (5 frames caused OOM)
+    # Request frames for images based on mode
+    # Multi-frame mode: [t-2, t-1, t, t+1]
+    #   - [t-2, t-1, t] for VGGT encoding (current + 2 past frames, 3 frames total)
+    #   - [t+1] for World Model training (future frame)
+    # Single-frame mode: [t, t+1]
+    #   - [t] for VGGT encoding (current frame only, 1 frame)
+    #   - [t+1] for World Model training (future frame)
     # Use 0.1 second intervals to match LeRobot validation
     image_fps = 10.0  # Use standard 10 fps for image timestamps
     for key in image_keys:
-        # Request 4 frames: past 2 frames + current + future frame
-        # delta_timestamps uses relative time offsets from current frame (0.0)
-        # Round to 0.1 second intervals for LeRobot validation
-        delta_timestamps[key] = [
-            round(-2.0 / image_fps, 2),   # t-2 (2 frames before current) = -0.2
-            round(-1.0 / image_fps, 2),   # t-1 (1 frame before current) = -0.1
-            0.0,                           # t (current frame)
-            round(1.0 / image_fps, 2)     # t+1 (1 frame after current, for World Model) = 0.1
-        ]
-        print(f"DEBUG: Requesting 4 frames: [t-2, t-1, t, t+1] for key {key} (VGGT uses [t-2, t-1, t], World Model uses t+1)")
+        if use_single_frame_mode:
+            # Single-frame mode: only current and future frame
+            delta_timestamps[key] = [
+                0.0,                           # t (current frame)
+                round(1.0 / image_fps, 2)     # t+1 (1 frame after current, for World Model) = 0.1
+            ]
+            print(f"DEBUG: [Single-frame mode] Requesting 2 frames: [t, t+1] for key {key} (VGGT uses [t], World Model uses t+1)")
+        else:
+            # Multi-frame mode: past 2 frames + current + future frame
+            # delta_timestamps uses relative time offsets from current frame (0.0)
+            # Round to 0.1 second intervals for LeRobot validation
+            delta_timestamps[key] = [
+                round(-2.0 / image_fps, 2),   # t-2 (2 frames before current) = -0.2
+                round(-1.0 / image_fps, 2),   # t-1 (1 frame before current) = -0.1
+                0.0,                           # t (current frame)
+                round(1.0 / image_fps, 2)     # t+1 (1 frame after current, for World Model) = 0.1
+            ]
+            print(f"DEBUG: [Multi-frame mode] Requesting 4 frames: [t-2, t-1, t, t+1] for key {key} (VGGT uses [t-2, t-1, t], World Model uses t+1)")
         print(f"DEBUG: Using image_fps={image_fps} (dataset_meta.fps={dataset_meta.fps})")
 
     # Also request temporal state - try both possible key formats
@@ -196,14 +213,21 @@ def create_torch_dataset(
     else:
         print(f"WARNING: Could not find state key in dataset features. Available keys: {list(dataset_meta.features.keys())}")
 
-    # Add depth data for all 4 frames (same as images) to match batch shape
-    # We'll only use t+1 frame for depth supervision loss, but load all 4 for shape consistency
+    # Add depth data to match image temporal dimension
+    # Single-frame mode: [t, t+1] (2 frames)
+    # Multi-frame mode: [t-2, t-1, t, t+1] (4 frames)
+    # We'll only use t+1 frame for depth supervision loss, but load all frames for shape consistency
     depth_keys_to_try = ["depth", "observation.depth", "observation/depth"]
     for depth_key in depth_keys_to_try:
         if depth_key in dataset_meta.features:
-            # Request 4 frames [t-2, t-1, t, t+1] to match image temporal dimension
-            delta_timestamps[depth_key] = [-0.2, -0.1, 0.0, round(1.0 / image_fps, 2)]  # [t-2, t-1, t, t+1]
-            print(f"DEBUG: Added depth data with key: {depth_key} (4 frames for shape consistency, will use t+1 for loss)")
+            if use_single_frame_mode:
+                # Single-frame mode: [t, t+1] to match image temporal dimension
+                delta_timestamps[depth_key] = [0.0, round(1.0 / image_fps, 2)]  # [t, t+1]
+                print(f"DEBUG: [Single-frame mode] Added depth data with key: {depth_key} (2 frames for shape consistency, will use t+1 for loss)")
+            else:
+                # Multi-frame mode: [t-2, t-1, t, t+1] to match image temporal dimension
+                delta_timestamps[depth_key] = [-0.2, -0.1, 0.0, round(1.0 / image_fps, 2)]  # [t-2, t-1, t, t+1]
+                print(f"DEBUG: [Multi-frame mode] Added depth data with key: {depth_key} (4 frames for shape consistency, will use t+1 for loss)")
             break
 
     print(f"DEBUG: delta_timestamps: {delta_timestamps}")
@@ -368,7 +392,9 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    # Check if model config has use_single_frame_mode
+    use_single_frame_mode = getattr(model_config, "use_single_frame_mode", False)
+    dataset = create_torch_dataset(data_config, action_horizon, model_config, use_single_frame_mode=use_single_frame_mode)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks

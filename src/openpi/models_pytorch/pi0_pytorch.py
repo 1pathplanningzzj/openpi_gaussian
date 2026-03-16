@@ -124,10 +124,11 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0314_lpips")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0315_lpips_single_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
+        use_single_frame_mode = getattr(config, "use_single_frame_mode", False)
         # Typically Gaussian features join the prefix, so they must match the VLM width
         # Disable LGPD for now to test training stability
         # Option to unfreeze VGGT encoder/decoder for reconstruction loss training
@@ -138,6 +139,7 @@ class PI0Pytorch(nn.Module):
             use_gaussian,
             paligemma_config.width,
             use_lgpd=False,
+            use_single_frame_mode=use_single_frame_mode,
             unfreeze_encoder=unfreeze_vggt_encoder,
             unfreeze_decoder_only=unfreeze_vggt_decoder_only,
             use_lora=use_lora
@@ -419,7 +421,10 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        
+
+        # Check if single-frame mode is enabled
+        use_single_frame_mode = getattr(self.config, "use_single_frame_mode", False)
+
         # --- Handle Future Split for 3DGS World Model ---
         future_observation = None
         # Check if first image has T dimension (ndim=5 for B,T,H,W,C now due to model.py fix)
@@ -428,7 +433,7 @@ class PI0Pytorch(nn.Module):
             img_val = next(iter(observation.images.values()))
             # DEBUG PRINT
             if train and torch.rand(1).item() < 0.01:
-                 print(f"DEBUG: _preprocess_observation. img_val ndim={img_val.ndim}, shape={img_val.shape}")
+                 print(f"DEBUG: _preprocess_observation. img_val ndim={img_val.ndim}, shape={img_val.shape}, use_single_frame_mode={use_single_frame_mode}")
 
             if img_val.ndim == 5:
                 # [B, T, H, W, C]
@@ -443,81 +448,117 @@ class PI0Pytorch(nn.Module):
                     idx_curr, idx_fut = 2, 3  # Current is at idx=2 (t), future is at idx=3 (t+1)
                 elif time_dim == 6:  # [t-4, t-3, t-2, t-1, t, t+1] (old format for VGGT 5 frames + World Model)
                     idx_curr, idx_fut = 4, 5  # Current is at idx=4 (t), future is at idx=5 (t+1)
-                
+
                 # DEBUG PRINT
                 if train and torch.rand(1).item() < 0.01:
                      print(f"DEBUG: Found Time Dim {time_dim}. indices: curr={idx_curr}, fut={idx_fut}")
 
                 if idx_fut > 0:
                     curr_imgs, fut_imgs = {}, {}
-                    # For VGGT, we need multiple frames, so keep the temporal dimension
-                    # For World Model and other processing, we extract single frames
+                    # Save original temporal images for visualization before slicing
+                    raw_temporal_images = {}
+
+                    # Handle single-frame mode vs multi-frame mode
                     for k, v in observation.images.items():
-                        # Keep temporal dimension for VGGT: [B, T, H, W, C]
-                        # VGGT will extract the needed frames in prepare_inputs
-                        curr_imgs[k] = v  # Keep full temporal sequence [B, T, H, W, C]
+                        if use_single_frame_mode:
+                            # Save raw temporal data [B, T, H, W, C] for visualization
+                            # In single-frame mode, we only have [t, t+1], so extract those 2 frames
+                            raw_temporal_images[k] = v[:, [idx_curr, idx_fut]]  # [B, 2, H, W, C]
+
+                            # Single-frame mode: only keep current frame [B, H, W, C]
+                            # This prevents future leakage in image branch
+                            curr_imgs[k] = v[:, idx_curr]  # Extract single current frame
+                        else:
+                            # Multi-frame mode: keep full temporal sequence for VGGT [B, T, H, W, C]
+                            # VGGT will extract the needed frames in prepare_inputs
+                            curr_imgs[k] = v  # Keep full temporal sequence
                         # Extract single frame for future observation [B, H, W, C]
                         fut_imgs[k] = v[:, idx_fut]
-                    
+
                     curr_state = observation.state
                     fut_state = observation.state
-                    
+
                     # Handle state [B, T, D]
-                    # For VGGT, we need to keep temporal dimension for state to match images
                     if observation.state is not None:
                         if observation.state.ndim == 3:
                             # State has temporal dimension [B, T, D]
                             if observation.state.shape[1] == time_dim:
-                                # Keep full temporal dimension for current (VGGT needs it)
-                                curr_state = observation.state  # Keep [B, T, D] for VGGT
+                                if use_single_frame_mode:
+                                    # Single-frame mode: only keep current frame [B, D]
+                                    curr_state = observation.state[:, idx_curr]
+                                else:
+                                    # Multi-frame mode: keep full temporal dimension [B, T, D]
+                                    curr_state = observation.state
                                 fut_state = observation.state[:, idx_fut]  # Single frame for future
                         elif observation.state.ndim == 2:
-                            # State is [B, D], expand to [B, T, D] to match images
-                            # Repeat state for all time frames
-                            curr_state = observation.state.unsqueeze(1).expand(-1, time_dim, -1)  # [B, T, D]
+                            # State is [B, D]
+                            if use_single_frame_mode:
+                                # Single-frame mode: keep as is [B, D]
+                                curr_state = observation.state
+                            else:
+                                # Multi-frame mode: expand to [B, T, D] to match images
+                                curr_state = observation.state.unsqueeze(1).expand(-1, time_dim, -1)
                             fut_state = observation.state  # Keep [B, D] for future
 
                     # Clone observation for future
                     # Note: We must also slice the masks and prompts to match the single-step batch dimension,
                     # otherwise jaxtyping will complain about mismatched *b dimensions (e.g. mask [B, T] vs image [B, H, W, C])
-                    
+
                     # 1. Slice Image Masks
                     fut_masks = {}
                     curr_masks = {}
                     for k, v in observation.image_masks.items():
                         if v.ndim == 2: # [B, T]
-                            # Keep full temporal dimension for current (VGGT needs it)
-                            curr_masks[k] = v  # Keep [B, T] for VGGT
+                            if use_single_frame_mode:
+                                # Single-frame mode: only keep current frame [B]
+                                curr_masks[k] = v[:, idx_curr]
+                            else:
+                                # Multi-frame mode: keep full temporal dimension [B, T]
+                                curr_masks[k] = v
                             fut_masks[k] = v[:, idx_fut]  # Single frame for future
                         else: # [B] - assume valid for all steps
                             curr_masks[k] = v
                             fut_masks[k] = v
-                            
+
                     # 2. Slice Prompts
-                    # Prompts might be expanded to [B, T, L] in model.py
-                    # For VGGT, we need to keep temporal dimension to match images
                     curr_prompt = observation.tokenized_prompt
                     fut_prompt = observation.tokenized_prompt
                     if curr_prompt is not None:
                         if curr_prompt.ndim == 3: # [B, T, L]
-                            # Keep full temporal dimension for current (VGGT needs it)
-                            curr_prompt = curr_prompt  # Keep [B, T, L] for VGGT
-                            fut_prompt = curr_prompt[:, idx_fut]  # Single frame for future
+                            if use_single_frame_mode:
+                                # Single-frame mode: only keep current frame [B, L]
+                                curr_prompt = curr_prompt[:, idx_curr]
+                            else:
+                                # Multi-frame mode: keep full temporal dimension [B, T, L]
+                                curr_prompt = curr_prompt
+                            fut_prompt = curr_prompt[:, idx_fut] if curr_prompt.ndim == 3 else observation.tokenized_prompt[:, idx_fut]
                         elif curr_prompt.ndim == 2: # [B, L]
-                            # Expand to [B, T, L] to match images
-                            curr_prompt = curr_prompt.unsqueeze(1).expand(-1, time_dim, -1)  # [B, T, L]
+                            if use_single_frame_mode:
+                                # Single-frame mode: keep as is [B, L]
+                                curr_prompt = curr_prompt
+                            else:
+                                # Multi-frame mode: expand to [B, T, L] to match images
+                                curr_prompt = curr_prompt.unsqueeze(1).expand(-1, time_dim, -1)
                             fut_prompt = observation.tokenized_prompt  # Keep [B, L] for future
-                        
+
                     curr_prompt_mask = observation.tokenized_prompt_mask
                     fut_prompt_mask = observation.tokenized_prompt_mask
                     if curr_prompt_mask is not None:
                         if curr_prompt_mask.ndim == 3: # [B, T, L]
-                            # Keep full temporal dimension for current (VGGT needs it)
-                            curr_prompt_mask = curr_prompt_mask  # Keep [B, T, L] for VGGT
-                            fut_prompt_mask = curr_prompt_mask[:, idx_fut]  # Single frame for future
+                            if use_single_frame_mode:
+                                # Single-frame mode: only keep current frame [B, L]
+                                curr_prompt_mask = curr_prompt_mask[:, idx_curr]
+                            else:
+                                # Multi-frame mode: keep full temporal dimension [B, T, L]
+                                curr_prompt_mask = curr_prompt_mask
+                            fut_prompt_mask = curr_prompt_mask[:, idx_fut] if curr_prompt_mask.ndim == 3 else observation.tokenized_prompt_mask[:, idx_fut]
                         elif curr_prompt_mask.ndim == 2: # [B, L]
-                            # Expand to [B, T, L] to match images
-                            curr_prompt_mask = curr_prompt_mask.unsqueeze(1).expand(-1, time_dim, -1)  # [B, T, L]
+                            if use_single_frame_mode:
+                                # Single-frame mode: keep as is [B, L]
+                                curr_prompt_mask = curr_prompt_mask
+                            else:
+                                # Multi-frame mode: expand to [B, T, L] to match images
+                                curr_prompt_mask = curr_prompt_mask.unsqueeze(1).expand(-1, time_dim, -1)
                             fut_prompt_mask = observation.tokenized_prompt_mask  # Keep [B, L] for future
 
                     # Handle depth data if available
@@ -527,9 +568,12 @@ class PI0Pytorch(nn.Module):
                         # observation.depth: [B, T, 1, H, W] or [B, 1, H, W]
                         if observation.depth.ndim == 5:  # [B, T, 1, H, W]
                             if observation.depth.shape[1] == time_dim:
-                                # For current observation: keep full temporal dimension [B, T, 1, H, W]
-                                # For future observation: extract single frame [B, 1, H, W]
-                                curr_depth = observation.depth  # Keep [B, T, 1, H, W] for VGGT
+                                if use_single_frame_mode:
+                                    # Single-frame mode: only keep current frame [B, 1, H, W]
+                                    curr_depth = observation.depth[:, idx_curr]
+                                else:
+                                    # Multi-frame mode: keep full temporal dimension [B, T, 1, H, W]
+                                    curr_depth = observation.depth
                                 fut_depth = observation.depth[:, idx_fut]  # [B, 1, H, W]
                         elif observation.depth.ndim == 4:  # [B, 1, H, W]
                             # Single frame depth, use as is for both
@@ -565,7 +609,12 @@ class PI0Pytorch(nn.Module):
         # This ensures that when _prepare_gaussian_inputs is called later, it uses the observation
         # with preserved temporal dimension, not the original one
         preprocessed_observation = observation
-        
+
+        # Attach raw temporal images for visualization if available
+        if 'raw_temporal_images' in locals() and raw_temporal_images:
+            # Store as a separate attribute for visualization
+            preprocessed_observation.raw_temporal_images = raw_temporal_images
+
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),
@@ -747,28 +796,44 @@ class PI0Pytorch(nn.Module):
             device = pad_masks[0].device if pad_masks else next(self.parameters()).device
             token_dim = self.future_query_tokens.shape[-1]
             future_dtype = self.future_query_tokens.dtype
+            use_single_frame_mode = getattr(self.config, "use_single_frame_mode", False)
 
             # 1. Construct temporal base from gaussian_embs
             if gaussian_embs is not None:
                 num_tokens = gaussian_embs.shape[1]
                 D = gaussian_embs.shape[-1]
 
-                if num_tokens == 768:  # 3 frames * 256 tokens (training)
-                    # Reshape to [B, 3, 256, D] for [t-2, t-1, t]
-                    g = gaussian_embs.view(B, 3, 256, -1)
-                    z_t2, z_t1, z_t = g[:, 0], g[:, 1], g[:, 2]  # Each [B, 256, D]
-
-                    # Learnable temporal weighting (softmax to ensure sum=1, stable)
-                    w = torch.softmax(self.temporal_base_w, dim=0)  # [3]
-                    z_base = w[0] * z_t2 + w[1] * z_t1 + w[2] * z_t  # [B, 256, D]
-
-                elif num_tokens == 256:  # Single frame (inference fallback)
-                    # Use the single frame as base
-                    z_base = gaussian_embs  # [B, 256, D]
-
+                if use_single_frame_mode:
+                    # Single-frame mode: use current frame t as base
+                    # gaussian_embs: [B, 256, D] (1 frame × 256 tokens)
+                    # Semantic: future = current_latent + learnable_delta
+                    if num_tokens == 256:
+                        z_base = gaussian_embs  # [B, 256, D]
+                    else:
+                        # Unexpected shape in single-frame mode
+                        logging.warning(f"Single-frame mode expects 256 tokens, got {num_tokens}. Using zero base.")
+                        z_base = torch.zeros(B, self.future_token_count, D, device=device, dtype=future_dtype)
                 else:
-                    # Unexpected shape: use zero base
-                    z_base = torch.zeros(B, self.future_token_count, D, device=device, dtype=future_dtype)
+                    # Multi-frame mode: weighted fusion of [t-2, t-1, t]
+                    # gaussian_embs: [B, 768, D] (3 frames × 256 tokens)
+                    # Semantic: future = weighted_history + learnable_delta
+                    if num_tokens == 768:  # 3 frames * 256 tokens (training)
+                        # Reshape to [B, 3, 256, D] for [t-2, t-1, t]
+                        g = gaussian_embs.view(B, 3, 256, -1)
+                        z_t2, z_t1, z_t = g[:, 0], g[:, 1], g[:, 2]  # Each [B, 256, D]
+
+                        # Learnable temporal weighting (softmax to ensure sum=1, stable)
+                        w = torch.softmax(self.temporal_base_w, dim=0)  # [3]
+                        z_base = w[0] * z_t2 + w[1] * z_t1 + w[2] * z_t  # [B, 256, D]
+
+                    elif num_tokens == 256:  # Single frame (inference fallback or single-frame mode)
+                        # Use the single frame as base
+                        z_base = gaussian_embs  # [B, 256, D]
+
+                    else:
+                        # Unexpected shape: use zero base
+                        logging.warning(f"Multi-frame mode expects 768 tokens, got {num_tokens}. Using zero base.")
+                        z_base = torch.zeros(B, self.future_token_count, D, device=device, dtype=future_dtype)
             else:
                 # No gaussian_embs: use zero base
                 z_base = torch.zeros(B, self.future_token_count, token_dim, device=device, dtype=future_dtype)
@@ -1340,11 +1405,17 @@ class PI0Pytorch(nn.Module):
                                     # Extract temporal frames from preprocessed_observation
                                     # Expected: 4 consecutive frames [t-2, t-1, t, t+1]
                                     temporal_frames = {}
-                                    if hasattr(preprocessed_observation, 'images'):
+                                    # First check if raw_temporal_images is available (for single-frame mode)
+                                    if hasattr(preprocessed_observation, 'raw_temporal_images'):
+                                        temporal_frames = preprocessed_observation.raw_temporal_images
+                                        for k, v in temporal_frames.items():
+                                            logging.info(f"[Viz] Extracted raw temporal {k} with shape {v.shape}")
+                                    # Otherwise try to extract from preprocessed_observation.images (for multi-frame mode)
+                                    elif hasattr(preprocessed_observation, 'images'):
                                         for k, v in preprocessed_observation.images.items():
-                                            # v shape: [B, T, H, W, C] where T=4 for [t-2, t-1, t, t+1]
-                                            if v.ndim == 5 and v.shape[1] == 4:  # Has 4 temporal frames
-                                                temporal_frames[k] = v  # Keep all 4 frames [B, 4, H, W, C]
+                                            # v shape: [B, T, H, W, C] where T=4 for multi-frame [t-2, t-1, t, t+1] or T=2 for single-frame [t, t+1]
+                                            if v.ndim == 5 and v.shape[1] in [2, 4]:  # Accept both single-frame (T=2) and multi-frame (T=4)
+                                                temporal_frames[k] = v  # Keep all frames [B, T, H, W, C]
                                                 logging.info(f"[Viz] Extracted {k} with shape {v.shape}")
 
                                     self._visualize_rendering_comparison(

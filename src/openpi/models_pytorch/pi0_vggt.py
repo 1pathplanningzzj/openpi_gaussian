@@ -363,6 +363,7 @@ class GaussianAdapter(nn.Module):
     """
     def __init__(self, use_gaussian: bool, action_expert_width: int, use_lgpd: bool = True,
                  num_frames: int = 3, inference_num_frames: int = 1,
+                 use_single_frame_mode: bool = False,
                  unfreeze_encoder: bool = False, unfreeze_decoder_only: bool = True,
                  use_lora: bool = True, lora_rank: int = 8, lora_alpha: float = 32.0,
                  lora_targets=("qkv", "proj")):
@@ -377,6 +378,9 @@ class GaussianAdapter(nn.Module):
                        Wrist view is excluded from VGGT encoding (but still used in 2D encoders like SigLIP).
             inference_num_frames: Number of frames to use during inference (default: 1, single frame).
                                  Single frame is more practical for real-time inference.
+            use_single_frame_mode: If True, override num_frames to 1 for both training and inference.
+                                  This mode removes temporal history (t-2, t-1) and only uses current frame (t).
+                                  Useful for ablation studies to test if temporal context is necessary.
             unfreeze_encoder: If True, unfreeze VGGT encoder to allow end-to-end training (default: False).
                              When True, encoder will be trained with reconstruction loss.
             unfreeze_decoder_only: If True, only unfreeze decoder (gs_head) while keeping encoder frozen (default: True).
@@ -388,8 +392,15 @@ class GaussianAdapter(nn.Module):
         self.proj = None
         self.lgpd = None  # Language-Gated Physical Distillation
         self.use_lgpd = use_lgpd
-        self.num_frames = num_frames
-        self.inference_num_frames = inference_num_frames
+
+        # Single-frame mode: override num_frames to 1 for both training and inference
+        if use_single_frame_mode:
+            self.num_frames = 1
+            self.inference_num_frames = 1
+            logging.info("Single-frame mode enabled: using 1 frame for both training and inference")
+        else:
+            self.num_frames = num_frames
+            self.inference_num_frames = inference_num_frames
 
         if self.use_gaussian and VGGT3DGSModel is not None:
             logging.info("Initializing VGGT 3DGS Components in Adapter...")
@@ -442,8 +453,16 @@ class GaussianAdapter(nn.Module):
                 # Configuration
                 self.gaussian_feat_dim = 2048  # VGGT output dimension
                 self.tokens_per_frame = 256  # 16×16 = 256 tokens per frame (was 100)
-                self.use_enhanced_temporal = True  # Enable enhanced temporal encoding
-                self.use_multi_scale = True  # Enable multi-scale feature extraction
+
+                # Single-frame mode: disable temporal encoding to avoid "single frame through temporal modules"
+                # This ensures a clean ablation: spatial-only feature extraction without temporal machinery
+                if use_single_frame_mode:
+                    self.use_enhanced_temporal = False  # Force disable temporal modules in single-frame mode
+                    self.use_multi_scale = False  # Also disable multi-scale (requires temporal modules)
+                    logging.info("Single-frame mode: disabling temporal and multi-scale modules for clean spatial-only ablation")
+                else:
+                    self.use_enhanced_temporal = True  # Enable enhanced temporal encoding
+                    self.use_multi_scale = True  # Enable multi-scale feature extraction
 
                 if self.use_enhanced_temporal:
                     # === Multi-Scale Feature Extraction (Priority 2) ===
@@ -481,30 +500,33 @@ class GaussianAdapter(nn.Module):
                         self.fused_to_2048 = None
 
                     # 1. 3D Conv for temporal-spatial feature extraction
+                    # Use self.num_frames (respects single-frame mode)
                     self.temporal_conv = TemporalConv3DEncoder(
                         in_channels=2048,
                         out_channels=512,
-                        num_frames=num_frames
+                        num_frames=self.num_frames  # Changed from num_frames to self.num_frames
                     )
-                    # Output: [B, 512, 3, 9, 9] for 37×37 input
+                    # Output: [B, 512, T, 9, 9] where T=self.num_frames
 
                     # 2. Spatial pooling to 16×16 (256 tokens per frame)
                     self.spatial_pool = nn.AdaptiveAvgPool2d((16, 16))
 
                     # 3. Causal temporal attention
+                    # Use self.num_frames (respects single-frame mode)
                     self.temporal_attn = CausalTemporalAttention(
                         embed_dim=512,
                         num_heads=8,
-                        num_frames=num_frames
+                        num_frames=self.num_frames  # Changed from num_frames to self.num_frames
                     )
 
                     # 4. Frame positional encoding (sinusoidal + learnable)
+                    # Use self.num_frames (respects single-frame mode)
                     self.frame_pos_encoding = nn.ModuleList([
-                        SinusoidalPositionalEncoding(num_frames, 512)
-                        for _ in range(num_frames)
+                        SinusoidalPositionalEncoding(self.num_frames, 512)  # Changed from num_frames
+                        for _ in range(self.num_frames)  # Changed from num_frames
                     ])
                     self.frame_embeddings = nn.Parameter(
-                        torch.randn(num_frames, 512) * 0.02
+                        torch.randn(self.num_frames, 512) * 0.02  # Changed from num_frames
                     )
 
                     # 5. Projection to action_expert_width
@@ -515,21 +537,35 @@ class GaussianAdapter(nn.Module):
                         f"  - 3D Conv: 2048 → 512 channels\n"
                         f"  - Spatial resolution: 37×37 → 16×16\n"
                         f"  - Tokens per frame: {self.tokens_per_frame}\n"
-                        f"  - Total tokens: {num_frames * self.tokens_per_frame}\n"
-                        f"  - Causal temporal attention: {num_frames} frames"
+                        f"  - Total tokens: {self.num_frames * self.tokens_per_frame}\n"  # Changed from num_frames
+                        f"  - Causal temporal attention: {self.num_frames} frames"  # Changed from num_frames
                     )
                 else:
                     # Original implementation (fallback)
-                    self.proj = nn.Linear(self.gaussian_feat_dim, action_expert_width)
-                    self.pool = nn.AdaptiveAvgPool2d((10, 10))
-                    self.tokens_per_frame = 100
+                    # In single-frame mode, use 16×16 pooling to match future query expectations (256 tokens)
+                    # In multi-frame mode, use 10×10 pooling for backward compatibility (100 tokens per frame)
+                    if use_single_frame_mode:
+                        self.pool = nn.AdaptiveAvgPool2d((16, 16))
+                        self.tokens_per_frame = 256  # 16×16 = 256 tokens
+                        logging.info(f"Using spatial-only encoding with 16×16 pooling (256 tokens, no temporal modules)")
+                    else:
+                        self.pool = nn.AdaptiveAvgPool2d((10, 10))
+                        self.tokens_per_frame = 100  # 10×10 = 100 tokens per frame
+                        logging.info(f"Using original temporal encoding with {self.num_frames} frames, 100 tokens/frame")
 
-                    # Original frame positional encoding
-                    self.use_frame_pos_encoding = True
-                    self.frame_embeddings = nn.Parameter(
-                        torch.randn(num_frames, action_expert_width) * 0.02
-                    )
-                    logging.info(f"Using original temporal encoding with {num_frames} frames, 100 tokens/frame")
+                    self.proj = nn.Linear(self.gaussian_feat_dim, action_expert_width)
+
+                    # Frame positional encoding
+                    # In single-frame mode, disable frame embeddings for clean spatial-only ablation
+                    if use_single_frame_mode:
+                        self.use_frame_pos_encoding = False
+                        self.frame_embeddings = None
+                    else:
+                        # Multi-frame mode: use frame positional encoding
+                        self.use_frame_pos_encoding = True
+                        self.frame_embeddings = nn.Parameter(
+                            torch.randn(self.num_frames, action_expert_width) * 0.02
+                        )
                 
                 # LGPD Module
                 if self.use_lgpd:
@@ -700,16 +736,19 @@ class GaussianAdapter(nn.Module):
                 img = img.unsqueeze(1)  # [B, 1, C, H, W]
                 target_num_frames = 1  # Update target to match available
             else:
-                # Training mode: repeat frame to match num_frames
-                # This warning indicates that the dataset might not be loading temporal frames correctly
-                # or the observation was processed incorrectly before reaching prepare_inputs
-                logging.warning(
-                    f"Single frame input detected during training. "
-                    f"Image shape: {img.shape}, Expected 5D [B, T, H, W, C] with T>=3. "
-                    f"Repeating frame {target_num_frames} times for VGGT. "
-                    f"Check data_loader delta_timestamps configuration."
-                )
-                img = img.unsqueeze(1).repeat(1, target_num_frames, 1, 1, 1)  # [B, target_num_frames, C, H, W]
+                # Training mode
+                if target_num_frames == 1:
+                    # Single-frame mode: this is expected, no warning needed
+                    img = img.unsqueeze(1)  # [B, 1, C, H, W]
+                else:
+                    # Multi-frame mode but got single frame: this is unexpected, warn user
+                    logging.warning(
+                        f"Single frame input detected during training. "
+                        f"Image shape: {img.shape}, Expected 5D [B, T, H, W, C] with T>={target_num_frames}. "
+                        f"Repeating frame {target_num_frames} times for VGGT. "
+                        f"Check data_loader delta_timestamps configuration."
+                    )
+                    img = img.unsqueeze(1).repeat(1, target_num_frames, 1, 1, 1)  # [B, target_num_frames, C, H, W]
         else:
             logging.error(f"Unexpected image shape: {img.shape}. Expected 4D [B, C, H, W] or 5D [B, T, C, H, W]")
             return None
@@ -996,18 +1035,27 @@ class GaussianAdapter(nn.Module):
                 tokens_reshaped = tokens_flat.permute(0, 2, 1)  # [B, D, S*N_patches]
             
             tokens_2d = tokens_reshaped.view(B, D, spatial_size, spatial_size)
-            
-            # Pool to reduce tokens: [B, D, spatial_size, spatial_size] -> [B, D, 10, 10]
-            tokens_pooled = self.pool(tokens_2d)  # [B, D, 10, 10]
-            
-            # Flatten back: [B, D, 10, 10] -> [B, 100, D]
-            tokens_final = tokens_pooled.view(B, -1, D)  # [B, 100, D]
-            
+
+            # Pool to reduce tokens
+            # Single-frame mode: [B, D, spatial_size, spatial_size] -> [B, D, 16, 16] (256 tokens)
+            # Multi-frame mode: [B, D, spatial_size, spatial_size] -> [B, D, 10, 10] (100 tokens)
+            tokens_pooled = self.pool(tokens_2d)
+
+            # Flatten back
+            # Single-frame mode: [B, D, 16, 16] -> [B, 256, D]
+            # Multi-frame mode: [B, D, 10, 10] -> [B, 100, D]
+            # Use reshape instead of view to handle non-contiguous tensors
+            tokens_final = tokens_pooled.reshape(B, D, -1).permute(0, 2, 1)  # [B, D, N] -> [B, N, D]
+
             # Project to action_expert_width
-            gaussian_embs = self.proj(tokens_final)  # [B, 100, action_expert_width]
+            # Single-frame mode: [B, 256, action_expert_width]
+            # Multi-frame mode: [B, 100, action_expert_width]
+            gaussian_embs = self.proj(tokens_final)
         
         # Create mask (all tokens are valid)
-        # If using frame pos encoding, we have S*100 tokens, otherwise 100 tokens
+        # Single-frame mode: 256 tokens
+        # Multi-frame mode with frame pos encoding: S*100 tokens
+        # Multi-frame mode without frame pos encoding: 100 tokens
         g_mask = torch.ones(B, gaussian_embs.shape[1], dtype=torch.bool, device=gaussian_embs.device)
         
         # Apply LGPD if enabled and text embedding is provided

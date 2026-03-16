@@ -229,7 +229,6 @@ class Robot(object):
         Args:
             sim (MjSim): New simulation being instantiated to replace the old one
         """
-        print(f"[DEBUG] reset_sim updating self.sim from {id(self.sim) if hasattr(self, 'sim') else 'None'} to {id(sim)}")
         self.sim = sim
 
         # Update the simulator reference in the composite controller and its part controllers.

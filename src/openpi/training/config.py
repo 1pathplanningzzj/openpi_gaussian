@@ -816,6 +816,7 @@ _CONFIGS = [
             discrete_state_input=False,
             use_gaussian=True,
             use_world_model=True,
+            use_single_frame_mode=True,  # Set to True to use single-frame mode (only current frame t)
             render_loss_weight=0.2,
             depth_loss_weight=0.1,
             use_lpips=True,  # Enable LPIPS perceptual loss
@@ -830,7 +831,7 @@ _CONFIGS = [
             extra_delta_transform=False,
         ),
         # batch_size=256,
-        batch_size=4,  # Reduced from 8 to save GPU memory (OOM with world model + rendering + multi-scale features)
+        batch_size=8,  # Increased from 4 to 8 for single-frame mode (lower memory usage without temporal modules)
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,

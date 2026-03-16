@@ -783,8 +783,8 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
     idx = 0
 
     # Create figure with 2 rows x 3 columns:
-    # Row 1: GT t-2, GT t-1, GT t
-    # Row 2: GT t+1, Rendered t+1, Diff
+    # Multi-frame mode: Row 1: GT t-2, GT t-1, GT t | Row 2: GT t+1, Predicted t+1, Diff
+    # Single-frame mode: Row 1: [empty], GT t, [empty] | Row 2: GT t+1, Predicted t+1, Diff
     fig = plt.figure(figsize=(18, 12))
     gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
 
@@ -817,34 +817,65 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
                     print(f"[Viz] Using first available key: {temporal_key} for view {view_name}")
 
             # Display 4 frames: [t-2, t-1, t, t+1]
-            # Row 1: GT t-2, GT t-1, GT t (columns 0, 1, 2)
+            # Row 1: GT t-2, GT t-1, GT t (columns 0, 1, 2) for multi-frame mode
+            # Row 1: GT t (column 1 only) for single-frame mode
             # Row 2: GT t+1, Rendered t+1, Diff (columns 0, 1, 2)
             if temporal_key and temporal_key in temporal_frames:
-                frames = temporal_frames[temporal_key][idx]  # [4, H, W, C] for [t-2, t-1, t, t+1]
-                
-                # Row 1: Display first 3 frames (t-2, t-1, t)
-                for t_idx in range(3):
-                    if t_idx < frames.shape[0]:
-                        frame = frames[t_idx]  # [H, W, C]
-                        frame_np = frame.detach().cpu().numpy()
-                        # Normalize from [-1, 1] to [0, 1]
-                        frame_viz = np.clip((frame_np + 1.0) / 2.0, 0, 1)
+                frames = temporal_frames[temporal_key][idx]  # [T, H, W, C] where T=4 for multi-frame or T=2 for single-frame
+                num_temporal_frames = frames.shape[0]
 
-                        ax = fig.add_subplot(gs[0, t_idx])
-                        ax.imshow(frame_viz)
-                        ax.set_title(f"GT t-{2-t_idx}", fontsize=14)
+                # Detect single-frame mode: only 2 frames [t, t+1]
+                is_single_frame_mode = (num_temporal_frames == 2)
+
+                if is_single_frame_mode:
+                    # Single-frame mode: only show t in row 1, center column
+                    frame_t = frames[0]  # [H, W, C] - current frame t
+                    frame_t_np = frame_t.detach().cpu().numpy()
+                    frame_t_viz = np.clip((frame_t_np + 1.0) / 2.0, 0, 1)
+
+                    ax = fig.add_subplot(gs[0, 1])  # Center column
+                    ax.imshow(frame_t_viz)
+                    ax.set_title("t", fontsize=14)
+                    ax.axis('off')
+
+                    # Leave side columns empty
+                    for col in [0, 2]:
+                        ax = fig.add_subplot(gs[0, col])
                         ax.axis('off')
-                
-                # Row 2, Column 0: Display 4th frame (t+1)
-                if frames.shape[0] >= 4:
-                    frame_t1 = frames[3]  # [H, W, C]
+
+                    # Row 2, Column 0: Display t+1 frame
+                    frame_t1 = frames[1]  # [H, W, C] - future frame t+1
                     frame_t1_np = frame_t1.detach().cpu().numpy()
                     frame_t1_viz = np.clip((frame_t1_np + 1.0) / 2.0, 0, 1)
 
                     ax_gt_t1 = fig.add_subplot(gs[1, 0])
                     ax_gt_t1.imshow(frame_t1_viz)
-                    ax_gt_t1.set_title(f"GT t+1", fontsize=14)
+                    ax_gt_t1.set_title("t+1", fontsize=14)
                     ax_gt_t1.axis('off')
+                else:
+                    # Multi-frame mode: Display first 3 frames (t-2, t-1, t)
+                    for t_idx in range(3):
+                        if t_idx < num_temporal_frames:
+                            frame = frames[t_idx]  # [H, W, C]
+                            frame_np = frame.detach().cpu().numpy()
+                            # Normalize from [-1, 1] to [0, 1]
+                            frame_viz = np.clip((frame_np + 1.0) / 2.0, 0, 1)
+
+                            ax = fig.add_subplot(gs[0, t_idx])
+                            ax.imshow(frame_viz)
+                            ax.set_title(f"GT t-{2-t_idx}", fontsize=14)
+                            ax.axis('off')
+
+                    # Row 2, Column 0: Display 4th frame (t+1)
+                    if num_temporal_frames >= 4:
+                        frame_t1 = frames[3]  # [H, W, C]
+                        frame_t1_np = frame_t1.detach().cpu().numpy()
+                        frame_t1_viz = np.clip((frame_t1_np + 1.0) / 2.0, 0, 1)
+
+                        ax_gt_t1 = fig.add_subplot(gs[1, 0])
+                        ax_gt_t1.imshow(frame_t1_viz)
+                        ax_gt_t1.set_title(f"GT t+1", fontsize=14)
+                        ax_gt_t1.axis('off')
             else:
                 # If no temporal frames, show placeholder
                 for row in range(2):
@@ -871,7 +902,7 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
 
             ax_rendered = fig.add_subplot(gs[1, 1])
             ax_rendered.imshow(rendered_viz)
-            ax_rendered.set_title(f"Rendered t+1", fontsize=14)
+            ax_rendered.set_title("render t+1", fontsize=14)
             ax_rendered.axis('off')
 
             # Row 2, Column 2: Difference

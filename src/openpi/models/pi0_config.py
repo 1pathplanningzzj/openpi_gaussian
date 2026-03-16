@@ -32,6 +32,11 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # Whether to use 3D Gaussian Splatting Encoder as additional conditioning
     use_gaussian: bool = False
+    # Whether to use single-frame mode for VGGT (only use current frame t, not t-2, t-1)
+    # This removes temporal history and tests if temporal context is necessary
+    # When True: VGGT uses [t] only (1 frame)
+    # When False: VGGT uses [t-2, t-1, t] (3 frames, default)
+    use_single_frame_mode: bool = False
     # Whether to use BiDirectional World Model for aux loss
     use_world_model: bool = False
     # VGGT encoder/decoder training options (for reconstruction loss)
