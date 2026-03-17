@@ -69,6 +69,7 @@ class Policy(BasePolicy):
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
+
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)

@@ -169,65 +169,79 @@ def create_torch_dataset(
         
     print(f"DEBUG: Found image keys: {image_keys} with FPS: {dataset_meta.fps}")
 
-    # Request frames for images based on mode
-    # Multi-frame mode: [t-2, t-1, t, t+1]
-    #   - [t-2, t-1, t] for VGGT encoding (current + 2 past frames, 3 frames total)
-    #   - [t+1] for World Model training (future frame)
-    # Single-frame mode: [t, t+1]
-    #   - [t] for VGGT encoding (current frame only, 1 frame)
-    #   - [t+1] for World Model training (future frame)
-    # Use 0.1 second intervals to match LeRobot validation
+    # Request frames for images based on mode.
+    # Multi-frame mode: [t-2, t-1, t, t+1, ..., t+H]
+    # Single-frame mode: [t, t+1, ..., t+H]
+    # where H is the world-model future supervision horizon.
+    # Use 0.1 second intervals to match LeRobot validation.
     image_fps = 10.0  # Use standard 10 fps for image timestamps
+    future_prediction_horizon = (
+        max(1, int(getattr(model_config, "future_prediction_horizon", 1)))
+        if getattr(model_config, "use_world_model", False)
+        else 1
+    )
+    future_image_offsets = [round((t + 1) / image_fps, 2) for t in range(future_prediction_horizon)]
     for key in image_keys:
         if use_single_frame_mode:
-            # Single-frame mode: only current and future frame
-            delta_timestamps[key] = [
-                0.0,                           # t (current frame)
-                round(1.0 / image_fps, 2)     # t+1 (1 frame after current, for World Model) = 0.1
-            ]
-            print(f"DEBUG: [Single-frame mode] Requesting 2 frames: [t, t+1] for key {key} (VGGT uses [t], World Model uses t+1)")
+            delta_timestamps[key] = [0.0, *future_image_offsets]
+            print(
+                "DEBUG: [Single-frame mode] Requesting frames "
+                f"{delta_timestamps[key]} for key {key} "
+                f"(VGGT uses [t], World Model uses t+1..t+{future_prediction_horizon})"
+            )
         else:
-            # Multi-frame mode: past 2 frames + current + future frame
-            # delta_timestamps uses relative time offsets from current frame (0.0)
-            # Round to 0.1 second intervals for LeRobot validation
             delta_timestamps[key] = [
-                round(-2.0 / image_fps, 2),   # t-2 (2 frames before current) = -0.2
-                round(-1.0 / image_fps, 2),   # t-1 (1 frame before current) = -0.1
-                0.0,                           # t (current frame)
-                round(1.0 / image_fps, 2)     # t+1 (1 frame after current, for World Model) = 0.1
+                round(-2.0 / image_fps, 2),
+                round(-1.0 / image_fps, 2),
+                0.0,
+                *future_image_offsets,
             ]
-            print(f"DEBUG: [Multi-frame mode] Requesting 4 frames: [t-2, t-1, t, t+1] for key {key} (VGGT uses [t-2, t-1, t], World Model uses t+1)")
+            print(
+                "DEBUG: [Multi-frame mode] Requesting frames "
+                f"{delta_timestamps[key]} for key {key} "
+                f"(VGGT uses [t-2, t-1, t], World Model uses t+1..t+{future_prediction_horizon})"
+            )
         print(f"DEBUG: Using image_fps={image_fps} (dataset_meta.fps={dataset_meta.fps})")
 
-    # Also request temporal state - try both possible key formats
-    # State still needs [t, t+1] for World Model training: current state + action -> next state
-    # Use 0.1 second intervals to match LeRobot validation
+    # Also request temporal state - try both possible key formats.
+    # State uses [t, t+1, ..., t+H] for future supervision.
     state_fps = 10.0  # Use standard 10 fps for state timestamps
+    future_state_offsets = [round((t + 1) / state_fps, 2) for t in range(future_prediction_horizon)]
     state_keys_to_try = ["observation.state", "observation/state", "state"]
     for state_key in state_keys_to_try:
         if state_key in dataset_meta.features:
-            delta_timestamps[state_key] = [0.0, round(1.0 / state_fps, 2)]  # [current, next] = [0.0, 0.1]
-            print(f"DEBUG: Added temporal state with key: {state_key} (for World Model: [t, t+1])")
+            delta_timestamps[state_key] = [0.0, *future_state_offsets]
+            print(
+                f"DEBUG: Added temporal state with key: {state_key} "
+                f"(for World Model: [t, t+1..t+{future_prediction_horizon}])"
+            )
             print(f"DEBUG: Using state_fps={state_fps} (dataset_meta.fps={dataset_meta.fps})")
             break
     else:
         print(f"WARNING: Could not find state key in dataset features. Available keys: {list(dataset_meta.features.keys())}")
 
-    # Add depth data to match image temporal dimension
-    # Single-frame mode: [t, t+1] (2 frames)
-    # Multi-frame mode: [t-2, t-1, t, t+1] (4 frames)
-    # We'll only use t+1 frame for depth supervision loss, but load all frames for shape consistency
+    # Add depth data to match image temporal dimension.
+    # We supervise depth on all future horizons when available.
     depth_keys_to_try = ["depth", "observation.depth", "observation/depth"]
     for depth_key in depth_keys_to_try:
         if depth_key in dataset_meta.features:
             if use_single_frame_mode:
-                # Single-frame mode: [t, t+1] to match image temporal dimension
-                delta_timestamps[depth_key] = [0.0, round(1.0 / image_fps, 2)]  # [t, t+1]
-                print(f"DEBUG: [Single-frame mode] Added depth data with key: {depth_key} (2 frames for shape consistency, will use t+1 for loss)")
+                delta_timestamps[depth_key] = [0.0, *future_image_offsets]
+                print(
+                    f"DEBUG: [Single-frame mode] Added depth data with key: {depth_key} "
+                    f"({1 + future_prediction_horizon} frames for t..t+{future_prediction_horizon})"
+                )
             else:
-                # Multi-frame mode: [t-2, t-1, t, t+1] to match image temporal dimension
-                delta_timestamps[depth_key] = [-0.2, -0.1, 0.0, round(1.0 / image_fps, 2)]  # [t-2, t-1, t, t+1]
-                print(f"DEBUG: [Multi-frame mode] Added depth data with key: {depth_key} (4 frames for shape consistency, will use t+1 for loss)")
+                delta_timestamps[depth_key] = [
+                    round(-2.0 / image_fps, 2),
+                    round(-1.0 / image_fps, 2),
+                    0.0,
+                    *future_image_offsets,
+                ]
+                print(
+                    f"DEBUG: [Multi-frame mode] Added depth data with key: {depth_key} "
+                    f"({3 + future_prediction_horizon} frames for [t-2, t-1, t, t+1..t+{future_prediction_horizon}])"
+                )
             break
 
     print(f"DEBUG: delta_timestamps: {delta_timestamps}")

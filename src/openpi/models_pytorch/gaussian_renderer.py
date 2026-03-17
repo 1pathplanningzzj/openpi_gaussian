@@ -163,7 +163,7 @@ def validate_camera_params(camera_params: Dict[str, torch.Tensor], batch_idx: in
     # This is a simplified check - full projection matrix depends on znear/zfar
     
     # Print summary if requested
-    if step is not None and step % 40 == 0:
+    if step is not None and step % 400 == 0:
         print(f"[Camera Validation] Batch {batch_idx}:")
         print(f"  viewmatrix: shape={viewmatrix.shape}, det(R)={det_R.item():.4f}")
         print(f"  projmatrix: shape={projmatrix.shape}")
@@ -253,11 +253,11 @@ class GaussianRenderer(nn.Module):
         
         # Clamp opacity to [0, 1]
         # Debug: Print opacity stats (only every 40 steps)
-        if step is not None and step % 40 == 0:
+        if step is not None and step % 400 == 0:
             opacity_before = gaussian_params["opacity"]
             print(f"[GaussianRenderer] Opacity before clamp: min={opacity_before.min():.6f}, max={opacity_before.max():.6f}, mean={opacity_before.mean():.6f}")
         gaussian_params["opacity"] = torch.clamp(gaussian_params["opacity"], min=0.0, max=1.0)
-        if step is not None and step % 40 == 0:
+        if step is not None and step % 400 == 0:
             opacity_after = gaussian_params["opacity"]
             print(f"[GaussianRenderer] Opacity after clamp: min={opacity_after.min():.6f}, max={opacity_after.max():.6f}, mean={opacity_after.mean():.6f}")
 
@@ -266,10 +266,10 @@ class GaussianRenderer(nn.Module):
         rotations = gaussian_params["rotations"]
 
         # Clamp scales
-        if step is not None and step % 40 == 0:
+        if step is not None and step % 400 == 0:
             print(f"[GaussianRenderer] Scales before clamp: min={scales.min():.6f}, max={scales.max():.6f}, mean={scales.mean():.6f}")
         scales = torch.clamp(scales, min=1e-6, max=10.0)
-        if step is not None and step % 40 == 0:
+        if step is not None and step % 400 == 0:
             print(f"[GaussianRenderer] Scales after clamp: min={scales.min():.6f}, max={scales.max():.6f}, mean={scales.mean():.6f}")
 
         # Apply scale factor
@@ -309,7 +309,7 @@ class GaussianRenderer(nn.Module):
         rendered_images = []
 
         # Validate camera parameters (only for first batch and every 40 steps)
-        if step is not None and step % 40 == 0:
+        if step is not None and step % 400 == 0:
             is_valid, issues = validate_camera_params(camera_params, batch_idx=0, step=step)
             if not is_valid and issues:
                 import warnings
@@ -365,7 +365,7 @@ class GaussianRenderer(nn.Module):
             expected_sh_dim = num_coeffs * 3  # For sh_degree=1: 4 * 3 = 12
 
             # Debug: Print SH stats (only every 40 steps)
-            if step is not None and step % 40 == 0 and b == 0:
+            if step is not None and step % 400 == 0 and b == 0:
                 print(f"[GaussianRenderer] SH before reshape: shape={shs_val.shape}, min={shs_val.min():.6f}, max={shs_val.max():.6f}, mean={shs_val.mean():.6f}")
                 print(f"[GaussianRenderer] sh_degree={self.sh_degree}, num_coeffs={num_coeffs}, expected_sh_dim={expected_sh_dim}")
 
@@ -384,7 +384,7 @@ class GaussianRenderer(nn.Module):
                 shs_val = sh_padded.view(-1, num_coeffs, 3)
 
             # Debug: Print SH stats after reshape (only every 40 steps)
-            if step is not None and step % 40 == 0 and b == 0:
+            if step is not None and step % 400 == 0 and b == 0:
                 print(f"[GaussianRenderer] SH after reshape: shape={shs_val.shape}, min={shs_val.min():.6f}, max={shs_val.max():.6f}, mean={shs_val.mean():.6f}")
                 # Check SH C0 (DC term) which determines base color
                 sh_c0 = shs_val[:, 0, :]  # [N, 3] - DC term for RGB
@@ -444,7 +444,7 @@ class GaussianRenderer(nn.Module):
                 )
             
             # Debug: Log rendering statistics (only for first batch, every 40 steps)
-            if b == 0 and step is not None and step % 40 == 0:
+            if b == 0 and step is not None and step % 400 == 0:
                 z_min, z_max = z_cam.min().item(), z_cam.max().item()
                 rendered_max = rendered_color.max().item()
                 rendered_mean = rendered_color.mean().item()
@@ -747,7 +747,7 @@ def compute_multi_view_rendering_loss(
             loss_dict["loss_edge_smooth"] = edge_loss
             total_loss = total_loss + edge_loss
 
-    if step is not None and step % 40 == 0:
+    if step is not None and step % 400 == 0:
         parts = ", ".join(f"{k}={v.item():.6f}" for k, v in loss_dict.items())
         print(f"[MultiViewLoss] Step {step}: {parts}, total={total_loss.item():.6f}")
 
@@ -931,3 +931,93 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Saved Rendering Visualization to {save_path}")
+
+
+def visualize_future_rollout_comparison(
+    step,
+    target_obs_seq,
+    rendered_obs_seq,
+    view_names,
+    save_dir=None,
+    temporal_frames=None,
+    time_suffix="_future_rollout",
+):
+    """Visualize context + multi-horizon future GT/render/diff in one figure."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+
+    if save_dir is None:
+        save_dir = "./visualizations/rendering"
+    os.makedirs(save_dir, exist_ok=True)
+
+    if not target_obs_seq or not rendered_obs_seq:
+        return
+
+    idx = 0
+    horizon = min(len(target_obs_seq), len(rendered_obs_seq))
+    view_name = view_names[0]
+    context_frames = []
+
+    temporal_key = None
+    if temporal_frames:
+        for key in temporal_frames.keys():
+            key_lower = key.lower()
+            if view_name == "agent" and ("base" in key_lower or "high" in key_lower or "exterior" in key_lower or "agent" in key_lower):
+                temporal_key = key
+                break
+            if view_name == "wrist" and "wrist" in key_lower:
+                temporal_key = key
+                break
+        if temporal_key is None:
+            temporal_key = next(iter(temporal_frames.keys()))
+
+    if temporal_key is not None:
+        frames = temporal_frames[temporal_key][idx]
+        context_count = max(0, frames.shape[0] - horizon)
+        for frame_idx in range(context_count):
+            frame = frames[frame_idx].detach().cpu().numpy()
+            context_frames.append(np.clip((frame + 1.0) / 2.0, 0, 1))
+
+    num_cols = max(horizon, len(context_frames), 1)
+    fig, axes = plt.subplots(4, num_cols, figsize=(4 * num_cols, 14))
+    if num_cols == 1:
+        axes = np.array(axes).reshape(4, 1)
+
+    row_titles = ["Context", "GT Future", "Rendered Future", "Abs Diff"]
+    for row_idx, title in enumerate(row_titles):
+        axes[row_idx, 0].set_ylabel(title, fontsize=14)
+
+    for col_idx in range(num_cols):
+        for row_idx in range(4):
+            axes[row_idx, col_idx].axis("off")
+
+    for col_idx, frame in enumerate(context_frames[:num_cols]):
+        axes[0, col_idx].imshow(frame)
+        if len(context_frames) == 1:
+            axes[0, col_idx].set_title("t", fontsize=13)
+        else:
+            label_offset = len(context_frames) - col_idx - 1
+            axes[0, col_idx].set_title("t" if label_offset == 0 else f"t-{label_offset}", fontsize=13)
+
+    for horizon_idx in range(min(horizon, num_cols)):
+        gt_key = f"{view_name}_image"
+        gt_img = target_obs_seq[horizon_idx][gt_key][idx].permute(1, 2, 0).detach().cpu().numpy()
+        gt_img = np.clip(gt_img, 0, 1)
+        rendered_img = rendered_obs_seq[horizon_idx][gt_key][idx].permute(1, 2, 0).detach().cpu().numpy()
+        rendered_img = np.clip(rendered_img, 0, 1)
+        diff_img = np.abs(rendered_img - gt_img)
+
+        axes[1, horizon_idx].imshow(gt_img)
+        axes[1, horizon_idx].set_title(f"t+{horizon_idx + 1}", fontsize=13)
+        axes[2, horizon_idx].imshow(rendered_img)
+        axes[3, horizon_idx].imshow(diff_img)
+
+    fig.suptitle(f"Future Rollout Visualization - Step {step}", fontsize=16)
+    save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}.png")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved Future Rollout Visualization to {save_path}")

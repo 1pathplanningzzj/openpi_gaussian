@@ -34,9 +34,9 @@ class Args:
     # Model server parameters
     #################################################################################################################
     host: str = "0.0.0.0"
-    port: int = 8003
+    port: int = 8000
     resize_size: int = 224
-    replan_steps: int = 5
+    replan_steps: int = 5  # Test with 1 for closed-loop control
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -44,15 +44,17 @@ class Args:
     task_suite_name: str = (
         "libero_10"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
+    task_id: int | None = None  # Specific task ID to evaluate (None = evaluate all tasks)
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50  # Number of rollouts per task
 
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data_316/pi05_10000_libero_10_test_2/videos"  # Path to save videos
+    video_out_path: str = "data_317/gaussian_vla_exp316_15000_libero_10_test_1/videos"  # Path to save videos
 # Gaussian_vla_exp315_12000_libero_10 这个实际上是goal
-    seed: int = 7  # Random Seed (for reproducibility)
+    save_videos: bool = True  # Whether to save rollout videos
+    seed: int = 10  # Random Seed (for reproducibility)
 
 
 def _configure_logging(video_out_path: str) -> None:
@@ -111,7 +113,16 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+
+    # Determine which tasks to evaluate
+    if args.task_id is not None:
+        task_ids = [args.task_id]
+        logging.info(f"Evaluating single task: {args.task_id}")
+    else:
+        task_ids = range(num_tasks_in_suite)
+        logging.info(f"Evaluating all {num_tasks_in_suite} tasks")
+
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -160,7 +171,8 @@ def eval_libero(args: Args) -> None:
                     )
 
                     # Save preprocessed image for replay video
-                    replay_images.append(img)
+                    if args.save_videos:
+                        replay_images.append(img)
 
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
@@ -179,7 +191,8 @@ def eval_libero(args: Args) -> None:
                         }
 
                         # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        infer_result = client.infer(element)
+                        action_chunk = infer_result["actions"]
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
@@ -203,13 +216,14 @@ def eval_libero(args: Args) -> None:
             total_episodes += 1
 
             # Save a replay video of the episode
-            suffix = "success" if done else "failure"
-            task_segment = task_description.replace(" ", "_")
-            imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=10,
-            )
+            if args.save_videos:
+                suffix = "success" if done else "failure"
+                task_segment = task_description.replace(" ", "_")
+                imageio.mimwrite(
+                    pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                    [np.asarray(x) for x in replay_images],
+                    fps=10,
+                )
 
             # Log current results
             logging.info(f"Success: {done}")

@@ -39,6 +39,9 @@ class Pi0Config(_model.BaseModelConfig):
     use_single_frame_mode: bool = False
     # Whether to use BiDirectional World Model for aux loss
     use_world_model: bool = False
+    # Number of future frames to supervise in the world-model branch.
+    # When set to 5, the model predicts t+1 ... t+5 from a single future seed.
+    future_prediction_horizon: int = 5
     # VGGT encoder/decoder training options (for reconstruction loss)
     unfreeze_vggt_encoder: bool = False  # If True, unfreeze entire VGGT encoder for end-to-end training
     unfreeze_vggt_decoder_only: bool = True  # If True (default), only unfreeze decoder (gs_head) while keeping encoder frozen
@@ -53,6 +56,10 @@ class Pi0Config(_model.BaseModelConfig):
     lpips_weight: float = 0.1  # Weight for LPIPS perceptual loss
     # Regularization weight for future-token delta magnitude (encourages stable delta prediction).
     future_delta_reg_weight: float = 1e-4
+    # Number of steps to anneal future-rollout horizon weights from near-heavy to uniform.
+    future_horizon_curriculum_steps: int = 5_000
+    # Tail weight used by the early near-heavy horizon weighting profile.
+    future_horizon_early_min_weight: float = 0.2
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 

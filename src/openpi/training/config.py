@@ -821,6 +821,8 @@ _CONFIGS = [
             depth_loss_weight=0.1,
             use_lpips=True,  # Enable LPIPS perceptual loss
             lpips_weight=0.1,  # Weight for LPIPS loss
+            future_horizon_curriculum_steps=5_000,
+            future_horizon_early_min_weight=0.2,
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",

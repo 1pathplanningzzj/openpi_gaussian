@@ -3,6 +3,7 @@
 # Description: Main PI0 PyTorch model implementation with integrated 3D Gaussian Splatting (DF3DGS) support.
 import logging
 import math
+from types import SimpleNamespace
 
 import torch
 from torch import Tensor
@@ -124,7 +125,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0315_lpips_single_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0317_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -151,6 +152,9 @@ class PI0Pytorch(nn.Module):
         # --- World Model Tokens in Prefix (NEW Architecture) ---
         # Add future query tokens to prefix for unified VLM processing
         self.use_world_tokens_in_prefix = getattr(config, "use_world_model", False) and use_gaussian
+        self.future_prediction_horizon = max(
+            1, int(getattr(config, "future_prediction_horizon", 5 if self.use_world_tokens_in_prefix else 1))
+        )
         if self.use_world_tokens_in_prefix:
             # === Priority 1: Aligned Future Query Tokens ===
             # 256 future query tokens (matches 16×16 decoder grid)
@@ -200,18 +204,70 @@ class PI0Pytorch(nn.Module):
                     )
                 )
 
+            # Roll out a single future seed into short-horizon latents [t+1, ..., t+H].
+            self.future_horizon_embed = nn.Parameter(
+                torch.randn(self.future_prediction_horizon, paligemma_config.width) * 0.02
+            )
+            self.future_rollout_mlp = nn.Sequential(
+                nn.LayerNorm(paligemma_config.width),
+                nn.Linear(paligemma_config.width, paligemma_config.width),
+                nn.SiLU(),
+                nn.Linear(paligemma_config.width, paligemma_config.width),
+            )
+
+            # === NEW: Action-Conditioned Future Query (FiLM modulation) ===
+            # Use FiLM (Feature-wise Linear Modulation) to inject action information
+            # This is lightweight and stable - action modulates future query without strong coupling
+            self.use_action_film = getattr(config, "use_action_film", True)
+            if self.use_action_film:
+                # Encode action chunk into scale (gamma) and shift (beta) parameters
+                self.action_film_encoder = nn.Sequential(
+                    nn.Linear(config.action_dim * self.future_prediction_horizon, paligemma_config.width // 2),
+                    nn.LayerNorm(paligemma_config.width // 2),
+                    nn.SiLU(),
+                )
+                # Separate heads for gamma and beta
+                self.action_film_gamma = nn.Linear(paligemma_config.width // 2, paligemma_config.width)
+                self.action_film_beta = nn.Linear(paligemma_config.width // 2, paligemma_config.width)
+                nn.init.zeros_(self.action_film_gamma.weight)
+                nn.init.zeros_(self.action_film_gamma.bias)
+                nn.init.zeros_(self.action_film_beta.weight)
+                nn.init.zeros_(self.action_film_beta.bias)
+                logging.info(f"Action-conditioned future query enabled (FiLM modulation)")
+            else:
+                self.action_film_encoder = None
+                self.action_film_gamma = None
+                self.action_film_beta = None
+
+            # Global gate that decides how much future-delta information is allowed to
+            # influence the shared prefix. If the future branch is not helpful, action
+            # loss can keep this near zero instead of letting noisy future tokens pollute
+            # the action pathway.
+            self.use_future_usage_gate = getattr(config, "use_future_usage_gate", True)
+            if self.use_future_usage_gate:
+                future_usage_init = float(getattr(config, "future_usage_init", 0.05))
+                future_usage_init = min(max(future_usage_init, 1e-3), 1.0 - 1e-3)
+                self.future_usage_gate_raw = nn.Parameter(
+                    torch.tensor(math.log(future_usage_init / (1.0 - future_usage_init)), dtype=torch.float32)
+                )
+            else:
+                self.future_usage_gate_raw = None
+
             logging.info(
                 f"Initialized aligned future query tokens:\n"
                 f"  - Token count: {self.future_token_count}\n"
                 f"  - Spatial structure: {self.future_grid_size}×{self.future_grid_size}\n"
                 f"  - Spatial positional encoding: {'Sinusoidal + Learnable' if self.use_sinusoidal_spatial else 'Learnable only'}\n"
-                f"  - Aligned with VGGT tokens: 768 (3 frames × 256 tokens/frame)"
+                f"  - Aligned with VGGT tokens: 768 (3 frames × 256 tokens/frame)\n"
+                f"  - Future rollout horizon: {self.future_prediction_horizon}"
             )
         else:
             self.world_token_count = 0
             self.future_token_count = 0
             self.world_token_proj = None
             self.future_query_tokens = None
+            self.future_horizon_embed = None
+            self.future_rollout_mlp = None
         
         # --- VAE Token Compressor (Option B: Hybrid) ---
         # VAE is used only for reconstruction supervision (auxiliary loss)
@@ -279,6 +335,8 @@ class PI0Pytorch(nn.Module):
         self.depth_loss_weight = getattr(config, "depth_loss_weight", 0.1)  # 提高depth loss权重，优先学习几何
         # Keep future-token edits bounded to stabilize base+delta learning.
         self.future_delta_reg_weight = getattr(config, "future_delta_reg_weight", 1e-4)
+        self.future_horizon_curriculum_steps = max(0, int(getattr(config, "future_horizon_curriculum_steps", 5_000)))
+        self.future_horizon_early_min_weight = float(getattr(config, "future_horizon_early_min_weight", 0.2))
         self._action_loss_enabled = True  # Can be toggled by freeze/unfreeze_action_expert
         # -------------------------------
 
@@ -438,42 +496,38 @@ class PI0Pytorch(nn.Module):
             if img_val.ndim == 5:
                 # [B, T, H, W, C]
                 time_dim = img_val.shape[1]
-                idx_curr, idx_fut = 0, 0
-
-                if time_dim == 2:  # Curr, Next (from delta_timestamps=[0, 1])
-                    idx_curr, idx_fut = 0, 1
-                elif time_dim == 3:  # Prev, Curr, Next (from delta_timestamps=[-1, 0, 1])
-                    idx_curr, idx_fut = 1, 2
-                elif time_dim == 4:  # [t-2, t-1, t, t+1] (format for VGGT 3 frames + World Model)
-                    idx_curr, idx_fut = 2, 3  # Current is at idx=2 (t), future is at idx=3 (t+1)
-                elif time_dim == 6:  # [t-4, t-3, t-2, t-1, t, t+1] (old format for VGGT 5 frames + World Model)
-                    idx_curr, idx_fut = 4, 5  # Current is at idx=4 (t), future is at idx=5 (t+1)
+                context_frames = 1 if use_single_frame_mode else min(3, time_dim)
+                future_steps = max(0, min(self.future_prediction_horizon, time_dim - context_frames))
+                context_start = max(0, time_dim - future_steps - context_frames)
+                context_indices = list(range(context_start, context_start + context_frames))
+                future_indices = list(range(context_start + context_frames, context_start + context_frames + future_steps))
+                idx_curr = context_indices[-1]
 
                 # DEBUG PRINT
                 if train and torch.rand(1).item() < 0.01:
-                     print(f"DEBUG: Found Time Dim {time_dim}. indices: curr={idx_curr}, fut={idx_fut}")
+                     print(
+                         f"DEBUG: Found Time Dim {time_dim}. "
+                         f"context_indices={context_indices}, future_indices={future_indices}"
+                     )
 
-                if idx_fut > 0:
+                if future_indices:
                     curr_imgs, fut_imgs = {}, {}
                     # Save original temporal images for visualization before slicing
                     raw_temporal_images = {}
 
+                    def _select_time_slices(tensor, indices, *, collapse_single=False):
+                        if tensor is None or tensor.ndim < 2:
+                            return tensor
+                        selected = tensor[:, indices]
+                        if collapse_single and len(indices) == 1:
+                            return selected[:, 0]
+                        return selected
+
                     # Handle single-frame mode vs multi-frame mode
                     for k, v in observation.images.items():
-                        if use_single_frame_mode:
-                            # Save raw temporal data [B, T, H, W, C] for visualization
-                            # In single-frame mode, we only have [t, t+1], so extract those 2 frames
-                            raw_temporal_images[k] = v[:, [idx_curr, idx_fut]]  # [B, 2, H, W, C]
-
-                            # Single-frame mode: only keep current frame [B, H, W, C]
-                            # This prevents future leakage in image branch
-                            curr_imgs[k] = v[:, idx_curr]  # Extract single current frame
-                        else:
-                            # Multi-frame mode: keep full temporal sequence for VGGT [B, T, H, W, C]
-                            # VGGT will extract the needed frames in prepare_inputs
-                            curr_imgs[k] = v  # Keep full temporal sequence
-                        # Extract single frame for future observation [B, H, W, C]
-                        fut_imgs[k] = v[:, idx_fut]
+                        raw_temporal_images[k] = _select_time_slices(v, context_indices + future_indices)
+                        curr_imgs[k] = _select_time_slices(v, context_indices, collapse_single=use_single_frame_mode)
+                        fut_imgs[k] = _select_time_slices(v, future_indices, collapse_single=len(future_indices) == 1)
 
                     curr_state = observation.state
                     fut_state = observation.state
@@ -483,22 +537,16 @@ class PI0Pytorch(nn.Module):
                         if observation.state.ndim == 3:
                             # State has temporal dimension [B, T, D]
                             if observation.state.shape[1] == time_dim:
-                                if use_single_frame_mode:
-                                    # Single-frame mode: only keep current frame [B, D]
-                                    curr_state = observation.state[:, idx_curr]
-                                else:
-                                    # Multi-frame mode: keep full temporal dimension [B, T, D]
-                                    curr_state = observation.state
-                                fut_state = observation.state[:, idx_fut]  # Single frame for future
+                                curr_state = observation.state[:, idx_curr]
+                                fut_state = _select_time_slices(
+                                    observation.state, future_indices, collapse_single=len(future_indices) == 1
+                                )
                         elif observation.state.ndim == 2:
-                            # State is [B, D]
-                            if use_single_frame_mode:
-                                # Single-frame mode: keep as is [B, D]
-                                curr_state = observation.state
+                            curr_state = observation.state
+                            if len(future_indices) == 1:
+                                fut_state = observation.state
                             else:
-                                # Multi-frame mode: expand to [B, T, D] to match images
-                                curr_state = observation.state.unsqueeze(1).expand(-1, time_dim, -1)
-                            fut_state = observation.state  # Keep [B, D] for future
+                                fut_state = observation.state.unsqueeze(1).expand(-1, len(future_indices), -1)
 
                     # Clone observation for future
                     # Note: We must also slice the masks and prompts to match the single-step batch dimension,
@@ -509,13 +557,8 @@ class PI0Pytorch(nn.Module):
                     curr_masks = {}
                     for k, v in observation.image_masks.items():
                         if v.ndim == 2: # [B, T]
-                            if use_single_frame_mode:
-                                # Single-frame mode: only keep current frame [B]
-                                curr_masks[k] = v[:, idx_curr]
-                            else:
-                                # Multi-frame mode: keep full temporal dimension [B, T]
-                                curr_masks[k] = v
-                            fut_masks[k] = v[:, idx_fut]  # Single frame for future
+                            curr_masks[k] = _select_time_slices(v, context_indices, collapse_single=use_single_frame_mode)
+                            fut_masks[k] = _select_time_slices(v, future_indices, collapse_single=len(future_indices) == 1)
                         else: # [B] - assume valid for all steps
                             curr_masks[k] = v
                             fut_masks[k] = v
@@ -525,41 +568,39 @@ class PI0Pytorch(nn.Module):
                     fut_prompt = observation.tokenized_prompt
                     if curr_prompt is not None:
                         if curr_prompt.ndim == 3: # [B, T, L]
-                            if use_single_frame_mode:
-                                # Single-frame mode: only keep current frame [B, L]
-                                curr_prompt = curr_prompt[:, idx_curr]
-                            else:
-                                # Multi-frame mode: keep full temporal dimension [B, T, L]
-                                curr_prompt = curr_prompt
-                            fut_prompt = curr_prompt[:, idx_fut] if curr_prompt.ndim == 3 else observation.tokenized_prompt[:, idx_fut]
+                            curr_prompt = _select_time_slices(
+                                curr_prompt, context_indices, collapse_single=use_single_frame_mode
+                            )
+                            fut_prompt = _select_time_slices(
+                                observation.tokenized_prompt,
+                                future_indices,
+                                collapse_single=len(future_indices) == 1,
+                            )
                         elif curr_prompt.ndim == 2: # [B, L]
-                            if use_single_frame_mode:
-                                # Single-frame mode: keep as is [B, L]
-                                curr_prompt = curr_prompt
-                            else:
-                                # Multi-frame mode: expand to [B, T, L] to match images
-                                curr_prompt = curr_prompt.unsqueeze(1).expand(-1, time_dim, -1)
-                            fut_prompt = observation.tokenized_prompt  # Keep [B, L] for future
+                            if not use_single_frame_mode:
+                                curr_prompt = curr_prompt.unsqueeze(1).expand(-1, len(context_indices), -1)
+                            if len(future_indices) > 1:
+                                fut_prompt = observation.tokenized_prompt.unsqueeze(1).expand(-1, len(future_indices), -1)
 
                     curr_prompt_mask = observation.tokenized_prompt_mask
                     fut_prompt_mask = observation.tokenized_prompt_mask
                     if curr_prompt_mask is not None:
                         if curr_prompt_mask.ndim == 3: # [B, T, L]
-                            if use_single_frame_mode:
-                                # Single-frame mode: only keep current frame [B, L]
-                                curr_prompt_mask = curr_prompt_mask[:, idx_curr]
-                            else:
-                                # Multi-frame mode: keep full temporal dimension [B, T, L]
-                                curr_prompt_mask = curr_prompt_mask
-                            fut_prompt_mask = curr_prompt_mask[:, idx_fut] if curr_prompt_mask.ndim == 3 else observation.tokenized_prompt_mask[:, idx_fut]
+                            curr_prompt_mask = _select_time_slices(
+                                curr_prompt_mask, context_indices, collapse_single=use_single_frame_mode
+                            )
+                            fut_prompt_mask = _select_time_slices(
+                                observation.tokenized_prompt_mask,
+                                future_indices,
+                                collapse_single=len(future_indices) == 1,
+                            )
                         elif curr_prompt_mask.ndim == 2: # [B, L]
-                            if use_single_frame_mode:
-                                # Single-frame mode: keep as is [B, L]
-                                curr_prompt_mask = curr_prompt_mask
-                            else:
-                                # Multi-frame mode: expand to [B, T, L] to match images
-                                curr_prompt_mask = curr_prompt_mask.unsqueeze(1).expand(-1, time_dim, -1)
-                            fut_prompt_mask = observation.tokenized_prompt_mask  # Keep [B, L] for future
+                            if not use_single_frame_mode:
+                                curr_prompt_mask = curr_prompt_mask.unsqueeze(1).expand(-1, len(context_indices), -1)
+                            if len(future_indices) > 1:
+                                fut_prompt_mask = observation.tokenized_prompt_mask.unsqueeze(1).expand(
+                                    -1, len(future_indices), -1
+                                )
 
                     # Handle depth data if available
                     fut_depth = None
@@ -568,17 +609,19 @@ class PI0Pytorch(nn.Module):
                         # observation.depth: [B, T, 1, H, W] or [B, 1, H, W]
                         if observation.depth.ndim == 5:  # [B, T, 1, H, W]
                             if observation.depth.shape[1] == time_dim:
-                                if use_single_frame_mode:
-                                    # Single-frame mode: only keep current frame [B, 1, H, W]
-                                    curr_depth = observation.depth[:, idx_curr]
-                                else:
-                                    # Multi-frame mode: keep full temporal dimension [B, T, 1, H, W]
-                                    curr_depth = observation.depth
-                                fut_depth = observation.depth[:, idx_fut]  # [B, 1, H, W]
+                                curr_depth = _select_time_slices(
+                                    observation.depth, context_indices, collapse_single=use_single_frame_mode
+                                )
+                                fut_depth = _select_time_slices(
+                                    observation.depth, future_indices, collapse_single=len(future_indices) == 1
+                                )
                         elif observation.depth.ndim == 4:  # [B, 1, H, W]
                             # Single frame depth, use as is for both
                             curr_depth = observation.depth
-                            fut_depth = observation.depth
+                            if len(future_indices) == 1:
+                                fut_depth = observation.depth
+                            else:
+                                fut_depth = observation.depth.unsqueeze(1).expand(-1, len(future_indices), -1, -1, -1)
                         else:
                             logging.warning(f"Unexpected depth shape: {observation.depth.shape}, ndim={observation.depth.ndim}")
 
@@ -639,9 +682,345 @@ class PI0Pytorch(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
+    def _get_future_horizon_loss_weights(
+        self, step: int | None, horizon: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Anneal future-rollout horizon weights from near-heavy to uniform."""
+        if horizon <= 0:
+            return torch.zeros(0, device=device, dtype=dtype)
+
+        uniform = torch.ones(horizon, device=device, dtype=torch.float32)
+        if step is None or horizon == 1 or self.future_horizon_curriculum_steps <= 0:
+            return uniform.to(dtype=dtype)
+
+        tail_weight = min(max(self.future_horizon_early_min_weight, 1e-3), 1.0)
+        early = torch.linspace(1.0, tail_weight, horizon, device=device, dtype=torch.float32)
+        early = early / early.mean().clamp_min(1e-6)
+
+        progress = min(max(step, 0), self.future_horizon_curriculum_steps) / float(self.future_horizon_curriculum_steps)
+        weights = (1.0 - progress) * early + progress * uniform
+        return weights.to(dtype=dtype)
+
+    def _log_future_rollout_diagnostics(
+        self,
+        step: int | None,
+        future_seed_tokens: torch.Tensor,
+        z_future_pred_tokens: torch.Tensor,
+        per_step_delta: torch.Tensor,
+        horizon_weights: torch.Tensor,
+    ) -> None:
+        """Log latent-space rollout diagnostics on the visualization cadence."""
+        if step is None or step % 400 != 0:
+            return
+
+        import torch.distributed as dist
+
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        delta_fp32 = per_step_delta.float()
+        future_fp32 = z_future_pred_tokens.float()
+        delta_rms_by_h = delta_fp32.pow(2).mean(dim=(0, 2, 3)).sqrt()
+
+        inter_horizon_l2 = torch.zeros(0, device=future_fp32.device, dtype=torch.float32)
+        t1_tH_l2 = torch.zeros((), device=future_fp32.device, dtype=torch.float32)
+        if future_fp32.shape[1] > 1:
+            inter_horizon_l2 = (future_fp32[:, 1:] - future_fp32[:, :-1]).pow(2).mean(dim=(0, 2, 3)).sqrt()
+            t1_tH_l2 = (future_fp32[:, -1] - future_fp32[:, 0]).pow(2).mean().sqrt()
+
+        seed_to_tH_l2 = (future_fp32[:, -1] - future_seed_tokens.float()).pow(2).mean().sqrt()
+        weights_str = ", ".join(f"{value:.3f}" for value in horizon_weights.detach().cpu().tolist())
+        delta_rms_str = ", ".join(f"{value:.6f}" for value in delta_rms_by_h.detach().cpu().tolist())
+        inter_l2_str = ", ".join(f"{value:.6f}" for value in inter_horizon_l2.detach().cpu().tolist()) or "N/A"
+        logging.info(
+            f"Step {step}: Future Rollout Diagnostics | "
+            f"raw_delta_abs_mean={delta_fp32.abs().mean().item():.6f}, "
+            f"raw_delta_rms={delta_fp32.pow(2).mean().sqrt().item():.6f}, "
+            f"raw_delta_abs_max={delta_fp32.abs().max().item():.6f}, "
+            f"delta_rms_by_h=[{delta_rms_str}], "
+            f"inter_horizon_l2=[{inter_l2_str}], "
+            f"t1_tH_l2={t1_tH_l2.item():.6f}, "
+            f"seed_to_tH_l2={seed_to_tH_l2.item():.6f}, "
+            f"horizon_weights=[{weights_str}]"
+        )
+
+    def _log_future_rollout_pixel_lpips(self, step: int | None, rendered_obs_seq: list[dict[str, torch.Tensor]]) -> None:
+        """Log pixel-space LPIPS between the first and last rendered future predictions."""
+        if step is None or step % 400 != 0 or len(rendered_obs_seq) < 2:
+            return
+
+        import torch.distributed as dist
+
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        first_render = rendered_obs_seq[0]
+        last_render = rendered_obs_seq[-1]
+        shared_keys = list(set(first_render.keys()) & set(last_render.keys()))
+        if not shared_keys:
+            return
+
+        view_key = "agent_image" if "agent_image" in shared_keys else shared_keys[0]
+        if self.lpips_fn is None:
+            logging.info(
+                f"Step {step}: Future Rollout Pixel LPIPS(t1,t{len(rendered_obs_seq)})[{view_key}] unavailable (LPIPS disabled)"
+            )
+            return
+
+        pred_t1 = torch.clamp(first_render[view_key], 0.0, 1.0)
+        pred_tH = torch.clamp(last_render[view_key], 0.0, 1.0)
+        with torch.no_grad():
+            lpips_value = self.lpips_fn(pred_t1 * 2.0 - 1.0, pred_tH * 2.0 - 1.0).mean()
+        logging.info(
+            f"Step {step}: Future Rollout Pixel LPIPS(t1,t{len(rendered_obs_seq)})[{view_key}] = {lpips_value.item():.6f}"
+        )
+
+    def _rollout_future_latents(self, future_seed_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Autoregressive rollout: z_{t+h} = z_{t+h-1} + delta_h.
+
+        Each step's MLP input is the *previous* latent + horizon embedding,
+        so the model can condition on accumulated state rather than
+        predicting all horizons independently from the same seed.
+        """
+        if self.future_rollout_mlp is None or self.future_horizon_embed is None:
+            zero_delta = torch.zeros_like(future_seed_tokens[:, None, :, :])
+            return future_seed_tokens[:, None, :, :], zero_delta
+
+        bsize, num_tokens, width = future_seed_tokens.shape
+        horizon = self.future_horizon_embed.shape[0]
+
+        rollout_tokens = []
+        rollout_deltas = []
+        running = future_seed_tokens  # [B, N, D]
+        for h in range(horizon):
+            mlp_input = running + self.future_horizon_embed[h][None, None, :]  # [B, N, D]
+            delta_h = self.future_rollout_mlp(mlp_input.reshape(bsize * num_tokens, width))
+            delta_h = delta_h.view(bsize, num_tokens, width)
+            running = running + delta_h
+            rollout_tokens.append(running)
+            rollout_deltas.append(delta_h)
+
+        return torch.stack(rollout_tokens, dim=1), torch.stack(rollout_deltas, dim=1)  # [B, H, N, D]
+
+    def _get_temporal_observation_length(self, observation) -> int:
+        """Infer the temporal length stored in a future observation sequence."""
+        if observation is None:
+            return 0
+
+        if hasattr(observation, "images"):
+            for value in observation.images.values():
+                if value.ndim == 5:
+                    return value.shape[1]
+        if hasattr(observation, "depth") and observation.depth is not None and observation.depth.ndim == 5:
+            return observation.depth.shape[1]
+        if hasattr(observation, "state") and observation.state is not None and observation.state.ndim == 3:
+            return observation.state.shape[1]
+        return 0
+
+    def _slice_temporal_observation(self, observation, index: int):
+        """Extract one horizon from a temporally-stacked observation container."""
+        if observation is None:
+            return None
+
+        images = {}
+        for key, value in observation.images.items():
+            if value.ndim == 5:
+                images[key] = value[:, index]
+            else:
+                images[key] = value
+
+        image_masks = {}
+        for key, value in observation.image_masks.items():
+            if value.ndim == 2:
+                image_masks[key] = value[:, index]
+            else:
+                image_masks[key] = value
+
+        state = observation.state[:, index] if observation.state is not None and observation.state.ndim == 3 else observation.state
+        tokenized_prompt = (
+            observation.tokenized_prompt[:, index]
+            if observation.tokenized_prompt is not None and observation.tokenized_prompt.ndim == 3
+            else observation.tokenized_prompt
+        )
+        tokenized_prompt_mask = (
+            observation.tokenized_prompt_mask[:, index]
+            if observation.tokenized_prompt_mask is not None and observation.tokenized_prompt_mask.ndim == 3
+            else observation.tokenized_prompt_mask
+        )
+        depth = observation.depth[:, index] if getattr(observation, "depth", None) is not None and observation.depth.ndim == 5 else getattr(observation, "depth", None)
+
+        return SimpleNamespace(
+            images=images,
+            image_masks=image_masks,
+            state=state,
+            tokenized_prompt=tokenized_prompt,
+            tokenized_prompt_mask=tokenized_prompt_mask,
+            token_ar_mask=getattr(observation, "token_ar_mask", None),
+            token_loss_mask=getattr(observation, "token_loss_mask", None),
+            depth=depth,
+        )
+
+    def _compute_world_model_frame_loss(
+        self,
+        z_next: torch.Tensor,
+        future_target,
+        preprocessed_observation,
+        step: int | None = None,
+        time_suffix: str = "_t1_pred_vlm",
+        visualize: bool = True,
+    ) -> torch.Tensor:
+        """Decode one future latent and supervise it with rendering + depth losses."""
+        device = z_next.device
+        total_loss = torch.zeros((), dtype=torch.float32, device=device)
+        if self.world_model is None or self.gaussian_renderer is None or future_target is None:
+            return total_loss
+
+        import torch.distributed as dist
+
+        is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+
+        try:
+            camera_params_for_decode = self._get_camera_params_for_view("agent", device, z_next.shape[0])
+            gaussian_params = self.world_model.decode(
+                z_next.float(),
+                future_observation=future_target,
+                gaussian_adapter=self.gaussian_adapter,
+                camera_params=camera_params_for_decode,
+                step=step,
+                current_observation=preprocessed_observation,
+            )
+
+            depth_map = gaussian_params.pop("depth_map", None)
+
+            if step is not None and step % 400 == 0:
+                logging.info(
+                    f"Step {step}{time_suffix}: depth_map={depth_map is not None}, "
+                    f"has_depth_attr={hasattr(future_target, 'depth')}, "
+                    f"depth_value={future_target.depth is not None if hasattr(future_target, 'depth') else 'N/A'}"
+                )
+
+            if depth_map is not None and hasattr(future_target, "depth") and future_target.depth is not None:
+                gt_depth = future_target.depth
+                if depth_map.shape != gt_depth.shape:
+                    depth_map = F.interpolate(
+                        depth_map, size=gt_depth.shape[-2:], mode="bilinear", align_corners=False
+                    )
+                depth_loss = F.l1_loss(depth_map, gt_depth)
+                if torch.isfinite(depth_loss):
+                    total_loss = total_loss + getattr(self, "depth_loss_weight", 0.1) * depth_loss
+                if step is not None and step % 400 == 0:
+                    logging.info(
+                        f"Step {step}{time_suffix}: Depth Loss = {depth_loss.item():.6f}, "
+                        f"weight={getattr(self, 'depth_loss_weight', 0.1)}"
+                    )
+
+            for key, value in gaussian_params.items():
+                if torch.isnan(value).any() or torch.isinf(value).any():
+                    gaussian_params[key] = torch.where(torch.isfinite(value), value, torch.zeros_like(value))
+
+            target_obs = {}
+            cam_params_dict = {}
+            valid_views = []
+
+            for key, value in future_target.images.items():
+                img_tensor = value
+                view_name = None
+                if key == "image" or "agent" in key or "high" in key or "cam_high" in key or "exterior" in key or "base" in key:
+                    view_name = "agent"
+                elif "left_wrist" in key or "wrist_left" in key:
+                    view_name = "wrist"
+                elif "right_wrist" in key or "wrist_right" in key:
+                    if img_tensor.min() == img_tensor.max() == -1.0:
+                        continue
+                    view_name = "wrist"
+                elif "wrist" in key or "bravo" in key:
+                    view_name = "wrist"
+
+                if view_name:
+                    if img_tensor.shape[1] != 3 and img_tensor.shape[-1] == 3:
+                        img_tensor = img_tensor.permute(0, 3, 1, 2)
+                    img_tensor = (img_tensor + 1.0) / 2.0
+                    view_key = f"{view_name}_image"
+                    if view_key not in target_obs:
+                        target_obs[view_key] = img_tensor
+                        cam_params_dict[view_name] = self._get_camera_params_for_view(view_name, device, z_next.shape[0])
+                        valid_views.append(view_name)
+
+            if valid_views:
+                render_views = ["agent"] if "agent" in valid_views else valid_views
+                render_loss, render_loss_dict = compute_multi_view_rendering_loss(
+                    gaussian_params,
+                    target_obs,
+                    cam_params_dict,
+                    self.gaussian_renderer,
+                    view_names=render_views,
+                    step=step,
+                    depth_map=depth_map,
+                    lambda_scale=0.001,
+                    lambda_opacity=0.01,
+                    lambda_edge_smooth=0.01,
+                    lpips_fn=self.lpips_fn,
+                    lpips_weight=self.lpips_weight,
+                )
+                if torch.isfinite(render_loss):
+                    total_loss = total_loss + self.render_loss_weight * render_loss.to(total_loss.dtype)
+
+                if "sh" in gaussian_params:
+                    sh_dc = gaussian_params["sh"]
+                    sh_dc_reg = (sh_dc ** 2).mean() * 0.01
+                    total_loss = total_loss + sh_dc_reg
+                    if step is not None and step % 400 == 0:
+                        logging.info(
+                            f"Step {step}{time_suffix}: SH DC Reg = {sh_dc_reg.item():.6f}, "
+                            f"SH DC mean = {sh_dc.mean().item():.6f}"
+                        )
+
+                should_log = step is not None and step % 400 == 0
+                if should_log:
+                    loss_parts = ", ".join(f"{k}={v.item():.6f}" for k, v in render_loss_dict.items())
+                    logging.info(
+                        f"Step {step}{time_suffix}: Render Loss = {render_loss.item():.4f}, "
+                        f"weight={self.render_loss_weight}, breakdown: {loss_parts}"
+                    )
+
+                if visualize and should_log and is_main_process:
+                    with torch.no_grad():
+                        try:
+                            temporal_frames = {}
+                            if hasattr(preprocessed_observation, "raw_temporal_images"):
+                                temporal_frames = preprocessed_observation.raw_temporal_images
+                                for key, value in temporal_frames.items():
+                                    logging.info(f"[Viz] Extracted raw temporal {key} with shape {value.shape}")
+                            elif hasattr(preprocessed_observation, "images"):
+                                for key, value in preprocessed_observation.images.items():
+                                    if value.ndim == 5 and value.shape[1] >= 2:
+                                        temporal_frames[key] = value
+                                        logging.info(f"[Viz] Extracted {key} with shape {value.shape}")
+
+                            self._visualize_rendering_comparison(
+                                step,
+                                gaussian_params,
+                                target_obs,
+                                cam_params_dict,
+                                view_names=render_views,
+                                time_suffix=time_suffix,
+                                temporal_frames=temporal_frames,
+                            )
+                        except Exception as viz_error:
+                            logging.warning(f"Step {step}{time_suffix}: Visualization failed: {viz_error}")
+        except Exception as error:
+            import traceback
+
+            logging.warning(f"Step {step}{time_suffix}: Decode/render failed: {error}")
+            if step is not None and step % 400 == 0:
+                traceback.print_exc()
+                logging.warning(traceback.format_exc())
+
+        return total_loss
+
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, gaussian_inputs=None, 
-        return_segment_lengths=False
+        self, images, img_masks, lang_tokens, lang_masks, gaussian_inputs=None,
+        future_actions=None, return_segment_lengths=False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -842,11 +1221,49 @@ class PI0Pytorch(nn.Module):
             delta_q = self.future_query_tokens.expand(B, -1, -1)  # [B, 256, D]
             z_base = z_base.to(delta_q.dtype)
             delta_scale = F.softplus(self.delta_scale)
+            future_usage_gate = (
+                torch.sigmoid(self.future_usage_gate_raw).to(dtype=delta_q.dtype, device=device)
+                if self.future_usage_gate_raw is not None
+                else torch.ones((), dtype=delta_q.dtype, device=device)
+            )
 
-            # 3. Combine: future = base + scaled_delta + role_embed
-            future_tokens = z_base + delta_scale * delta_q + self.future_delta_embed  # [B, 256, D]
+            # 3. Action conditioning via FiLM modulation (NEW)
+            # Apply action-conditioned gating: future = z_base + gate(a) * delta_q + beta(a) + role_embed
+            # This injects action dynamics: gate controls "how much change", beta controls "what change"
+            if future_actions is not None and self.use_action_film and self.action_film_encoder is not None:
+                # future_actions: [B, horizon, action_dim]
+                # Flatten to [B, horizon * action_dim]
+                action_flat = future_actions[:, :self.future_prediction_horizon].reshape(B, -1)
+                # Encode to intermediate representation
+                action_feat = self.action_film_encoder(action_flat)  # [B, D/2]
+                # Generate gate (scale for delta_q) and beta (action-specific shift)
+                gate = torch.sigmoid(self.action_film_gamma(action_feat)).unsqueeze(1)  # [B, 1, D]
+                beta = self.action_film_beta(action_feat).unsqueeze(1)  # [B, 1, D]
 
-            # 4. Add spatial positional encoding (16×16 grid structure)
+                # Combine: base + globally-gated action-conditioned delta.
+                # The global gate lets the action loss decide whether future tokens should
+                # participate in the shared prefix at all.
+                future_delta = future_usage_gate * (gate * delta_scale * delta_q + beta)
+                future_tokens = z_base + future_delta + self.future_delta_embed  # [B, 256, D]
+
+                # Debug log (only log occasionally to avoid spam)
+                if hasattr(self, '_film_log_counter'):
+                    self._film_log_counter += 1
+                else:
+                    self._film_log_counter = 0
+                if self._film_log_counter % 100 == 0:
+                    logging.info(
+                        "[Action FiLM] Applied action conditioning: "
+                        f"usage_gate={future_usage_gate.item():.4f}, "
+                        f"gate_mean={gate.mean().item():.4f}, beta_mean={beta.mean().item():.4f}"
+                    )
+            else:
+                # No action conditioning available (e.g. inference).
+                # Keep the same global gate so the model can fall back to a near-no-op
+                # future prefix if unguided future deltas are not useful.
+                future_tokens = z_base + future_usage_gate * delta_scale * delta_q + self.future_delta_embed  # [B, 256, D]
+
+            # 5. Add spatial positional encoding (16×16 grid structure)
             # Reshape spatial pos: [16, 16, D] -> [256, D]
             spatial_pos = self.future_spatial_pos.reshape(1, self.future_token_count, -1)  # [1, 256, D]
 
@@ -1139,6 +1556,136 @@ class PI0Pytorch(nn.Module):
             temporal_frames=temporal_frames
         )
 
+    def _get_temporal_frames_for_viz(self, preprocessed_observation):
+        temporal_frames = {}
+        if hasattr(preprocessed_observation, "raw_temporal_images"):
+            temporal_frames = preprocessed_observation.raw_temporal_images
+            for key, value in temporal_frames.items():
+                logging.info(f"[Viz] Extracted raw temporal {key} with shape {value.shape}")
+        elif hasattr(preprocessed_observation, "images"):
+            for key, value in preprocessed_observation.images.items():
+                if value.ndim == 5 and value.shape[1] >= 2:
+                    temporal_frames[key] = value
+                    logging.info(f"[Viz] Extracted {key} with shape {value.shape}")
+        return temporal_frames
+
+    def _visualize_future_rollout(self, step, z_future_pred_tokens, future_observation, preprocessed_observation):
+        """Visualize context + future rollout GT/render/diff in one grid."""
+        from openpi.models_pytorch.gaussian_renderer import visualize_future_rollout_comparison
+
+        if self.world_model is None or self.gaussian_renderer is None or future_observation is None:
+            return
+
+        temporal_frames = self._get_temporal_frames_for_viz(preprocessed_observation)
+        available_future_steps = self._get_temporal_observation_length(future_observation)
+        rollout_horizon = min(z_future_pred_tokens.shape[1], available_future_steps or 1)
+        if rollout_horizon <= 0:
+            return
+
+        first_future_target = (
+            self._slice_temporal_observation(future_observation, 0)
+            if available_future_steps > 0
+            else future_observation
+        )
+        view_names = []
+        for key in first_future_target.images.keys():
+            key_lower = key.lower()
+            if key == "image" or "agent" in key_lower or "high" in key_lower or "cam_high" in key_lower or "exterior" in key_lower or "base" in key_lower:
+                if "agent" not in view_names:
+                    view_names.append("agent")
+            elif "wrist" in key_lower or "bravo" in key_lower:
+                if "wrist" not in view_names:
+                    view_names.append("wrist")
+        if not view_names:
+            view_names = ["agent"]
+
+        target_obs_seq = []
+        rendered_obs_seq = []
+        render_views = None
+
+        with torch.no_grad():
+            for horizon_idx in range(rollout_horizon):
+                future_target = (
+                    self._slice_temporal_observation(future_observation, horizon_idx)
+                    if available_future_steps > 0
+                    else future_observation
+                )
+                camera_params_for_decode = self._get_camera_params_for_view(
+                    "agent", z_future_pred_tokens.device, z_future_pred_tokens.shape[0]
+                )
+                gaussian_params = self.world_model.decode(
+                    z_future_pred_tokens[:, horizon_idx].float(),
+                    future_observation=future_target,
+                    gaussian_adapter=self.gaussian_adapter,
+                    camera_params=camera_params_for_decode,
+                    step=step,
+                    current_observation=preprocessed_observation,
+                )
+
+                target_obs = {}
+                cam_params_dict = {}
+                valid_views = []
+                for key, value in future_target.images.items():
+                    img_tensor = value
+                    view_name = None
+                    key_lower = key.lower()
+                    if key == "image" or "agent" in key_lower or "high" in key_lower or "cam_high" in key_lower or "exterior" in key_lower or "base" in key_lower:
+                        view_name = "agent"
+                    elif "left_wrist" in key_lower or "wrist_left" in key_lower:
+                        view_name = "wrist"
+                    elif "right_wrist" in key_lower or "wrist_right" in key_lower:
+                        if img_tensor.min() == img_tensor.max() == -1.0:
+                            continue
+                        view_name = "wrist"
+                    elif "wrist" in key_lower or "bravo" in key_lower:
+                        view_name = "wrist"
+
+                    if view_name:
+                        if img_tensor.shape[1] != 3 and img_tensor.shape[-1] == 3:
+                            img_tensor = img_tensor.permute(0, 3, 1, 2)
+                        img_tensor = (img_tensor + 1.0) / 2.0
+                        view_key = f"{view_name}_image"
+                        if view_key not in target_obs:
+                            target_obs[view_key] = img_tensor
+                            cam_params_dict[view_name] = self._get_camera_params_for_view(
+                                view_name, z_future_pred_tokens.device, z_future_pred_tokens.shape[0]
+                            )
+                            valid_views.append(view_name)
+
+                if valid_views:
+                    render_views = ["agent"] if "agent" in valid_views else valid_views
+                elif render_views is None:
+                    render_views = ["agent"]
+
+                rendered_obs = {}
+                params_single = {
+                    "xyz": gaussian_params["xyz"][:1],
+                    "sh": gaussian_params["sh"][:1],
+                    "opacity": gaussian_params["opacity"][:1],
+                    "scales": gaussian_params["scales"][:1],
+                    "rotations": gaussian_params["rotations"][:1],
+                }
+                for view_name in render_views:
+                    cam_params = {
+                        key: value[:1] if isinstance(value, torch.Tensor) else value
+                        for key, value in cam_params_dict[view_name].items()
+                    }
+                    rendered_obs[f"{view_name}_image"] = self.gaussian_renderer(params_single, cam_params).float()
+
+                target_obs_seq.append({key: value[:1].float() for key, value in target_obs.items()})
+                rendered_obs_seq.append(rendered_obs)
+
+        visualize_future_rollout_comparison(
+            step,
+            target_obs_seq,
+            rendered_obs_seq,
+            render_views or view_names,
+            save_dir=self.vis_save_dir,
+            temporal_frames=temporal_frames,
+            time_suffix="_future_rollout",
+        )
+        self._log_future_rollout_pixel_lpips(step, rendered_obs_seq)
+
     def forward(self, observation, actions, noise=None, time=None, step=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         images, img_masks, lang_tokens, lang_masks, state, future_observation, preprocessed_observation = self._preprocess_observation(observation, train=True)
@@ -1171,8 +1718,10 @@ class PI0Pytorch(nn.Module):
             gaussian_inputs = self._prepare_gaussian_inputs(preprocessed_observation, actions.device, actions.shape[0])
 
         # Get prefix embeddings with segment lengths for extracting future tokens
+        # Pass actions for action-conditioned future query
         prefix_result = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, gaussian_inputs=gaussian_inputs,
+            future_actions=actions if self.use_world_tokens_in_prefix else None,
             return_segment_lengths=self.use_world_tokens_in_prefix
         )
         if self.use_world_tokens_in_prefix:
@@ -1228,6 +1777,7 @@ class PI0Pytorch(nn.Module):
         
         # --- Extract Future Frame Tokens from Prefix Output (NEW) ---
         z_t1_pred_tokens = None
+        z_future_pred_tokens = None
         if self.use_world_tokens_in_prefix and 'future' in segment_lengths:
             # Calculate the start position of future tokens in prefix_output
             # Order: gaussian (if exists) -> images -> language -> future
@@ -1245,199 +1795,81 @@ class PI0Pytorch(nn.Module):
             future_end = future_start + segment_lengths['future']
             z_t1_pred_tokens = prefix_out[:, future_start:future_end, :]  # [B, future_token_count, D]
             
-            if step is not None and step % 100 == 0:
+            if step is not None and step % 400 == 0:
                 print(f"[DEBUG] Extracted future tokens: shape={z_t1_pred_tokens.shape}, "
                       f"start={future_start}, end={future_end}, segment_lengths={segment_lengths}")
 
-            # Future-delta regularization: keep z_t1 close to current-frame token base unless needed.
-            gaussian_len = segment_lengths.get("gaussian", 0)
-            if gaussian_len >= self.future_token_count:
-                gaussian_end = gaussian_len
-                z_t_base_tokens = prefix_out[:, gaussian_end - self.future_token_count:gaussian_end, :]
-                delta_tokens = z_t1_pred_tokens - z_t_base_tokens
-                delta_reg = self.future_delta_reg_weight * delta_tokens.float().pow(2).mean()
+            z_future_pred_tokens, per_step_delta = self._rollout_future_latents(z_t1_pred_tokens)
+
+            # Future-rollout regularization: penalise per-step delta magnitude.
+            # For autoregressive rollout, regularise each step's increment separately.
+            horizon = z_future_pred_tokens.shape[1]
+            if horizon > 0:
+                delta_reg_weights = self._get_future_horizon_loss_weights(
+                    step, horizon, per_step_delta.device, torch.float32
+                )
+                raw_delta_reg = (
+                    per_step_delta.float().pow(2).mean(dim=(0, 2, 3)) * delta_reg_weights
+                ).sum() / delta_reg_weights.sum().clamp_min(1e-6)
+                delta_reg = self.future_delta_reg_weight * raw_delta_reg
                 if torch.isfinite(delta_reg):
                     loss = loss + delta_reg.to(loss.dtype)
-                if step is not None and step % 100 == 0:
+                self._log_future_rollout_diagnostics(
+                    step,
+                    z_t1_pred_tokens,
+                    z_future_pred_tokens,
+                    per_step_delta,
+                    delta_reg_weights,
+                )
+
+                if step is not None and step % 400 == 0:
                     logging.info(
-                        f"Step {step}: Future Delta Reg = {delta_reg.item():.6f}, "
-                        f"weight={self.future_delta_reg_weight}"
+                        f"Step {step}: Future Rollout Delta Reg = {delta_reg.item():.6f}, "
+                        f"raw={raw_delta_reg.item():.6f}, weight={self.future_delta_reg_weight}"
                     )
 
         # --- World Model Render Loss (render-only, no forward loss) ---
-        if self.use_world_tokens_in_prefix and z_t1_pred_tokens is not None and future_observation is not None:
-            z_next = z_t1_pred_tokens  # [B, 256, D]
+        if self.use_world_tokens_in_prefix and z_future_pred_tokens is not None and future_observation is not None:
+            available_future_steps = self._get_temporal_observation_length(future_observation)
+            rollout_horizon = min(z_future_pred_tokens.shape[1], available_future_steps or 1)
+            world_model_loss = torch.zeros((), dtype=torch.float32, device=loss.device)
+            horizon_loss_weights = self._get_future_horizon_loss_weights(
+                step, rollout_horizon, loss.device, torch.float32
+            )
 
-            import torch.distributed as dist
-            is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+            for horizon_idx in range(rollout_horizon):
+                future_target = (
+                    self._slice_temporal_observation(future_observation, horizon_idx)
+                    if available_future_steps > 0
+                    else future_observation
+                )
+                horizon_loss = self._compute_world_model_frame_loss(
+                    z_future_pred_tokens[:, horizon_idx],
+                    future_target,
+                    preprocessed_observation,
+                    step=step,
+                    time_suffix=f"_t{horizon_idx + 1}_pred_vlm",
+                    visualize=False,
+                )
+                world_model_loss = world_model_loss + horizon_loss_weights[horizon_idx] * horizon_loss
 
-            # Decode + render every step for proper gradient flow
-            if self.world_model is not None and self.gaussian_renderer is not None:
-                try:
-                    camera_params_for_decode = self._get_camera_params_for_view(
-                        "agent", z_next.device, z_next.shape[0]
-                    )
-                    z_next_float32 = z_next.float()
+            if rollout_horizon > 0:
+                loss = loss + (world_model_loss / horizon_loss_weights.sum().clamp_min(1e-6)).to(loss.dtype)
 
-                    # Decode predicted tokens to 3D Gaussians (with gradients)
-                    gaussian_params = self.world_model.decode(
-                        z_next_float32,
-                        future_observation=future_observation,
-                        gaussian_adapter=self.gaussian_adapter,
-                        camera_params=camera_params_for_decode,
-                        step=step,
-                        current_observation=preprocessed_observation,
-                    )
+                import torch.distributed as dist
 
-                    # Sanitize Gaussian params
-                    depth_map = gaussian_params.pop("depth_map", None)  # [B, 1, H, W]
-
-                    # --- Depth Supervision Loss (NEW) ---
-                    depth_loss = None
-                    # Debug: check if depth data is available
-                    if step is not None and step % 100 == 0:
-                        logging.info(f"Step {step}: depth_map={depth_map is not None}, "
-                                   f"has_depth_attr={hasattr(future_observation, 'depth')}, "
-                                   f"depth_value={future_observation.depth is not None if hasattr(future_observation, 'depth') else 'N/A'}")
-
-                    if depth_map is not None and hasattr(future_observation, 'depth') and future_observation.depth is not None:
-                        # future_observation.depth: [B, 1, H, W] - ground truth depth from Depth Anything V2
-                        gt_depth = future_observation.depth
-
-                        # Resize predicted depth to match GT depth if needed
-                        if depth_map.shape != gt_depth.shape:
-                            depth_map_resized = F.interpolate(
-                                depth_map, size=gt_depth.shape[-2:], mode='bilinear', align_corners=False
-                            )
-                        else:
-                            depth_map_resized = depth_map
-
-                        # Compute L1 loss for depth (more robust than L2 for depth estimation)
-                        depth_loss = F.l1_loss(depth_map_resized, gt_depth)
-
-                        # Add depth loss to total loss with weight
-                        depth_loss_weight = getattr(self, 'depth_loss_weight', 0.1)
-                        if torch.isfinite(depth_loss):
-                            loss = loss + depth_loss_weight * depth_loss
-
-                        # Logging
-                        if step is not None and step % 100 == 0:
-                            logging.info(f"Step {step}: Depth Loss = {depth_loss.item():.6f}, weight={depth_loss_weight}")
-
-                    for k, v in gaussian_params.items():
-                        if torch.isnan(v).any() or torch.isinf(v).any():
-                            gaussian_params[k] = torch.where(
-                                torch.isfinite(v), v, torch.zeros_like(v)
-                            )
-
-                    # Prepare target images for rendering loss
-                    target_obs = {}
-                    cam_params_dict = {}
-                    valid_views = []
-
-                    for k, v in future_observation.images.items():
-                        img_tensor = v
-                        view_name = None
-                        if k == "image" or "agent" in k or "high" in k or "cam_high" in k or "exterior" in k or "base" in k:
-                            view_name = "agent"
-                        elif "left_wrist" in k or "wrist_left" in k:
-                            view_name = "wrist"
-                        elif "right_wrist" in k or "wrist_right" in k:
-                            if img_tensor.min() == img_tensor.max() == -1.0:
-                                continue
-                            view_name = "wrist"
-                        elif "wrist" in k or "bravo" in k:
-                            view_name = "wrist"
-
-                        if view_name:
-                            if img_tensor.shape[1] != 3 and img_tensor.shape[-1] == 3:
-                                img_tensor = img_tensor.permute(0, 3, 1, 2)
-                            img_tensor = (img_tensor + 1.0) / 2.0
-                            view_key = f"{view_name}_image"
-                            if view_key not in target_obs:
-                                target_obs[view_key] = img_tensor
-                                cam_params_dict[view_name] = self._get_camera_params_for_view(
-                                    view_name, z_next.device, z_next.shape[0]
-                                )
-                                valid_views.append(view_name)
-
-                    if valid_views:
-                        render_views = ["agent"] if "agent" in valid_views else valid_views
-
-                        # Render loss every step (gradient supervision for decoder)
-                        render_loss, render_loss_dict = compute_multi_view_rendering_loss(
-                            gaussian_params,
-                            target_obs,
-                            cam_params_dict,
-                            self.gaussian_renderer,
-                            view_names=render_views,
-                            step=step,
-                            depth_map=depth_map,
-                            lambda_scale=0.001,
-                            lambda_opacity=0.01,  # 增大10倍: 0.001 → 0.01 (防止opacity过大导致模糊)
-                            lambda_edge_smooth=0.01,
-                            lpips_fn=self.lpips_fn,
-                            lpips_weight=self.lpips_weight,
+                should_log = step is not None and step % 400 == 0
+                is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+                if should_log and is_main_process:
+                    try:
+                        self._visualize_future_rollout(
+                            step,
+                            z_future_pred_tokens[:, :rollout_horizon],
+                            future_observation,
+                            preprocessed_observation,
                         )
-                        # Use dynamic render_loss_weight (can be changed for staged training)
-                        if torch.isfinite(render_loss):
-                            loss = loss + self.render_loss_weight * render_loss.to(loss.dtype)
-                        
-                        # SH DC regularization: encourage neutral gray (sh_dc ≈ 0) to prevent dark rendering
-                        # This prevents the model from learning to output negative SH DC values
-                        if "sh" in gaussian_params:
-                            sh_dc = gaussian_params["sh"]  # [B, N, 3] - SH DC coefficients
-                            # L2 regularization: penalize SH DC deviating from 0 (neutral gray)
-                            sh_dc_reg = (sh_dc ** 2).mean() * 0.01  # Small weight to avoid over-constraining
-                            loss = loss + sh_dc_reg
-                            if step is not None and step % 100 == 0:
-                                logging.info(f"Step {step}: SH DC Reg = {sh_dc_reg.item():.6f}, SH DC mean = {sh_dc.mean().item():.6f}")
-
-                        # Periodic logging + visualization
-                        should_log = step is not None and step % 100 == 0
-                        if should_log:
-                            loss_parts = ", ".join(f"{k}={v.item():.6f}" for k, v in render_loss_dict.items())
-                            logging.info(f"Step {step}: Render Loss = {render_loss.item():.4f}, weight={self.render_loss_weight}, breakdown: {loss_parts}")
-
-                        if should_log and is_main_process:
-                            with torch.no_grad():
-                                try:
-                                    # Extract temporal frames from preprocessed_observation
-                                    # Expected: 4 consecutive frames [t-2, t-1, t, t+1]
-                                    temporal_frames = {}
-                                    # First check if raw_temporal_images is available (for single-frame mode)
-                                    if hasattr(preprocessed_observation, 'raw_temporal_images'):
-                                        temporal_frames = preprocessed_observation.raw_temporal_images
-                                        for k, v in temporal_frames.items():
-                                            logging.info(f"[Viz] Extracted raw temporal {k} with shape {v.shape}")
-                                    # Otherwise try to extract from preprocessed_observation.images (for multi-frame mode)
-                                    elif hasattr(preprocessed_observation, 'images'):
-                                        for k, v in preprocessed_observation.images.items():
-                                            # v shape: [B, T, H, W, C] where T=4 for multi-frame [t-2, t-1, t, t+1] or T=2 for single-frame [t, t+1]
-                                            if v.ndim == 5 and v.shape[1] in [2, 4]:  # Accept both single-frame (T=2) and multi-frame (T=4)
-                                                temporal_frames[k] = v  # Keep all frames [B, T, H, W, C]
-                                                logging.info(f"[Viz] Extracted {k} with shape {v.shape}")
-
-                                    self._visualize_rendering_comparison(
-                                        step,
-                                        gaussian_params,
-                                        target_obs,
-                                        cam_params_dict,
-                                        view_names=render_views,
-                                        time_suffix="_t1_pred_vlm",
-                                        temporal_frames=temporal_frames
-                                    )
-                                except Exception as viz_e:
-                                    logging.warning(f"Step {step}: Visualization failed: {viz_e}")
-
-                        del gaussian_params, target_obs, cam_params_dict, z_next_float32, depth_map
-                        torch.cuda.empty_cache()
-                except Exception as e:
-                    import traceback
-                    logging.warning(f"Step {step}: Decode/render failed: {e}")
-                    if step is not None and step % 100 == 0:
-                        traceback.print_exc()
-                        logging.warning(traceback.format_exc())
+                    except Exception as viz_error:
+                        logging.warning(f"Step {step}: Future rollout visualization failed: {viz_error}")
 
         return loss
 
@@ -1450,7 +1882,7 @@ class PI0Pytorch(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         images, img_masks, lang_tokens, lang_masks, state, _, preprocessed_observation = self._preprocess_observation(observation, train=False)
-        
+
         gaussian_inputs = None
         if self.gaussian_adapter.use_gaussian:
             # For inference, use inference mode (fewer frames, more flexible)
@@ -1458,8 +1890,10 @@ class PI0Pytorch(nn.Module):
             gaussian_inputs = self._prepare_gaussian_inputs(preprocessed_observation, device, bsize, is_training=False)
 
         # Get prefix embeddings (with segment lengths if using world tokens)
+        # Note: During inference, we don't have future actions, so future_actions=None
         prefix_result = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, gaussian_inputs=gaussian_inputs,
+            future_actions=None,  # No ground truth actions during inference
             return_segment_lengths=self.use_world_tokens_in_prefix
         )
         if self.use_world_tokens_in_prefix:
@@ -1480,14 +1914,14 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
-        
+
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
+        timestep = torch.tensor(1.0, dtype=torch.float32, device=device)
+        while timestep >= -dt / 2:
+            expanded_time = timestep.expand(bsize)
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
@@ -1498,7 +1932,7 @@ class PI0Pytorch(nn.Module):
 
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
-            time += dt
+            timestep += dt
         return x_t
 
     def denoise_step(
