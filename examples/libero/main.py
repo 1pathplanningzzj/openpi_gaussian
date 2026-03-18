@@ -44,7 +44,7 @@ class Args:
     task_suite_name: str = (
         "libero_10"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
-    task_id: int | None = None  # Specific task ID to evaluate (None = evaluate all tasks)
+    task_id: list[int] | None = None  # Specific task ID(s) to evaluate (None = evaluate all tasks)
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50  # Number of rollouts per task
 
@@ -52,8 +52,8 @@ class Args:
     # Utils
     #################################################################################################################
     video_out_path: str = "data_317/gaussian_vla_exp316_15000_libero_10_test_1/videos"  # Path to save videos
-# Gaussian_vla_exp315_12000_libero_10 这个实际上是goal
-    save_videos: bool = True  # Whether to save rollout videos
+    # Gaussian_vla_exp315_12000_libero_10 这个实际上是goal
+    save_videos: bool = False  # Whether to save rollout videos
     seed: int = 10  # Random Seed (for reproducibility)
 
 
@@ -116,8 +116,8 @@ def eval_libero(args: Args) -> None:
 
     # Determine which tasks to evaluate
     if args.task_id is not None:
-        task_ids = [args.task_id]
-        logging.info(f"Evaluating single task: {args.task_id}")
+        task_ids = args.task_id if isinstance(args.task_id, list) else [args.task_id]
+        logging.info(f"Evaluating tasks: {task_ids}")
     else:
         task_ids = range(num_tasks_in_suite)
         logging.info(f"Evaluating all {num_tasks_in_suite} tasks")

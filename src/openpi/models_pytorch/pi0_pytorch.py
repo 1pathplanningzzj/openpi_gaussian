@@ -1245,7 +1245,7 @@ class PI0Pytorch(nn.Module):
                 # participate in the shared prefix at all.
                 future_delta = future_usage_gate * (gate * delta_scale * delta_q + beta)
                 future_tokens = z_base + future_delta + self.future_delta_embed  # [B, 256, D]
-
+                
                 # Debug log (only log occasionally to avoid spam)
                 if hasattr(self, '_film_log_counter'):
                     self._film_log_counter += 1
