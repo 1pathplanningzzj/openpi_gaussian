@@ -1791,10 +1791,10 @@ class PI0Pytorch(nn.Module):
                 future_start += segment_lengths['language']
             if 'world' in segment_lengths:
                 future_start += segment_lengths['world']
-            
+
             future_end = future_start + segment_lengths['future']
             z_t1_pred_tokens = prefix_out[:, future_start:future_end, :]  # [B, future_token_count, D]
-            
+
             if step is not None and step % 400 == 0:
                 print(f"[DEBUG] Extracted future tokens: shape={z_t1_pred_tokens.shape}, "
                       f"start={future_start}, end={future_end}, segment_lengths={segment_lengths}")

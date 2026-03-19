@@ -360,3 +360,5 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 nohup uv_venv/bin/torchrun \
     --exp_name gaussian_world_model_exp0313 \
     --checkpoint_base_dir /data/zijianzhang/train_ckpts \
     --resume > training_exp0313_ddp.log 2>&1 &
+
+ln -sf /home/zijianzhang/.vscode-server/extensions/openai.chatgpt-26.313.41514-linux-x64/bin/linux-x86_64/codex ~/.local/bin/codex

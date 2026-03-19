@@ -10,9 +10,11 @@ os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 import collections
 import dataclasses
+import hashlib
 import logging
 import math
 import pathlib
+import pickle
 
 import imageio
 from libero.libero import benchmark
@@ -55,6 +57,7 @@ class Args:
     # Gaussian_vla_exp315_12000_libero_10 这个实际上是goal
     save_videos: bool = False  # Whether to save rollout videos
     seed: int = 10  # Random Seed (for reproducibility)
+    debug_log_path: str | None = None  # Path to save debug logs (None = disabled)
 
 
 def _configure_logging(video_out_path: str) -> None:
@@ -111,6 +114,13 @@ def eval_libero(args: Args) -> None:
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
 
+    # Setup debug logging directory
+    debug_log_dir = None
+    if args.debug_log_path:
+        debug_log_dir = pathlib.Path(args.debug_log_path)
+        debug_log_dir.mkdir(parents=True, exist_ok=True)
+        logging.info(f"Debug logging enabled, saving to: {debug_log_dir}")
+
     # Start evaluation
     total_episodes, total_successes = 0, 0
 
@@ -147,6 +157,7 @@ def eval_libero(args: Args) -> None:
             # Setup
             t = 0
             replay_images = []
+            debug_records = []  # per-step debug records for this episode
             done = False
 
             logging.info(f"Starting episode {task_episodes + 1}...")
@@ -198,6 +209,19 @@ def eval_libero(args: Args) -> None:
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
                         action_plan.extend(action_chunk[: args.replan_steps])
 
+                        # Debug logging: record input and output
+                        if debug_log_dir:
+                            debug_records.append({
+                                "timestep": t,
+                                "state": element["observation/state"].copy(),
+                                "image": img.copy(),
+                                "wrist_image": wrist_img.copy(),
+                                "image_hash": hashlib.md5(img.tobytes()).hexdigest(),
+                                "wrist_image_hash": hashlib.md5(wrist_img.tobytes()).hexdigest(),
+                                "prompt": element["prompt"],
+                                "action_chunk": [a.tolist() if hasattr(a, 'tolist') else a for a in action_chunk],
+                            })
+
                     action = action_plan.popleft()
 
                     # Execute action in environment
@@ -214,6 +238,19 @@ def eval_libero(args: Args) -> None:
 
             task_episodes += 1
             total_episodes += 1
+
+            # Save debug records for this episode
+            if debug_log_dir and debug_records:
+                pkl_path = debug_log_dir / f"task_{task_id}_ep_{episode_idx}.pkl"
+                with open(pkl_path, "wb") as f:
+                    pickle.dump({
+                        "task_id": task_id,
+                        "episode_idx": episode_idx,
+                        "task_description": str(task_description),
+                        "success": done,
+                        "total_steps": t,
+                        "records": debug_records,
+                    }, f)
 
             # Save a replay video of the episode
             if args.save_videos:
