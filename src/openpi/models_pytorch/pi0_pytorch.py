@@ -133,7 +133,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0320_lpips_future_5_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0321_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -327,10 +327,19 @@ class PI0Pytorch(nn.Module):
         # Default to supervising delta depth on every predicted future horizon.
         self.delta_depth_first_horizon_only = bool(getattr(config, "delta_depth_first_horizon_only", False))
         self.future_delta_reg_weight = getattr(config, "future_delta_reg_weight", 1e-4)
-        self.future_horizon_curriculum_steps = max(0, int(getattr(config, "future_horizon_curriculum_steps", 5_000)))
+        self.future_motion_loss_gain = float(getattr(config, "future_motion_loss_gain", 2.0))
+        self.future_motion_rgb_threshold = float(getattr(config, "future_motion_rgb_threshold", 0.03))
+        self.future_motion_depth_threshold = float(getattr(config, "future_motion_depth_threshold", 0.01))
+        self.future_motion_depth_weight = float(getattr(config, "future_motion_depth_weight", 0.5))
+        self.future_motion_loss_min_weight = float(getattr(config, "future_motion_loss_min_weight", 0.35))
+        self.future_motion_loss_max_weight = float(getattr(config, "future_motion_loss_max_weight", 4.0))
+        self.future_motion_blur_kernel = max(1, int(getattr(config, "future_motion_blur_kernel", 9)))
+        if self.future_motion_blur_kernel % 2 == 0:
+            self.future_motion_blur_kernel += 1
+        self.future_horizon_curriculum_steps = int(getattr(config, "future_horizon_curriculum_steps", 0))
         self.future_horizon_early_min_weight = float(getattr(config, "future_horizon_early_min_weight", 0.2))
         self._action_loss_enabled = True  # Can be toggled by freeze/unfreeze_action_expert
-        # -------------------------------
+
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         try:
@@ -905,20 +914,106 @@ class PI0Pytorch(nn.Module):
             depth=depth,
         )
 
+
+    def _extract_reference_view_image(self, observation, view_name: str) -> torch.Tensor | None:
+        """Extract a normalized [B,3,H,W] image for a named view from an observation container."""
+        if observation is None or not hasattr(observation, "images"):
+            return None
+
+        for key, value in observation.images.items():
+            key_lower = key.lower()
+            mapped_view = None
+            if key == "image" or "agent" in key_lower or "high" in key_lower or "cam_high" in key_lower or "exterior" in key_lower or "base" in key_lower:
+                mapped_view = "agent"
+            elif "left_wrist" in key_lower or "wrist_left" in key_lower:
+                mapped_view = "wrist"
+            elif "right_wrist" in key_lower or "wrist_right" in key_lower:
+                if value.min() == value.max() == -1.0:
+                    continue
+                mapped_view = "wrist"
+            elif "wrist" in key_lower or "bravo" in key_lower:
+                mapped_view = "wrist"
+
+            if mapped_view != view_name:
+                continue
+
+            img_tensor = value
+            if img_tensor.ndim == 5:
+                img_tensor = img_tensor[:, -1]
+            if img_tensor.shape[1] != 3 and img_tensor.shape[-1] == 3:
+                img_tensor = img_tensor.permute(0, 3, 1, 2)
+            return (img_tensor + 1.0) / 2.0
+        return None
+
+    def _build_future_motion_weight_map(
+        self,
+        current_image: torch.Tensor | None,
+        future_image: torch.Tensor,
+        current_depth: torch.Tensor | None,
+        future_depth: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Create a soft motion weight map that emphasizes regions changing over time."""
+        device = future_image.device
+        bsize, _, height, width = future_image.shape
+        motion_rgb = torch.zeros((bsize, 1, height, width), device=device, dtype=torch.float32)
+        motion_depth = torch.zeros_like(motion_rgb)
+
+        if current_image is not None:
+            if current_image.shape[-2:] != future_image.shape[-2:]:
+                current_image = F.interpolate(
+                    current_image, size=future_image.shape[-2:], mode="bilinear", align_corners=False
+                )
+            motion_rgb = (future_image - current_image).abs().mean(dim=1, keepdim=True).float()
+            motion_rgb = torch.relu(motion_rgb - self.future_motion_rgb_threshold)
+
+        if current_depth is not None and future_depth is not None:
+            current_depth_map = current_depth.float()
+            future_depth_map = future_depth.float()
+            if current_depth_map.ndim == 3:
+                current_depth_map = current_depth_map.unsqueeze(1)
+            if future_depth_map.ndim == 3:
+                future_depth_map = future_depth_map.unsqueeze(1)
+            if current_depth_map.shape[-2:] != future_image.shape[-2:]:
+                current_depth_map = F.interpolate(
+                    current_depth_map, size=future_image.shape[-2:], mode="bilinear", align_corners=False
+                )
+            if future_depth_map.shape[-2:] != future_image.shape[-2:]:
+                future_depth_map = F.interpolate(
+                    future_depth_map, size=future_image.shape[-2:], mode="bilinear", align_corners=False
+                )
+            motion_depth = (future_depth_map - current_depth_map).abs()
+            motion_depth = torch.relu(motion_depth - self.future_motion_depth_threshold)
+
+        motion = motion_rgb + self.future_motion_depth_weight * motion_depth
+        if self.future_motion_blur_kernel > 1:
+            pad = self.future_motion_blur_kernel // 2
+            motion = F.avg_pool2d(motion, kernel_size=self.future_motion_blur_kernel, stride=1, padding=pad)
+
+        motion_mean = motion.mean(dim=(-2, -1), keepdim=True)
+        motion = motion / (motion_mean + 1e-6)
+        weight_map = 1.0 + self.future_motion_loss_gain * motion
+        weight_map = torch.clamp(
+            weight_map,
+            min=self.future_motion_loss_min_weight,
+            max=self.future_motion_loss_max_weight,
+        )
+        return weight_map.squeeze(1)
+
     def _compute_world_model_frame_loss(
         self,
         z_next: torch.Tensor,
         future_target,
         preprocessed_observation,
+        *,
         step: int | None = None,
-        time_suffix: str = "_t1_pred_vlm",
+        time_suffix: str = "",
         visualize: bool = True,
         horizon_idx: int = 0,
         static_gaussian_params: dict | None = None,
         velocity_time_factor: float = 1.0,
         return_gaussian_params: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
-        """Decode one future latent and supervise it with rendering + depth losses."""
+    ):
+        """Decode one future horizon and compute depth/render supervision."""
         device = z_next.device
         total_loss = torch.zeros((), dtype=torch.float32, device=device)
         if self.world_model is None or self.gaussian_renderer is None or future_target is None:
@@ -1047,11 +1142,30 @@ class PI0Pytorch(nn.Module):
 
             if valid_views:
                 render_views = ["agent"] if "agent" in valid_views else valid_views
+                motion_weight_maps = {}
+                for render_view in render_views:
+                    view_key = f"{render_view}_image"
+                    current_image = self._extract_reference_view_image(preprocessed_observation, render_view)
+                    future_image = target_obs[view_key]
+                    current_depth_for_view = base_depth if render_view == "agent" else None
+                    future_depth_for_view = (
+                        future_target.depth
+                        if render_view == "agent" and hasattr(future_target, "depth")
+                        else None
+                    )
+                    motion_weight_maps[render_view] = self._build_future_motion_weight_map(
+                        current_image,
+                        future_image,
+                        current_depth_for_view,
+                        future_depth_for_view,
+                    )
+
                 render_loss, render_loss_dict = compute_multi_view_rendering_loss(
                     gaussian_params,
                     target_obs,
                     cam_params_dict,
                     self.gaussian_renderer,
+                    M_attn_dict=motion_weight_maps,
                     view_names=render_views,
                     step=step,
                     depth_map=depth_map,
@@ -1077,9 +1191,13 @@ class PI0Pytorch(nn.Module):
                 should_log = step is not None and step % 400 == 0
                 if should_log:
                     loss_parts = ", ".join(f"{k}={v.item():.6f}" for k, v in render_loss_dict.items())
+                    weight_parts = ", ".join(
+                        f"{name}=mean:{weight.mean().item():.4f}/max:{weight.max().item():.4f}"
+                        for name, weight in motion_weight_maps.items()
+                    )
                     logging.info(
                         f"Step {step}{time_suffix}: Render Loss = {render_loss.item():.4f}, "
-                        f"weight={self.render_loss_weight}, breakdown: {loss_parts}"
+                        f"weight={self.render_loss_weight}, breakdown: {loss_parts}, motion_weights: {weight_parts}"
                     )
 
                 if visualize and should_log and is_main_process:
@@ -1676,12 +1794,74 @@ class PI0Pytorch(nn.Module):
 
         target_obs_seq = []
         rendered_obs_seq = []
+        motion_weight_seq = []
         render_views = None
+        base_target_obs = None
+        base_rendered_obs = None
+
+        def _build_target_obs_and_cameras(obs):
+            target_obs = {}
+            cam_params_dict = {}
+            valid_views = []
+            if obs is None:
+                return target_obs, cam_params_dict, valid_views
+
+            for key, value in obs.images.items():
+                img_tensor = value
+                mapped_view_name = None
+                key_lower = key.lower()
+                if key == "image" or "agent" in key_lower or "high" in key_lower or "cam_high" in key_lower or "exterior" in key_lower or "base" in key_lower:
+                    mapped_view_name = "agent"
+                elif "left_wrist" in key_lower or "wrist_left" in key_lower:
+                    mapped_view_name = "wrist"
+                elif "right_wrist" in key_lower or "wrist_right" in key_lower:
+                    if img_tensor.min() == img_tensor.max() == -1.0:
+                        continue
+                    mapped_view_name = "wrist"
+                elif "wrist" in key_lower or "bravo" in key_lower:
+                    mapped_view_name = "wrist"
+
+                if mapped_view_name:
+                    if img_tensor.shape[1] != 3 and img_tensor.shape[-1] == 3:
+                        img_tensor = img_tensor.permute(0, 3, 1, 2)
+                    img_tensor = (img_tensor + 1.0) / 2.0
+                    view_key = f"{mapped_view_name}_image"
+                    if view_key not in target_obs:
+                        target_obs[view_key] = img_tensor
+                        cam_params_dict[mapped_view_name] = self._get_camera_params_for_view(
+                            mapped_view_name, z_future_pred_tokens.device, z_future_pred_tokens.shape[0]
+                        )
+                        valid_views.append(mapped_view_name)
+            return target_obs, cam_params_dict, valid_views
+
+        def _render_single_batch(gaussian_params, cam_params_dict, views_to_render):
+            rendered_obs = {}
+            params_single = {
+                "xyz": gaussian_params["xyz"][:1],
+                "sh": gaussian_params["sh"][:1],
+                "opacity": gaussian_params["opacity"][:1],
+                "scales": gaussian_params["scales"][:1],
+                "rotations": gaussian_params["rotations"][:1],
+            }
+            for render_view in views_to_render:
+                cam_params = {
+                    key: value[:1] if isinstance(value, torch.Tensor) else value
+                    for key, value in cam_params_dict[render_view].items()
+                }
+                rendered_obs[f"{render_view}_image"] = self.gaussian_renderer(params_single, cam_params).float()
+            return rendered_obs
 
         with torch.no_grad():
             base_depth = getattr(preprocessed_observation, "depth", None)
             if base_depth is not None and base_depth.ndim == 5:
                 base_depth = base_depth[:, -1]
+
+            current_obs_steps = self._get_temporal_observation_length(preprocessed_observation)
+            current_target = (
+                self._slice_temporal_observation(preprocessed_observation, current_obs_steps - 1)
+                if current_obs_steps > 0
+                else preprocessed_observation
+            )
 
             viz_static_template = static_template
             for horizon_idx in range(rollout_horizon):
@@ -1718,58 +1898,44 @@ class PI0Pytorch(nn.Module):
                         k: v.detach() if torch.is_tensor(v) else v for k, v in gaussian_params.items()
                     }
 
-                target_obs = {}
-                cam_params_dict = {}
-                valid_views = []
-                for key, value in future_target.images.items():
-                    img_tensor = value
-                    view_name = None
-                    key_lower = key.lower()
-                    if key == "image" or "agent" in key_lower or "high" in key_lower or "cam_high" in key_lower or "exterior" in key_lower or "base" in key_lower:
-                        view_name = "agent"
-                    elif "left_wrist" in key_lower or "wrist_left" in key_lower:
-                        view_name = "wrist"
-                    elif "right_wrist" in key_lower or "wrist_right" in key_lower:
-                        if img_tensor.min() == img_tensor.max() == -1.0:
-                            continue
-                        view_name = "wrist"
-                    elif "wrist" in key_lower or "bravo" in key_lower:
-                        view_name = "wrist"
-
-                    if view_name:
-                        if img_tensor.shape[1] != 3 and img_tensor.shape[-1] == 3:
-                            img_tensor = img_tensor.permute(0, 3, 1, 2)
-                        img_tensor = (img_tensor + 1.0) / 2.0
-                        view_key = f"{view_name}_image"
-                        if view_key not in target_obs:
-                            target_obs[view_key] = img_tensor
-                            cam_params_dict[view_name] = self._get_camera_params_for_view(
-                                view_name, z_future_pred_tokens.device, z_future_pred_tokens.shape[0]
-                            )
-                            valid_views.append(view_name)
+                target_obs, cam_params_dict, valid_views = _build_target_obs_and_cameras(future_target)
 
                 if valid_views:
                     render_views = ["agent"] if "agent" in valid_views else valid_views
                 elif render_views is None:
                     render_views = ["agent"]
 
-                rendered_obs = {}
-                params_single = {
-                    "xyz": gaussian_params["xyz"][:1],
-                    "sh": gaussian_params["sh"][:1],
-                    "opacity": gaussian_params["opacity"][:1],
-                    "scales": gaussian_params["scales"][:1],
-                    "rotations": gaussian_params["rotations"][:1],
-                }
-                for view_name in render_views:
-                    cam_params = {
-                        key: value[:1] if isinstance(value, torch.Tensor) else value
-                        for key, value in cam_params_dict[view_name].items()
-                    }
-                    rendered_obs[f"{view_name}_image"] = self.gaussian_renderer(params_single, cam_params).float()
-
+                rendered_obs = _render_single_batch(gaussian_params, cam_params_dict, render_views)
                 target_obs_seq.append({key: value[:1].float() for key, value in target_obs.items()})
                 rendered_obs_seq.append(rendered_obs)
+
+                motion_weight_entry = {}
+                for render_view in render_views:
+                    view_key = f"{render_view}_image"
+                    current_image = self._extract_reference_view_image(preprocessed_observation, render_view)
+                    future_image = target_obs[view_key]
+                    current_depth_for_view = base_depth if render_view == "agent" else None
+                    future_depth_for_view = (
+                        future_target.depth
+                        if render_view == "agent" and hasattr(future_target, "depth")
+                        else None
+                    )
+                    motion_weight_entry[view_key] = self._build_future_motion_weight_map(
+                        current_image,
+                        future_image,
+                        current_depth_for_view,
+                        future_depth_for_view,
+                    )[:1].float()
+                motion_weight_seq.append(motion_weight_entry)
+
+            base_target_obs_raw, base_cam_params_dict, base_valid_views = _build_target_obs_and_cameras(current_target)
+            if base_target_obs_raw:
+                base_target_obs = {key: value[:1].float() for key, value in base_target_obs_raw.items()}
+            base_render_views = ["agent"] if "agent" in base_valid_views else base_valid_views
+            if not base_render_views:
+                base_render_views = render_views or view_names
+            if viz_static_template is not None and base_target_obs is not None and base_render_views:
+                base_rendered_obs = _render_single_batch(viz_static_template, base_cam_params_dict, base_render_views)
 
         visualize_future_rollout_comparison(
             step,
@@ -1780,6 +1946,10 @@ class PI0Pytorch(nn.Module):
             temporal_frames=temporal_frames,
             time_suffix="_future_rollout",
             horizon_labels=[f"t+{offset}" for offset in self.future_prediction_offsets[:rollout_horizon]],
+            base_target_obs=base_target_obs,
+            base_rendered_obs=base_rendered_obs,
+            base_label="t/base",
+            motion_weight_seq=motion_weight_seq,
         )
         self._log_future_rollout_pixel_lpips(step, rendered_obs_seq)
 

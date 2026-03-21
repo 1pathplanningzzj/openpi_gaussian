@@ -942,8 +942,12 @@ def visualize_future_rollout_comparison(
     temporal_frames=None,
     time_suffix="_future_rollout",
     horizon_labels=None,
+    base_target_obs=None,
+    base_rendered_obs=None,
+    base_label="t/base",
+    motion_weight_seq=None,
 ):
-    """Visualize context + multi-horizon future GT/render/diff in one figure."""
+    """Visualize context + base render + multi-horizon future GT/render/diff in one figure."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -986,42 +990,87 @@ def visualize_future_rollout_comparison(
     if horizon_labels is None:
         horizon_labels = [f"t+{idx + 1}" for idx in range(horizon)]
 
-    num_cols = max(horizon, len(context_frames), 1)
-    fig, axes = plt.subplots(4, num_cols, figsize=(4 * num_cols, 14))
+    show_base = base_target_obs is not None or base_rendered_obs is not None
+    show_future_vs_base = base_rendered_obs is not None
+    show_motion = motion_weight_seq is not None and len(motion_weight_seq) > 0
+    total_future_cols = max(horizon, len(context_frames), 1)
+    num_cols = total_future_cols + (1 if show_base else 0)
+    num_rows = 4 + int(show_future_vs_base) + int(show_motion)
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(4 * num_cols, 3.6 * num_rows))
     if num_cols == 1:
-        axes = np.array(axes).reshape(4, 1)
+        axes = np.array(axes).reshape(num_rows, 1)
 
-    row_titles = ["Context", "GT Future", "Rendered Future", "Abs Diff"]
+    row_titles = ["Context", "GT", "Rendered", "Abs Diff"]
+    if show_future_vs_base:
+        row_titles.append("|Render-Base|")
+    if show_motion:
+        row_titles.append("Motion Weight")
     for row_idx, title in enumerate(row_titles):
         axes[row_idx, 0].set_ylabel(title, fontsize=14)
 
     for col_idx in range(num_cols):
-        for row_idx in range(4):
+        for row_idx in range(num_rows):
             axes[row_idx, col_idx].axis("off")
 
-    for col_idx, frame in enumerate(context_frames[:num_cols]):
-        axes[0, col_idx].imshow(frame)
+    start_col = 1 if show_base else 0
+
+    for col_idx, frame in enumerate(context_frames[:total_future_cols]):
+        dst_col = start_col + col_idx
+        axes[0, dst_col].imshow(frame)
         if len(context_frames) == 1:
-            axes[0, col_idx].set_title("t", fontsize=13)
+            axes[0, dst_col].set_title("t", fontsize=13)
         else:
             label_offset = len(context_frames) - col_idx - 1
-            axes[0, col_idx].set_title("t" if label_offset == 0 else f"t-{label_offset}", fontsize=13)
+            axes[0, dst_col].set_title("t" if label_offset == 0 else f"t-{label_offset}", fontsize=13)
 
-    for horizon_idx in range(min(horizon, num_cols)):
-        gt_key = f"{view_name}_image"
+    gt_key = f"{view_name}_image"
+    base_gt_img = None
+    base_render_img = None
+    render_base_row = 4 if show_future_vs_base else None
+    motion_row = 5 if show_future_vs_base and show_motion else (4 if show_motion else None)
+
+    if show_base:
+        axes[0, 0].set_title(base_label, fontsize=13)
+        if base_target_obs is not None and gt_key in base_target_obs:
+            base_gt_img = base_target_obs[gt_key][idx].permute(1, 2, 0).detach().cpu().numpy()
+            base_gt_img = np.clip(base_gt_img, 0, 1)
+            axes[0, 0].imshow(base_gt_img)
+            axes[1, 0].imshow(base_gt_img)
+        if base_rendered_obs is not None and gt_key in base_rendered_obs:
+            base_render_img = base_rendered_obs[gt_key][0].permute(1, 2, 0).detach().cpu().numpy()
+            base_render_img = np.clip(base_render_img, 0, 1)
+            axes[2, 0].imshow(base_render_img)
+        if base_gt_img is not None and base_render_img is not None:
+            axes[3, 0].imshow(np.abs(base_render_img - base_gt_img))
+        if render_base_row is not None and base_render_img is not None:
+            axes[render_base_row, 0].imshow(np.zeros_like(base_render_img))
+        if motion_row is not None:
+            base_shape = base_gt_img.shape[:2] if base_gt_img is not None else (224, 224)
+            axes[motion_row, 0].imshow(np.zeros(base_shape), cmap="magma", vmin=0.0, vmax=1.0)
+
+    for horizon_idx in range(min(horizon, total_future_cols)):
+        col = start_col + horizon_idx
         gt_img = target_obs_seq[horizon_idx][gt_key][idx].permute(1, 2, 0).detach().cpu().numpy()
         gt_img = np.clip(gt_img, 0, 1)
         rendered_img = rendered_obs_seq[horizon_idx][gt_key][idx].permute(1, 2, 0).detach().cpu().numpy()
         rendered_img = np.clip(rendered_img, 0, 1)
         diff_img = np.abs(rendered_img - gt_img)
 
-        axes[1, horizon_idx].imshow(gt_img)
-        axes[1, horizon_idx].set_title(horizon_labels[horizon_idx], fontsize=13)
-        axes[2, horizon_idx].imshow(rendered_img)
-        axes[3, horizon_idx].imshow(diff_img)
+        axes[1, col].imshow(gt_img)
+        axes[1, col].set_title(horizon_labels[horizon_idx], fontsize=13)
+        axes[2, col].imshow(rendered_img)
+        axes[3, col].imshow(diff_img)
+        if render_base_row is not None and base_render_img is not None:
+            axes[render_base_row, col].imshow(np.abs(rendered_img - base_render_img))
+        if motion_row is not None and horizon_idx < len(motion_weight_seq):
+            motion_entry = motion_weight_seq[horizon_idx]
+            if gt_key in motion_entry:
+                motion_map = motion_entry[gt_key][idx].detach().cpu().numpy()
+                axes[motion_row, col].imshow(motion_map, cmap="magma")
 
     fig.suptitle(f"Future Rollout Visualization - Step {step}", fontsize=16)
     save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}.png")
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved Future Rollout Visualization to {save_path}")
+
