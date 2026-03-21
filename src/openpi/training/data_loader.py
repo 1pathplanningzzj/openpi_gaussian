@@ -19,6 +19,24 @@ import openpi.transforms as _transforms
 T_co = TypeVar("T_co", covariant=True)
 
 
+def _resolve_future_prediction_offsets(model_config: _model.BaseModelConfig, fps: float) -> list[float]:
+    """Resolve future supervision offsets in seconds from config.
+
+    If future_prediction_offsets is provided, it is interpreted as frame steps on the
+    canonical training grid (default 10 FPS). Otherwise fall back to dense t+1..t+H.
+    """
+    if not getattr(model_config, "use_world_model", False):
+        return [round(1.0 / fps, 2)]
+
+    raw_offsets = getattr(model_config, "future_prediction_offsets", None)
+    if raw_offsets:
+        offsets = [max(1, int(value)) for value in raw_offsets]
+        return [round(value / fps, 2) for value in offsets]
+
+    future_prediction_horizon = max(1, int(getattr(model_config, "future_prediction_horizon", 1)))
+    return [round((t + 1) / fps, 2) for t in range(future_prediction_horizon)]
+
+
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
@@ -175,19 +193,16 @@ def create_torch_dataset(
     # where H is the world-model future supervision horizon.
     # Use 0.1 second intervals to match LeRobot validation.
     image_fps = 10.0  # Use standard 10 fps for image timestamps
-    future_prediction_horizon = (
-        max(1, int(getattr(model_config, "future_prediction_horizon", 1)))
-        if getattr(model_config, "use_world_model", False)
-        else 1
-    )
-    future_image_offsets = [round((t + 1) / image_fps, 2) for t in range(future_prediction_horizon)]
+    future_image_offsets = _resolve_future_prediction_offsets(model_config, image_fps)
+    future_prediction_horizon = len(future_image_offsets)
+    future_offset_labels = ", ".join(f"t+{int(round(offset * image_fps))}" for offset in future_image_offsets)
     for key in image_keys:
         if use_single_frame_mode:
             delta_timestamps[key] = [0.0, *future_image_offsets]
             print(
                 "DEBUG: [Single-frame mode] Requesting frames "
                 f"{delta_timestamps[key]} for key {key} "
-                f"(VGGT uses [t], World Model uses t+1..t+{future_prediction_horizon})"
+                f"(VGGT uses [t], World Model uses [{future_offset_labels}])"
             )
         else:
             delta_timestamps[key] = [
@@ -199,21 +214,21 @@ def create_torch_dataset(
             print(
                 "DEBUG: [Multi-frame mode] Requesting frames "
                 f"{delta_timestamps[key]} for key {key} "
-                f"(VGGT uses [t-2, t-1, t], World Model uses t+1..t+{future_prediction_horizon})"
+                f"(VGGT uses [t-2, t-1, t], World Model uses [{future_offset_labels}])"
             )
         print(f"DEBUG: Using image_fps={image_fps} (dataset_meta.fps={dataset_meta.fps})")
 
     # Also request temporal state - try both possible key formats.
     # State uses [t, t+1, ..., t+H] for future supervision.
     state_fps = 10.0  # Use standard 10 fps for state timestamps
-    future_state_offsets = [round((t + 1) / state_fps, 2) for t in range(future_prediction_horizon)]
+    future_state_offsets = _resolve_future_prediction_offsets(model_config, state_fps)
     state_keys_to_try = ["observation.state", "observation/state", "state"]
     for state_key in state_keys_to_try:
         if state_key in dataset_meta.features:
             delta_timestamps[state_key] = [0.0, *future_state_offsets]
             print(
                 f"DEBUG: Added temporal state with key: {state_key} "
-                f"(for World Model: [t, t+1..t+{future_prediction_horizon}])"
+                f"(for World Model: [t, {future_offset_labels}])"
             )
             print(f"DEBUG: Using state_fps={state_fps} (dataset_meta.fps={dataset_meta.fps})")
             break
@@ -229,7 +244,7 @@ def create_torch_dataset(
                 delta_timestamps[depth_key] = [0.0, *future_image_offsets]
                 print(
                     f"DEBUG: [Single-frame mode] Added depth data with key: {depth_key} "
-                    f"({1 + future_prediction_horizon} frames for t..t+{future_prediction_horizon})"
+                    f"({1 + future_prediction_horizon} frames for [t, {future_offset_labels}])"
                 )
             else:
                 delta_timestamps[depth_key] = [
@@ -240,7 +255,7 @@ def create_torch_dataset(
                 ]
                 print(
                     f"DEBUG: [Multi-frame mode] Added depth data with key: {depth_key} "
-                    f"({3 + future_prediction_horizon} frames for [t-2, t-1, t, t+1..t+{future_prediction_horizon}])"
+                    f"({3 + future_prediction_horizon} frames for [t-2, t-1, t, {future_offset_labels}])"
                 )
             break
 

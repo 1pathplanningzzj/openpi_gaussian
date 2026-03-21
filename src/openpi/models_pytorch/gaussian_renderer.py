@@ -941,6 +941,7 @@ def visualize_future_rollout_comparison(
     save_dir=None,
     temporal_frames=None,
     time_suffix="_future_rollout",
+    horizon_labels=None,
 ):
     """Visualize context + multi-horizon future GT/render/diff in one figure."""
     import matplotlib
@@ -982,6 +983,9 @@ def visualize_future_rollout_comparison(
             frame = frames[frame_idx].detach().cpu().numpy()
             context_frames.append(np.clip((frame + 1.0) / 2.0, 0, 1))
 
+    if horizon_labels is None:
+        horizon_labels = [f"t+{idx + 1}" for idx in range(horizon)]
+
     num_cols = max(horizon, len(context_frames), 1)
     fig, axes = plt.subplots(4, num_cols, figsize=(4 * num_cols, 14))
     if num_cols == 1:
@@ -1012,7 +1016,7 @@ def visualize_future_rollout_comparison(
         diff_img = np.abs(rendered_img - gt_img)
 
         axes[1, horizon_idx].imshow(gt_img)
-        axes[1, horizon_idx].set_title(f"t+{horizon_idx + 1}", fontsize=13)
+        axes[1, horizon_idx].set_title(horizon_labels[horizon_idx], fontsize=13)
         axes[2, horizon_idx].imshow(rendered_img)
         axes[3, horizon_idx].imshow(diff_img)
 

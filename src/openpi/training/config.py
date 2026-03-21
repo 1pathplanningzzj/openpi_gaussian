@@ -578,13 +578,16 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
-    # Staged training: if > 0, Stage 1 trains render+depth only (freeze action expert),
-    # Stage 2 unfreezes action expert for joint training
+    # Staged training:
+    # - Stage 1: [0, stage1_steps) depth-only (action frozen, render weight = stage1_render_weight)
+    # - Stage 2: [stage1_steps, stage2_steps) depth+render (action frozen, render weight = stage2_render_weight)
+    # - Stage 3: [stage2_steps, end) joint training (action enabled, render weight = stage3_render_weight)
+    # If stage2_steps <= stage1_steps, the schedule falls back to the legacy two-stage setup.
     stage1_steps: int = 0
-    # Render loss weight for stage 1 (render+depth only, lower to encourage colorful predictions)
-    stage1_render_weight: float = 0.2
-    # Render loss weight for stage 2 (joint training, lower so action loss dominates)
-    stage2_render_weight: float = 0.1
+    stage2_steps: int = 0
+    stage1_render_weight: float = 0.0
+    stage2_render_weight: float = 0.2
+    stage3_render_weight: float = 0.1
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -817,6 +820,8 @@ _CONFIGS = [
             use_gaussian=True,
             use_world_model=True,
             use_single_frame_mode=True,  # Set to True to use single-frame mode (only current frame t)
+            future_prediction_offsets=(2, 5, 10, 15, 20),
+            use_velocity_future_gaussians=True,
             render_loss_weight=0.2,
             depth_loss_weight=0.1,
             use_lpips=True,  # Enable LPIPS perceptual loss
@@ -846,9 +851,11 @@ _CONFIGS = [
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
         save_interval=3000,  # Changed from default 1000 to 3000
-        stage1_steps=5_000,  # Stage 1: render+depth only (freeze action expert)
-        stage1_render_weight=0.2,  # Lower render weight to encourage colorful predictions
-        stage2_render_weight=0.1,  # Lower render weight for joint training
+        stage1_steps=5_000,  # Stage 1: depth+render together (freeze action expert), 0-5000
+        stage2_steps=5_000,  # Fallback to two-stage: Stage 2 = joint from 5000+
+        stage1_render_weight=0.2,  # Render on from step 0 (with depth)
+        stage2_render_weight=0.1,
+        stage3_render_weight=0.1,
     ),
     #
     # Fine-tuning Aloha configs.

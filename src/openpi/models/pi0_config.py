@@ -39,9 +39,12 @@ class Pi0Config(_model.BaseModelConfig):
     use_single_frame_mode: bool = False
     # Whether to use BiDirectional World Model for aux loss
     use_world_model: bool = False
-    # Number of future frames to supervise in the world-model branch.
+    # Number of future frames to supervise in the world-model branch when using dense rollout.
     # When set to 5, the model predicts t+1 ... t+5 from a single future seed.
     future_prediction_horizon: int = 5
+    # Optional sparse future offsets (in frame steps) for world-model supervision, e.g. (2, 5, 10, 15, 20).
+    # If provided, this overrides the dense t+1...t+H schedule while keeping H=len(offsets).
+    future_prediction_offsets: tuple[int, ...] | None = None
     # VGGT encoder/decoder training options (for reconstruction loss)
     unfreeze_vggt_encoder: bool = False  # If True, unfreeze entire VGGT encoder for end-to-end training
     unfreeze_vggt_decoder_only: bool = True  # If True (default), only unfreeze decoder (gs_head) while keeping encoder frozen
@@ -51,6 +54,18 @@ class Pi0Config(_model.BaseModelConfig):
     render_loss_weight: float = 0.1  # Weight for rendering loss (RGB + regularization) - reduced to let action loss dominate
     # Depth supervision loss weight
     depth_loss_weight: float = 0.02  # Weight for depth supervision loss (from Depth Anything V2) - reduced to let action loss dominate
+    # Incremental-depth auxiliary supervision weight. 0 disables delta-depth loss.
+    delta_depth_loss_weight: float = 0.0
+    # If True, only supervise delta depth for t->t+1. Default False supervises t->t+h for all horizons.
+    delta_depth_first_horizon_only: bool = False
+    # Make world-model depth prediction residual wrt current depth.
+    use_incremental_depth: bool = True
+    # If True, horizon 0 uses full Gaussian decode; horizons h>1 reuse detached static
+    # (rot/scale/opacity/SH + template xyz) and only predict per-token velocity v so that
+    # xyz_h = xyz_0 + v(z_h) * velocity_world_model_scale * (offset[h]/offset[0]).
+    use_velocity_future_gaussians: bool = False
+    # Scale for camera-space displacement from predicted velocity (meters-scale heuristic).
+    velocity_world_model_scale: float = 0.15
     # LPIPS perceptual loss options
     use_lpips: bool = False  # Whether to use LPIPS perceptual loss for rendering
     lpips_weight: float = 0.1  # Weight for LPIPS perceptual loss

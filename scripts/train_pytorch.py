@@ -580,15 +580,33 @@ def train_loop(config: _config.TrainConfig):
     )
 
     # Staged training configuration
-    stage1_steps = getattr(config, "stage1_steps", 0)  # 0 means no staged training
-    stage1_render_weight = getattr(config, "stage1_render_weight", 0.5)  # render weight for stage 1 (render+depth only)
-    stage2_render_weight = getattr(config, "stage2_render_weight", 0.1)  # render weight for stage 2 (joint)
+    stage1_steps = getattr(config, "stage1_steps", 0)
+    stage2_steps = getattr(config, "stage2_steps", 0)
+    stage1_render_weight = getattr(config, "stage1_render_weight", 0.0)
+    stage2_render_weight = getattr(config, "stage2_render_weight", 0.2)
+    stage3_render_weight = getattr(config, "stage3_render_weight", 0.1)
+    use_three_stage = stage1_steps > 0 and stage2_steps > stage1_steps
     staged_training_enabled = stage1_steps > 0
 
     if staged_training_enabled and is_main:
         logging.info(f"=== Staged Training Enabled ===")
-        logging.info(f"Stage 1 (Render+Depth only): steps 0-{stage1_steps}, render_weight={stage1_render_weight}")
-        logging.info(f"Stage 2 (Joint training): steps {stage1_steps}-{config.num_train_steps}, render_weight={stage2_render_weight}")
+        if use_three_stage:
+            logging.info(
+                f"Stage 1 (Depth only): steps 0-{stage1_steps}, render_weight={stage1_render_weight}, action=off"
+            )
+            logging.info(
+                f"Stage 2 (Depth+Render): steps {stage1_steps}-{stage2_steps}, render_weight={stage2_render_weight}, action=off"
+            )
+            logging.info(
+                f"Stage 3 (Joint training): steps {stage2_steps}-{config.num_train_steps}, render_weight={stage3_render_weight}, action=on"
+            )
+        else:
+            logging.info(
+                f"Stage 1 (Render+Depth only): steps 0-{stage1_steps}, render_weight={stage1_render_weight}"
+            )
+            logging.info(
+                f"Stage 2 (Joint training): steps {stage1_steps}-{config.num_train_steps}, render_weight={stage2_render_weight}"
+            )
 
     # Get the underlying model (unwrap DDP if needed)
     raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
@@ -604,27 +622,58 @@ def train_loop(config: _config.TrainConfig):
                 break
 
             # Staged training: apply correct stage based on current global_step (checked every step)
-            if staged_training_enabled and global_step < stage1_steps:
-                # Stage 1: Freeze action expert, train only render+depth path
-                if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
-                    if hasattr(raw_model, 'freeze_action_expert'):
-                        raw_model.freeze_action_expert()
-                        raw_model.set_render_loss_weight(stage1_render_weight)
-                        raw_model._stage_applied = 1
-                        if is_main:
-                            logging.info(f"=== Stage 1 Active: Render+Depth Only (render_weight={stage1_render_weight}) ===")
-
-            elif staged_training_enabled and global_step >= stage1_steps:
-                # Stage 2: Unfreeze action expert, joint training with lower render weight
-                if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 2:
-                    if hasattr(raw_model, 'unfreeze_action_expert'):
-                        raw_model.unfreeze_action_expert()
-                        raw_model.set_render_loss_weight(stage2_render_weight)
-                        raw_model._stage_applied = 2
-                        if is_main:
-                            logging.info(f"=== Stage 2 Started: Joint Training (render_weight={stage2_render_weight}) ===")
-
-            # The unified data loader returns (observation, actions) tuple
+            if staged_training_enabled:
+                if use_three_stage and global_step < stage1_steps:
+                    if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
+                        if hasattr(raw_model, 'freeze_action_expert'):
+                            raw_model.freeze_action_expert()
+                            raw_model.set_render_loss_weight(stage1_render_weight)
+                            raw_model._stage_applied = 1
+                            if is_main:
+                                logging.info(
+                                    f"=== Stage 1 Active: Depth Only (render_weight={stage1_render_weight}, action=off) ==="
+                                )
+                elif use_three_stage and global_step < stage2_steps:
+                    if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 2:
+                        if hasattr(raw_model, 'freeze_action_expert'):
+                            raw_model.freeze_action_expert()
+                            raw_model.set_render_loss_weight(stage2_render_weight)
+                            raw_model._stage_applied = 2
+                            if is_main:
+                                logging.info(
+                                    f"=== Stage 2 Active: Depth+Render (render_weight={stage2_render_weight}, action=off) ==="
+                                )
+                elif use_three_stage:
+                    if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 3:
+                        if hasattr(raw_model, 'unfreeze_action_expert'):
+                            raw_model.unfreeze_action_expert()
+                            raw_model.set_render_loss_weight(stage3_render_weight)
+                            raw_model._stage_applied = 3
+                            if is_main:
+                                logging.info(
+                                    f"=== Stage 3 Active: Joint Training (render_weight={stage3_render_weight}, action=on) ==="
+                                )
+                elif global_step < stage1_steps:
+                    # Legacy two-stage schedule.
+                    if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
+                        if hasattr(raw_model, 'freeze_action_expert'):
+                            raw_model.freeze_action_expert()
+                            raw_model.set_render_loss_weight(stage1_render_weight)
+                            raw_model._stage_applied = 1
+                            if is_main:
+                                logging.info(
+                                    f"=== Stage 1 Active: Render+Depth Only (render_weight={stage1_render_weight}) ==="
+                                )
+                else:
+                    if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 2:
+                        if hasattr(raw_model, 'unfreeze_action_expert'):
+                            raw_model.unfreeze_action_expert()
+                            raw_model.set_render_loss_weight(stage2_render_weight)
+                            raw_model._stage_applied = 2
+                            if is_main:
+                                logging.info(
+                                    f"=== Stage 2 Started: Joint Training (render_weight={stage2_render_weight}) ==="
+                                )
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901

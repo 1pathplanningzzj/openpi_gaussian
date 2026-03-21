@@ -1,6 +1,8 @@
 # zijian
 # date 2026.01.24
 # v2 refactored: GaussianDecoder — lightweight decode-only module
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -90,9 +92,10 @@ class IndependentGaussianHead(nn.Module):
         self.use_image_fusion = use_image_fusion
         self.predict_depth = predict_depth
 
-        # Output channels: rot(4) + scale(3) + opacity(1) + SH(9)
+        # Output channels: rot(4) + scale(3) + opacity(1) + SH(9) + xy_delta(2)
         # SH(9) = DC(3) + 1st order(6) for basic view-dependent effects
-        out_ch = 4 + 3 + 1 + 9
+        # xy_delta(2) allows explicit lateral motion avoiding conflict with existing depth prediction.
+        out_ch = 4 + 3 + 1 + 9 + 2
 
         # Multi-scale feature extraction (DPT-style)
         # Layer 1: 16×16 → 32×32
@@ -256,6 +259,10 @@ class GaussianDecoder(nn.Module):
         action_dim: int = 7,
         use_action_conditioning: bool = True,
         predict_depth: bool = True,
+        use_incremental_depth: bool = True,
+        future_prediction_horizon: int = 1,
+        use_velocity_future_gaussians: bool = False,
+        velocity_world_model_scale: float = 0.15,
     ):
         super().__init__()
         self.token_dim = token_dim
@@ -263,6 +270,13 @@ class GaussianDecoder(nn.Module):
         self.action_dim = action_dim
         self.use_action_conditioning = use_action_conditioning
         self.predict_depth = predict_depth
+        self.use_incremental_depth = use_incremental_depth
+        self.future_prediction_horizon = max(1, int(future_prediction_horizon))
+        self.use_velocity_future_gaussians = use_velocity_future_gaussians
+        self.velocity_world_model_scale = float(velocity_world_model_scale)
+
+        # Horizon embedding helps the decoder distinguish t+1 vs t+H.
+        self.horizon_embed = nn.Embedding(self.future_prediction_horizon, token_dim)
 
         # Action embedding projection
         if use_action_conditioning:
@@ -272,7 +286,8 @@ class GaussianDecoder(nn.Module):
                 nn.Linear(128, token_dim),  # 输出维度应该匹配 token_dim (2048)
             )
 
-        # Independent ConvNet decoder — RGB output, no VGGT DPT dependency
+        # Full Gaussian decode is used to build the current/base template.
+        # Future horizons can optionally reuse that template and predict only dynamic xyz updates.
         grid_size = int(input_num_tokens ** 0.5)  # 256 → 16
         self.gaussian_head = IndependentGaussianHead(
             token_dim=token_dim, grid_size=grid_size,
@@ -280,6 +295,17 @@ class GaussianDecoder(nn.Module):
             img_dim=3,
             predict_depth=predict_depth,
         )
+
+        # Future-query dynamics head: predict 3D velocity / delta xyz in camera space.
+        if use_velocity_future_gaussians:
+            self.velocity_token_mlp = nn.Sequential(
+                nn.LayerNorm(token_dim),
+                nn.Linear(token_dim, token_dim),
+                nn.SiLU(),
+                nn.Linear(token_dim, 3),
+            )
+        else:
+            self.velocity_token_mlp = None
 
     # ------------------------------------------------------------------
     # depth2pc — real-camera unprojection  (adapted from AD-FFgsStudio)
@@ -334,28 +360,128 @@ class GaussianDecoder(nn.Module):
         step=None,
         current_observation=None,
         actions=None,
+        base_depth: torch.Tensor | None = None,
+        horizon_idx: int = 0,
+        static_reference_params: dict | None = None,
+        velocity_time_factor: float = 1.0,
     ):
         """Decode latent tokens → Gaussian parameters."""
         return self._decode_independent(
             z, gaussian_adapter=gaussian_adapter, camera_params=camera_params,
             current_observation=current_observation, future_observation=future_observation,
-            step=step, actions=actions,
+            step=step, actions=actions, base_depth=base_depth, horizon_idx=horizon_idx,
+            static_reference_params=static_reference_params,
+            velocity_time_factor=velocity_time_factor,
+        )
+
+    def decode_gaussian_prefix_template(
+        self,
+        z: torch.Tensor,
+        gaussian_adapter,
+        current_observation,
+        camera_params=None,
+        base_depth: torch.Tensor | None = None,
+        step=None,
+    ):
+        """Decode the current/base Gaussian template from prefix Gaussian tokens.
+
+        Used by the future dynamics branch: current Gaussian tokens produce one static
+        template, and future latents only predict delta xyz / velocity on top of it.
+        z: [B, 256, D] or [B, 768, D]; if 768, uses last 256 (t frame) for decode.
+        """
+        if z.shape[1] == 768:
+            z = z[:, -256:, :]
+        elif z.shape[1] != 256:
+            raise ValueError(f"decode_gaussian_prefix_template expects 256 or 768 tokens, got {z.shape[1]}")
+        return self._decode_independent(
+            z,
+            gaussian_adapter=gaussian_adapter,
+            camera_params=camera_params,
+            current_observation=current_observation,
+            future_observation=None,
+            step=step,
+            actions=None,
+            base_depth=base_depth,
+            horizon_idx=0,
+            static_reference_params=None,
+            velocity_time_factor=1.0,
+            skip_horizon_embedding=True,
+            skip_action_conditioning=True,
         )
 
     # ------------------------------------------------------------------
     # Independent ConvNet decoder (RGB output)
     # ------------------------------------------------------------------
+    def _decode_velocity_from_static(
+        self,
+        z: torch.Tensor,
+        static_reference_params: dict,
+        velocity_time_factor: float,
+        step: int | None,
+    ) -> dict:
+        """Reuse the base Gaussian template and predict future dynamics via delta xyz only."""
+        B, num_tokens, D = z.shape
+        g = int(math.sqrt(num_tokens))
+        if g * g != num_tokens:
+            raise ValueError(f"velocity path expects square token grid, got N={num_tokens}")
+
+        vel_tok = self.velocity_token_mlp(z)  # [B, N, 3]
+        vel_map = vel_tok.view(B, g, g, 3).permute(0, 3, 1, 2).contiguous()  # [B, 3, g, g]
+
+        xyz0 = static_reference_params["xyz"]
+        Npts = xyz0.shape[1]
+        H = W = int(math.sqrt(Npts))
+        if H * W != Npts:
+            raise ValueError(f"static xyz N={Npts} is not a square grid")
+
+        vel_up = F.interpolate(vel_map, size=(H, W), mode="bilinear", align_corners=False)
+        vel_flat = vel_up.permute(0, 2, 3, 1).reshape(B, Npts, 3)
+        delta = torch.tanh(vel_flat) * self.velocity_world_model_scale * float(velocity_time_factor)
+        xyz = xyz0 + delta.to(dtype=xyz0.dtype)
+        xyz = torch.clamp(xyz, min=-100.0, max=100.0)
+        xyz = torch.where(torch.isnan(xyz) | torch.isinf(xyz), torch.zeros_like(xyz), xyz)
+
+        z_cam = xyz[..., 2].reshape(B, H, W)
+        depth_map = z_cam.unsqueeze(1).clamp(min=0.0, max=8.0)
+
+        if step is not None and step % 400 == 0:
+            import logging
+
+            logging.info(
+                f"[VelocityDecoder] delta_xyz: scale={self.velocity_world_model_scale}, "
+                f"time_factor={velocity_time_factor:.4f}, |delta|_mean={delta.abs().mean().item():.6f}"
+            )
+
+        return {
+            "xyz": xyz,
+            "scales": static_reference_params["scales"],
+            "opacity": static_reference_params["opacity"],
+            "sh": static_reference_params["sh"],
+            "rotations": static_reference_params["rotations"],
+            "depth_map": depth_map,
+            "depth_delta_map": None,
+        }
+
     def _decode_independent(
         self, z, gaussian_adapter=None, camera_params=None,
         current_observation=None, future_observation=None, step=None, actions=None,
+        base_depth: torch.Tensor | None = None, horizon_idx: int = 0,
+        static_reference_params: dict | None = None,
+        velocity_time_factor: float = 1.0,
+        skip_horizon_embedding: bool = False,
+        skip_action_conditioning: bool = False,
     ):
-        """Decode VLM tokens via independent ConvNet head + VGGT depth."""
-        vggt_obs = current_observation if current_observation is not None else future_observation
-        if vggt_obs is None or gaussian_adapter is None:
-            raise ValueError("current_observation and gaussian_adapter are required")
+        """Decode VLM tokens into Gaussian parameters.
 
-        # Action conditioning: embed actions and add to VLM tokens
-        if self.use_action_conditioning and actions is not None:
+        Current/base template decode uses the full ConvNet head.
+        Future decode reuses a provided static template and predicts only delta xyz.
+        """
+        if not skip_horizon_embedding:
+            horizon_idx = max(0, min(int(horizon_idx), self.future_prediction_horizon - 1))
+            horizon_ids = torch.full((z.shape[0],), horizon_idx, device=z.device, dtype=torch.long)
+            z = z + self.horizon_embed(horizon_ids).unsqueeze(1).to(dtype=z.dtype)
+
+        if not skip_action_conditioning and self.use_action_conditioning and actions is not None:
             # Transform actions to camera frame
             action_cam = self._transform_action_to_camera(actions, camera_params)
             # Extract only first 7 meaningful dimensions for projection
@@ -363,6 +489,19 @@ class GaussianDecoder(nn.Module):
             # Embed and add to tokens
             action_embed = self.action_proj(action_cam_7d)  # [B, token_dim]
             z = z + action_embed.unsqueeze(1)  # [B, 256, D] + [B, 1, D] → [B, 256, D]
+
+        if (
+            self.use_velocity_future_gaussians
+            and static_reference_params is not None
+            and self.velocity_token_mlp is not None
+        ):
+            return self._decode_velocity_from_static(
+                z, static_reference_params, velocity_time_factor, step
+            )
+
+        vggt_obs = current_observation if current_observation is not None else future_observation
+        if vggt_obs is None or gaussian_adapter is None:
+            raise ValueError("current_observation and gaussian_adapter are required")
 
         # Prepare VGGT inputs for image feature fusion
         vggt_inputs = gaussian_adapter.prepare_inputs(
@@ -378,20 +517,32 @@ class GaussianDecoder(nn.Module):
 
         # Decode VLM tokens → Gaussian params + depth (with current frame residual)
         decoder_output = self.gaussian_head(z, images=current_frame_img)
-        raw = decoder_output['gaussian_params']  # [B, 17, 256, 256]
-        rot_raw, scale_raw, opa_raw, sh_raw = raw.split([4, 3, 1, 9], dim=1)
+        raw = decoder_output['gaussian_params']  # [B, 19, 256, 256]
+        rot_raw, scale_raw, opa_raw, sh_raw, xy_delta_raw = raw.split([4, 3, 1, 9, 2], dim=1)
 
-        # Get depth: use predicted depth if available, otherwise fallback to VGGT
+        # Get depth: use predicted incremental depth if available, otherwise fallback to VGGT
+        depth_delta_map = None
         if self.predict_depth and 'depth' in decoder_output:
-            # Use predicted depth from decoder (方案 A)
             depth_raw = decoder_output['depth']  # [B, 1, 256, 256]
-            # Apply sigmoid + scaling to match GT depth range from Depth Anything V2
-            # GT depth statistics: min=-0.21, max=7.53, mean=3.30, P5-P95: 0.24-6.58
-            # Use slightly wider range to allow model flexibility: 0.0 to 8.0 meters
-            min_depth = 0.0
-            max_depth = 8.0
-            final_depth = min_depth + (max_depth - min_depth) * torch.sigmoid(depth_raw.squeeze(1))  # [B, 256, 256]
-            H_dec, W_dec = final_depth.shape[1], final_depth.shape[2]  # Get spatial dimensions
+
+            if base_depth is not None and self.use_incremental_depth:
+                if base_depth.ndim == 4:
+                    base_depth_map = base_depth.squeeze(1)
+                else:
+                    base_depth_map = base_depth
+                if base_depth_map.shape[-2:] != depth_raw.shape[-2:]:
+                    base_depth_map = F.interpolate(
+                        base_depth_map.unsqueeze(1), size=depth_raw.shape[-2:], mode="bilinear", align_corners=False
+                    ).squeeze(1)
+                depth_delta_map = torch.tanh(depth_raw.squeeze(1))
+                final_depth = torch.clamp(base_depth_map + depth_delta_map, min=0.0, max=8.0)  # [B, 256, 256]
+                H_dec, W_dec = final_depth.shape[1], final_depth.shape[2]
+            else:
+                # Absolute-depth fallback path
+                min_depth = 0.0
+                max_depth = 8.0
+                final_depth = min_depth + (max_depth - min_depth) * torch.sigmoid(depth_raw.squeeze(1))  # [B, 256, 256]
+                H_dec, W_dec = final_depth.shape[1], final_depth.shape[2]
         else:
             # Fallback: use VGGT depth from current frame (old behavior)
             with torch.no_grad():
@@ -446,7 +597,7 @@ class GaussianDecoder(nn.Module):
         # LIBERO original camera: 256×256, fx=fy=221.7025, cx=cy=128.0
         # No scaling needed since decoder outputs 256×256
         if camera_params is not None and "fx" in camera_params:
-            xyz = self.depth2pc(
+            xyz_base = self.depth2pc(
                 final_depth,
                 fx=camera_params["fx"], fy=camera_params["fy"],
                 cx=camera_params["cx"], cy=camera_params["cy"],
@@ -454,15 +605,26 @@ class GaussianDecoder(nn.Module):
             )
         else:
             # LIBERO intrinsics for 256×256 resolution
-            xyz = self.depth2pc(
+            xyz_base = self.depth2pc(
                 final_depth,
                 fx=221.7025, fy=221.7025,
                 cx=128.0, cy=128.0,
                 downsample_factor=1,
             )
 
-        # 8. Flatten and sanitize
+        # Add explicit spatial delta prediction to Break 2D ray lock
+        xy_delta_maps = xy_delta_raw.permute(0, 2, 3, 1)  # [B, H, W, 2]
         N = H_dec * W_dec  # 256 * 256 = 65536
+        xy_delta_flat = xy_delta_maps.reshape(B, N, 2)
+        # Scale lateral movement explicitly
+        xy_delta_flat = torch.tanh(xy_delta_flat) * 0.5  # constrain to max 0.5m movement
+        
+        # Keep Z unchanged here because Z (depth) movement is completely handled and supervised by depth_refine.
+        z_zeros = torch.zeros(B, N, 1, device=xyz_base.device, dtype=xyz_base.dtype)
+        xyz_delta_flat = torch.cat([xy_delta_flat, z_zeros], dim=-1)
+        xyz = xyz_base + xyz_delta_flat
+
+        # 8. Flatten and sanitize
         rot_flat = rot_maps.reshape(B, N, 4)
         scale_flat = scale_maps.reshape(B, N, 3)
         opacity_flat = opacity_maps.reshape(B, N, 1)
@@ -486,6 +648,7 @@ class GaussianDecoder(nn.Module):
             "sh": sh_flat,  # [B, N, 9] for 1st order SH
             "rotations": rot_flat,
             "depth_map": final_depth.unsqueeze(1),  # [B, 1, H, W] for edge-aware smoothness
+            "depth_delta_map": None if depth_delta_map is None else depth_delta_map.unsqueeze(1),
         }
 
     def _transform_action_to_camera(self, actions, camera_params):
