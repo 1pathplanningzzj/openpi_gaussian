@@ -287,7 +287,7 @@ class GaussianDecoder(nn.Module):
             )
 
         # Full Gaussian decode is used to build the current/base template.
-        # Future horizons can optionally reuse that template and predict only dynamic xyz updates.
+        # Future horizons reuse that template and only predict gated dynamic xyz updates.
         grid_size = int(input_num_tokens ** 0.5)  # 256 → 16
         self.gaussian_head = IndependentGaussianHead(
             token_dim=token_dim, grid_size=grid_size,
@@ -296,8 +296,14 @@ class GaussianDecoder(nn.Module):
             predict_depth=predict_depth,
         )
 
-        # Future-query dynamics head: predict 3D velocity / delta xyz in camera space.
+        # Future-query dynamics heads: predict a motion gate and 3D velocity / delta xyz in camera space.
         if use_velocity_future_gaussians:
+            self.motion_gate_token_mlp = nn.Sequential(
+                nn.LayerNorm(token_dim),
+                nn.Linear(token_dim, token_dim),
+                nn.SiLU(),
+                nn.Linear(token_dim, 1),
+            )
             self.velocity_token_mlp = nn.Sequential(
                 nn.LayerNorm(token_dim),
                 nn.Linear(token_dim, token_dim),
@@ -305,6 +311,7 @@ class GaussianDecoder(nn.Module):
                 nn.Linear(token_dim, 3),
             )
         else:
+            self.motion_gate_token_mlp = None
             self.velocity_token_mlp = None
 
     # ------------------------------------------------------------------
@@ -419,13 +426,15 @@ class GaussianDecoder(nn.Module):
         velocity_time_factor: float,
         step: int | None,
     ) -> dict:
-        """Reuse the base Gaussian template and predict future dynamics via delta xyz only."""
+        """Reuse the base Gaussian template and predict gated future dynamics via delta xyz only."""
         B, num_tokens, D = z.shape
         g = int(math.sqrt(num_tokens))
         if g * g != num_tokens:
             raise ValueError(f"velocity path expects square token grid, got N={num_tokens}")
 
+        gate_tok = self.motion_gate_token_mlp(z)  # [B, N, 1]
         vel_tok = self.velocity_token_mlp(z)  # [B, N, 3]
+        gate_map = gate_tok.view(B, g, g, 1).permute(0, 3, 1, 2).contiguous()  # [B, 1, g, g]
         vel_map = vel_tok.view(B, g, g, 3).permute(0, 3, 1, 2).contiguous()  # [B, 3, g, g]
 
         xyz0 = static_reference_params["xyz"]
@@ -434,22 +443,29 @@ class GaussianDecoder(nn.Module):
         if H * W != Npts:
             raise ValueError(f"static xyz N={Npts} is not a square grid")
 
+        gate_up = F.interpolate(gate_map, size=(H, W), mode="bilinear", align_corners=False)
         vel_up = F.interpolate(vel_map, size=(H, W), mode="bilinear", align_corners=False)
+        gate_flat = gate_up.permute(0, 2, 3, 1).reshape(B, Npts, 1)
         vel_flat = vel_up.permute(0, 2, 3, 1).reshape(B, Npts, 3)
-        delta = torch.tanh(vel_flat) * self.velocity_world_model_scale * float(velocity_time_factor)
+
+        motion_gate = torch.sigmoid(gate_flat)
+        raw_delta = torch.tanh(vel_flat) * self.velocity_world_model_scale * float(velocity_time_factor)
+        delta = motion_gate * raw_delta
         xyz = xyz0 + delta.to(dtype=xyz0.dtype)
         xyz = torch.clamp(xyz, min=-100.0, max=100.0)
         xyz = torch.where(torch.isnan(xyz) | torch.isinf(xyz), torch.zeros_like(xyz), xyz)
 
         z_cam = xyz[..., 2].reshape(B, H, W)
         depth_map = z_cam.unsqueeze(1).clamp(min=0.0, max=8.0)
+        motion_gate_map = motion_gate.reshape(B, H, W)
 
         if step is not None and step % 400 == 0:
             import logging
 
             logging.info(
                 f"[VelocityDecoder] delta_xyz: scale={self.velocity_world_model_scale}, "
-                f"time_factor={velocity_time_factor:.4f}, |delta|_mean={delta.abs().mean().item():.6f}"
+                f"time_factor={velocity_time_factor:.4f}, gate_mean={motion_gate.mean().item():.6f}, "
+                f"gate_max={motion_gate.max().item():.6f}, |delta|_mean={delta.abs().mean().item():.6f}"
             )
 
         return {
@@ -460,6 +476,8 @@ class GaussianDecoder(nn.Module):
             "rotations": static_reference_params["rotations"],
             "depth_map": depth_map,
             "depth_delta_map": None,
+            "motion_gate_map": motion_gate_map,
+            "raw_delta_xyz": raw_delta,
         }
 
     def _decode_independent(
@@ -474,7 +492,7 @@ class GaussianDecoder(nn.Module):
         """Decode VLM tokens into Gaussian parameters.
 
         Current/base template decode uses the full ConvNet head.
-        Future decode reuses a provided static template and predicts only delta xyz.
+        Future decode reuses a provided static template and predicts only gated delta xyz.
         """
         if not skip_horizon_embedding:
             horizon_idx = max(0, min(int(horizon_idx), self.future_prediction_horizon - 1))

@@ -213,6 +213,16 @@ class PI0Pytorch(nn.Module):
                     )
                 )
 
+            # Let future queries read the current Gaussian scene tokens before
+            # forming the future seed tokens.
+            self.future_query_cross_attn = nn.MultiheadAttention(
+                embed_dim=paligemma_config.width,
+                num_heads=8,
+                batch_first=True,
+            )
+            self.future_query_cross_attn_q_norm = nn.LayerNorm(paligemma_config.width)
+            self.future_query_cross_attn_kv_norm = nn.LayerNorm(paligemma_config.width)
+
             # Roll out a single future seed into short-horizon latents [t+1, ..., t+H].
             self.future_horizon_embed = nn.Parameter(
                 torch.randn(self.future_prediction_horizon, paligemma_config.width) * 0.02
@@ -244,6 +254,9 @@ class PI0Pytorch(nn.Module):
             self.future_token_count = 0
             self.world_token_proj = None
             self.future_query_tokens = None
+            self.future_query_cross_attn = None
+            self.future_query_cross_attn_q_norm = None
+            self.future_query_cross_attn_kv_norm = None
             self.future_horizon_embed = None
             self.future_rollout_mlp = None
         
@@ -334,6 +347,7 @@ class PI0Pytorch(nn.Module):
         self.future_motion_loss_min_weight = float(getattr(config, "future_motion_loss_min_weight", 0.35))
         self.future_motion_loss_max_weight = float(getattr(config, "future_motion_loss_max_weight", 4.0))
         self.future_motion_blur_kernel = max(1, int(getattr(config, "future_motion_blur_kernel", 9)))
+        self.future_motion_gate_loss_weight = float(getattr(config, "future_motion_gate_loss_weight", 0.1))
         if self.future_motion_blur_kernel % 2 == 0:
             self.future_motion_blur_kernel += 1
         self.future_horizon_curriculum_steps = int(getattr(config, "future_horizon_curriculum_steps", 0))
@@ -481,11 +495,12 @@ class PI0Pytorch(nn.Module):
     def _temporal_context_future_indices(self, time_dim: int, use_single_frame_mode: bool) -> tuple[list[int], list[int], int]:
         """Pick context / future frame indices along T.
 
-        When world-model tokens are enabled, futures are at **current + offset** for each entry in
-        ``future_prediction_offsets`` (e.g. [2,5,10,15,20] → frames c+2, c+5, ...), with
-        ``c`` chosen as the last context index so that the largest offset still lies in [0, T-1].
+        In single-frame world-model mode, the dataloader already materializes sparse supervision
+        slots in order ``[t, t+o1, t+o2, ...]`` for ``future_prediction_offsets=(o1, o2, ...)``.
+        In that case we should index those slots directly instead of reinterpreting T as a dense
+        consecutive timeline.
 
-        Otherwise (no world model), keeps the legacy **consecutive** tail window.
+        Otherwise (no world model, or multi-frame mode), keep the legacy dense-index behavior.
         """
         context_frames = 1 if use_single_frame_mode else min(3, time_dim)
 
@@ -500,6 +515,22 @@ class PI0Pytorch(nn.Module):
             return _legacy_consecutive()
 
         offsets = self.future_prediction_offsets
+
+        if use_single_frame_mode:
+            expected_t = 1 + len(offsets)
+            if time_dim >= expected_t:
+                return [0], list(range(1, expected_t)), 0
+            if not getattr(self, "_warned_future_offset_fallback", False):
+                logging.warning(
+                    "World model: sparse future supervision expects time_dim >= %s for [t, %s], got %s. "
+                    "Using consecutive tail fallback.",
+                    expected_t,
+                    ", ".join(f"t+{offset}" for offset in offsets),
+                    time_dim,
+                )
+                self._warned_future_offset_fallback = True
+            return _legacy_consecutive()
+
         max_off = max(offsets)
         c_end = time_dim - 1 - max_off
         need_t = max_off + context_frames
@@ -999,6 +1030,12 @@ class PI0Pytorch(nn.Module):
         )
         return weight_map.squeeze(1)
 
+    def _build_future_motion_gate_target(self, motion_weight_map: torch.Tensor) -> torch.Tensor:
+        """Convert the soft motion weight map into a bounded gate target in [0, 1]."""
+        gate_target = (motion_weight_map.float() - 1.0) / max(self.future_motion_loss_gain, 1e-6)
+        gate_target = torch.clamp(gate_target, min=0.0, max=1.0)
+        return gate_target
+
     def _compute_world_model_frame_loss(
         self,
         z_next: torch.Tensor,
@@ -1045,6 +1082,8 @@ class PI0Pytorch(nn.Module):
 
             depth_map = gaussian_params.pop("depth_map", None)
             depth_delta_map = gaussian_params.pop("depth_delta_map", None)
+            motion_gate_map = gaussian_params.pop("motion_gate_map", None)
+            raw_delta_xyz = gaussian_params.pop("raw_delta_xyz", None)
 
             if step is not None and step % 400 == 0:
                 depth_delta_mean = float("nan")
@@ -1177,6 +1216,24 @@ class PI0Pytorch(nn.Module):
                 )
                 if torch.isfinite(render_loss):
                     total_loss = total_loss + self.render_loss_weight * render_loss.to(total_loss.dtype)
+
+                if motion_gate_map is not None and "agent" in motion_weight_maps:
+                    gate_target = self._build_future_motion_gate_target(motion_weight_maps["agent"])
+                    gate_pred = motion_gate_map.float()
+                    if gate_pred.shape != gate_target.shape:
+                        gate_pred = F.interpolate(
+                            gate_pred.unsqueeze(1), size=gate_target.shape[-2:], mode="bilinear", align_corners=False
+                        ).squeeze(1)
+                    motion_gate_loss = F.smooth_l1_loss(gate_pred, gate_target)
+                    if torch.isfinite(motion_gate_loss):
+                        total_loss = total_loss + self.future_motion_gate_loss_weight * motion_gate_loss
+                    render_loss_dict["loss_motion_gate"] = motion_gate_loss
+                    if step is not None and step % 400 == 0:
+                        logging.info(
+                            f"Step {step}{time_suffix}: Motion Gate Loss = {motion_gate_loss.item():.6f}, "
+                            f"weight={self.future_motion_gate_loss_weight}, gate_mean={gate_pred.mean().item():.4f}, "
+                            f"target_mean={gate_target.mean().item():.4f}"
+                        )
 
                 if "sh" in gaussian_params:
                     sh_dc = gaussian_params["sh"]
@@ -1439,6 +1496,16 @@ class PI0Pytorch(nn.Module):
 
             # 2. Delta query tokens (learnable, predict changes)
             delta_q = self.future_query_tokens.expand(B, -1, -1)  # [B, 256, D]
+            if gaussian_embs is not None and self.future_query_cross_attn is not None:
+                query_tokens = self.future_query_cross_attn_q_norm(delta_q)
+                key_value_tokens = self.future_query_cross_attn_kv_norm(gaussian_embs.to(delta_q.dtype))
+                cross_attn_out, _ = self.future_query_cross_attn(
+                    query_tokens,
+                    key_value_tokens,
+                    key_value_tokens,
+                    need_weights=False,
+                )
+                delta_q = delta_q + cross_attn_out
             z_base = z_base.to(delta_q.dtype)
             delta_scale = F.softplus(self.delta_scale)
 
