@@ -364,6 +364,7 @@ class GaussianAdapter(nn.Module):
     def __init__(self, use_gaussian: bool, action_expert_width: int, use_lgpd: bool = True,
                  num_frames: int = 3, inference_num_frames: int = 1,
                  use_single_frame_mode: bool = False,
+                 temporal_context_offsets: tuple[int, ...] | None = None,
                  unfreeze_encoder: bool = False, unfreeze_decoder_only: bool = True,
                  use_lora: bool = True, lora_rank: int = 8, lora_alpha: float = 32.0,
                  lora_targets=("qkv", "proj")):
@@ -373,18 +374,11 @@ class GaussianAdapter(nn.Module):
             action_expert_width: Width of action expert
             use_lgpd: Whether to use Language-Gated Physical Distillation
             num_frames: Number of consecutive frames to use from agent view during training (default: 3)
-                       Uses [t-2, t-1, t] for temporal modeling. Reduced from 5 to 3 to save memory.
-                       VGGT uses temporal frames to establish cross-frame geometry relationships.
-                       Wrist view is excluded from VGGT encoding (but still used in 2D encoders like SigLIP).
             inference_num_frames: Number of frames to use during inference (default: 1, single frame).
-                                 Single frame is more practical for real-time inference.
             use_single_frame_mode: If True, override num_frames to 1 for both training and inference.
-                                  This mode removes temporal history (t-2, t-1) and only uses current frame (t).
-                                  Useful for ablation studies to test if temporal context is necessary.
-            unfreeze_encoder: If True, unfreeze VGGT encoder to allow end-to-end training (default: False).
-                             When True, encoder will be trained with reconstruction loss.
-            unfreeze_decoder_only: If True, only unfreeze decoder (gs_head) while keeping encoder frozen (default: True).
-                                 This is a middle ground: train decoder with reconstruction loss while keeping encoder fixed.
+            temporal_context_offsets: Relative history offsets corresponding to packed context slots.
+            unfreeze_encoder: If True, unfreeze VGGT encoder to allow end-to-end training.
+            unfreeze_decoder_only: If True, only unfreeze decoder while keeping encoder frozen.
         """
         super().__init__()
         self.use_gaussian = use_gaussian
@@ -392,19 +386,26 @@ class GaussianAdapter(nn.Module):
         self.proj = None
         self.lgpd = None  # Language-Gated Physical Distillation
         self.use_lgpd = use_lgpd
+        self.temporal_context_offsets = tuple(temporal_context_offsets or tuple(range(-(num_frames - 1), 1)))
 
         # Single-frame mode: override num_frames to 1 for both training and inference
         if use_single_frame_mode:
             self.num_frames = 1
             self.inference_num_frames = 1
+            self.temporal_context_offsets = (0,)
             logging.info("Single-frame mode enabled: using 1 frame for both training and inference")
         else:
             self.num_frames = num_frames
             self.inference_num_frames = inference_num_frames
 
+        self._temporal_context_labels = [
+            "t" if offset == 0 else (f"t+{offset}" if offset > 0 else f"t{offset}")
+            for offset in self.temporal_context_offsets
+        ]
+
         if self.use_gaussian and VGGT3DGSModel is not None:
             logging.info("Initializing VGGT 3DGS Components in Adapter...")
-            
+
             try:
                 # Initialize VGGT Model
                 # Parameters based on vggt3dgs_model.py defaults or typical values
@@ -522,12 +523,13 @@ class GaussianAdapter(nn.Module):
                     # 4. Frame positional encoding (sinusoidal + learnable)
                     # Use self.num_frames (respects single-frame mode)
                     self.frame_pos_encoding = nn.ModuleList([
-                        SinusoidalPositionalEncoding(self.num_frames, 512)  # Changed from num_frames
-                        for _ in range(self.num_frames)  # Changed from num_frames
+                        SinusoidalPositionalEncoding(self.num_frames, 512)
+                        for _ in range(self.num_frames)
                     ])
                     self.frame_embeddings = nn.Parameter(
-                        torch.randn(self.num_frames, 512) * 0.02  # Changed from num_frames
+                        torch.randn(self.num_frames, 512) * 0.02
                     )
+                    self.temporal_offset_proj = nn.Linear(1, 512)
 
                     # 5. Projection to action_expert_width
                     self.proj = nn.Linear(512, action_expert_width)
@@ -537,8 +539,8 @@ class GaussianAdapter(nn.Module):
                         f"  - 3D Conv: 2048 → 512 channels\n"
                         f"  - Spatial resolution: 37×37 → 16×16\n"
                         f"  - Tokens per frame: {self.tokens_per_frame}\n"
-                        f"  - Total tokens: {self.num_frames * self.tokens_per_frame}\n"  # Changed from num_frames
-                        f"  - Causal temporal attention: {self.num_frames} frames"  # Changed from num_frames
+                        f"  - Total tokens: {self.num_frames * self.tokens_per_frame}\n"
+                        f"  - Causal temporal attention: {self.num_frames} frames"
                     )
                 else:
                     # Original implementation (fallback)
@@ -560,22 +562,22 @@ class GaussianAdapter(nn.Module):
                     if use_single_frame_mode:
                         self.use_frame_pos_encoding = False
                         self.frame_embeddings = None
+                        self.temporal_offset_proj = None
                     else:
                         # Multi-frame mode: use frame positional encoding
                         self.use_frame_pos_encoding = True
                         self.frame_embeddings = nn.Parameter(
                             torch.randn(self.num_frames, action_expert_width) * 0.02
                         )
-                
-                # LGPD Module
-                if self.use_lgpd:
-                    logging.info("Initializing LGPD Module...")
-                    self.lgpd = LanguageGatedPhysicalDistillation(
-                        token_dim=action_expert_width,
-                        text_dim=action_expert_width,  # Assuming pooled text emb has same dim as visual proj
-                        num_context_tokens=16,
-                        background_weight=0.1
-                    )
+                        self.temporal_offset_proj = nn.Linear(1, action_expert_width)
+                    if self.use_lgpd:
+                        logging.info("Initializing LGPD Module...")
+                        self.lgpd = LanguageGatedPhysicalDistillation(
+                            token_dim=action_expert_width,
+                            text_dim=action_expert_width,  # Assuming pooled text emb has same dim as visual proj
+                            num_context_tokens=16,
+                            background_weight=0.1
+                        )
 
             except Exception as e:
                 logging.error(f"Failed to initialize VGGT components: {e}")
@@ -584,23 +586,34 @@ class GaussianAdapter(nn.Module):
         else:
             self.use_gaussian = False
 
+
+    def _frame_offset_embedding(self, frame_idx: int, width: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Project configured temporal offset into token space for frame identity."""
+        if frame_idx < len(self.temporal_context_offsets):
+            offset_value = float(self.temporal_context_offsets[frame_idx])
+        else:
+            offset_value = float(frame_idx - len(self.temporal_context_offsets) + 1)
+        offset_tensor = torch.tensor([[offset_value]], device=device, dtype=dtype)
+        if getattr(self, "temporal_offset_proj", None) is None:
+            return torch.zeros(width, device=device, dtype=dtype)
+        return self.temporal_offset_proj(offset_tensor).reshape(width)
+
     def encode(self, observation, device, batch_size):
         """Pure encoding step to get Gaussian features."""
-        # This is mainly for inference/debugging checks
         inputs = self.prepare_inputs(observation, device, batch_size)
         if inputs is None:
             return None
-        return self.forward(inputs)[0] # Just return embs
+        return self.forward(inputs)[0]
 
     def prepare_inputs(self, observation, device, batch_size, is_training: bool = None):
         """Helper to prepare inputs for VGGT encoder from observation.
         VGGT expects [Batch_size, S (frames), 3, H, W]
-        
-        Strategy: Use consecutive frames from agent view only.
+
+        Strategy: use packed context frames from agent view only.
         - Agent view is more stable and suitable for temporal modeling
         - Wrist view is excluded from VGGT encoding (but still used in 2D encoders like SigLIP)
-        - Multiple frames allow VGGT's global attention to establish cross-frame geometry relationships
-        
+        - Multiple packed context frames allow VGGT's global attention to establish cross-frame geometry relationships
+
         Args:
             is_training: If True, uses num_frames. If False, uses inference_num_frames.
                         If None, auto-detects from model.training.
@@ -660,70 +673,34 @@ class GaussianAdapter(nn.Module):
         target_size = getattr(self.encoder, "img_size", 518)
         
         # Handle Temporal Dimension
-        # Goal: Extract current frame + previous (target_num_frames - 1) frames
-        # Strategy: Use past frames for temporal consistency (better for VGGT's global attention)
-        # If dataset has [t-2, t-1, t, t+1], we want [t-2, t-1, t] (current + 2 past frames)
+        # Goal: Extract packed context frames from the front of the temporal slots.
+        # Layout is expected to be [context..., future...], so current frame is always the
+        # last context slot rather than inferred from total T.
         if img.ndim == 5:  # [B, T, C, H, W] or [B, T, H, W, C]
             T = img.shape[1]
-            
+
             # Check if channel last
             if img.shape[-1] == 3:  # [B, T, H, W, C]
                 img = img.permute(0, 1, 4, 2, 3)  # [B, T, C, H, W]
-            
-            # Determine current frame index based on time dimension
-            # If T == 2: [curr, next] -> use idx_curr=0 (current frame)
-            # If T == 3: [prev, curr, next] -> use idx_curr=1 (current frame)
-            # If T == 4: [t-2, t-1, t, t+1] -> use idx_curr=2 (current frame at index 2)
-            # If T == 6: [t-4, t-3, t-2, t-1, t, t+1] -> use idx_curr=4 (current frame at index 4)
-            if T == 2:
-                idx_curr = 0  # First frame is current
-            elif T == 3:
-                idx_curr = 1  # Middle frame is current
-            elif T == 4:
-                idx_curr = 2  # Current frame is at index 2 in [t-2, t-1, t, t+1]
-            elif T == 6:
-                idx_curr = 4  # Current frame is at index 4 in [t-4, t-3, t-2, t-1, t, t+1]
-            else:
-                # For other T values, assume current is at T-2 (for [..., t-1, t, t+1] format)
-                idx_curr = T - 2
-            
-            # Select frames: current frame + previous (target_num_frames - 1) frames
-            # We want: [t-2, t-1, t] where t is current frame
+
             if T >= target_num_frames:
-                # Start from (idx_curr - target_num_frames + 1) to idx_curr (inclusive)
-                start_idx = max(0, idx_curr - target_num_frames + 1)
-                end_idx = idx_curr + 1
-                selected_frames = img[:, start_idx:end_idx]  # [B, selected_num, C, H, W]
-                
-                # If we don't have enough past frames, pad with the earliest available frame
-                selected_num = selected_frames.shape[1]
-                if selected_num < target_num_frames:
-                    padding_needed = target_num_frames - selected_num
-                    earliest_frame = selected_frames[:, :1]  # [B, 1, C, H, W]
-                    padding = earliest_frame.repeat(1, padding_needed, 1, 1, 1)
-                    img = torch.cat([padding, selected_frames], dim=1)  # [B, target_num_frames, C, H, W]
-                else:
-                    img = selected_frames
+                img = img[:, :target_num_frames]
             else:
-                # Fewer frames than requested
                 if not is_training:
-                    # Inference mode: use available frames (use what we have)
                     logging.debug(f"Inference: Using {T} available frames (requested {target_num_frames})")
-                    img = img  # Use all available frames
-                    target_num_frames = T  # Update target to match available
+                    img = img
+                    target_num_frames = T
                 else:
-                    # Training mode: pad by repeating the first frame (past frames)
-                    # We want current + past frames, so pad at the beginning
-                    # This is normal when dataset only provides 2 frames (curr, next)
-                    # We pad to get [curr, curr, curr] for 3-frame VGGT encoding
-                    if T == 2:
-                        logging.debug(f"Dataset has 2 frames (curr, next). Padding to get 3 frames for VGGT: [curr, curr, curr]")
-                    else:
-                        logging.warning(f"Only {T} frames available, requested {target_num_frames}. Padding with first frame at the beginning.")
-                    first_frame = img[:, :1]  # [B, 1, C, H, W]
+                    if T == 0:
+                        logging.error("No temporal frames available for GaussianAdapter.prepare_inputs")
+                        return None
+                    logging.warning(
+                        f"Only {T} frames available, requested {target_num_frames}. Padding from earliest context frame."
+                    )
+                    first_frame = img[:, :1]
                     padding = first_frame.repeat(1, target_num_frames - T, 1, 1, 1)
-                    img = torch.cat([padding, img], dim=1)  # [B, target_num_frames, C, H, W]
-                
+                    img = torch.cat([padding, img], dim=1)
+
         elif img.ndim == 4:  # [B, C, H, W] or [B, H, W, C] - single frame
             # Check if channel last
             if img.shape[-1] == 3:  # [B, H, W, C]
@@ -943,9 +920,9 @@ class GaussianAdapter(nn.Module):
             for frame_idx in range(S):
                 frame_tokens = tokens_flat[:, frame_idx]  # [B, 256, 512]
 
-                # Sinusoidal + learnable positional encoding
+                offset_emb = self._frame_offset_embedding(frame_idx, 512, frame_tokens.device, frame_tokens.dtype)
                 frame_pos = self.frame_pos_encoding[frame_idx](frame_idx)  # [512]
-                frame_pos = frame_pos + self.frame_embeddings[frame_idx]  # [512]
+                frame_pos = frame_pos + self.frame_embeddings[frame_idx] + offset_emb  # [512]
                 frame_pos = frame_pos.unsqueeze(0).unsqueeze(0)  # [1, 1, 512]
 
                 frame_tokens = frame_tokens + frame_pos  # [B, 256, 512]
@@ -1001,11 +978,10 @@ class GaussianAdapter(nn.Module):
                 # Project to action_expert_width
                 frame_embs = self.proj(tokens_final)  # [B, 100, action_expert_width]
 
-                # Add frame positional encoding
-                if hasattr(self, 'frame_embeddings'):
-                    # frame_embeddings: [S, action_expert_width]
-                    # Expand to [B, 100, action_expert_width] and add
-                    frame_emb = self.frame_embeddings[frame_idx]  # [action_expert_width]
+                if hasattr(self, 'frame_embeddings') and self.frame_embeddings is not None:
+                    frame_emb = self.frame_embeddings[frame_idx]
+                    offset_emb = self._frame_offset_embedding(frame_idx, action_expert_width, frame_emb.device, frame_emb.dtype)
+                    frame_emb = frame_emb + offset_emb
                     frame_emb = frame_emb.unsqueeze(0).unsqueeze(0).expand(B, 100, -1)  # [B, 100, action_expert_width]
                     frame_embs = frame_embs + frame_emb
 

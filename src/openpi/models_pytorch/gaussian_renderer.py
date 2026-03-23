@@ -753,25 +753,25 @@ def compute_multi_view_rendering_loss(
 
     return total_loss, loss_dict
 
-def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params_dict, renderer, view_names, save_dir=None, time_suffix="", temporal_frames=None):
+def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params_dict, renderer, view_names, save_dir=None, time_suffix="", temporal_frames=None, temporal_labels=None, future_label="future"):
     """
     Helper to visualize temporal sequence and rendering comparison.
     Args:
         step: Current training step (int)
         gaussian_params: Dict of gaussian parameters (batched)
-        target_obs: GT target observation dict (t+1 frame)
+        target_obs: GT target observation dict
         cam_params_dict: Camera parameters dict
         renderer: Instance of GaussianRenderer
         view_names: List of camera names to visualize
         save_dir: Optional directory to save visualizations. Defaults to "./visualizations/rendering"
-        time_suffix: Optional suffix to identify time step (e.g., "_t", "_t1_pred", "_t1_gt")
-        temporal_frames: Dict of temporal frames {key: [B, T, C, H, W]} where T includes t-2, t-1, t
+        time_suffix: Optional suffix to identify time step
+        temporal_frames: Dict of temporal frames {key: [B, T, C, H, W]}
+        temporal_labels: Optional labels for temporal context frames (e.g. ["t-10", "t-5", "t"])
+        future_label: Label for the supervised future frame column
     """
     import matplotlib
-    # Use non-interactive backend to avoid X11 authorization issues in headless environments
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
     import os
     import numpy as np
 
@@ -779,27 +779,17 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
         save_dir = "./visualizations/rendering"
     os.makedirs(save_dir, exist_ok=True)
 
-    # Take first item in batch
     idx = 0
-
-    # Create figure with 2 rows x 3 columns:
-    # Multi-frame mode: Row 1: GT t-2, GT t-1, GT t | Row 2: GT t+1, Predicted t+1, Diff
-    # Single-frame mode: Row 1: [empty], GT t, [empty] | Row 2: GT t+1, Predicted t+1, Diff
     fig = plt.figure(figsize=(18, 12))
     gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
 
     with torch.no_grad():
-        # Process temporal sequence + rendering comparison
         for i, view_name in enumerate(view_names):
-            if i >= 1:  # Only show first view to save space
+            if i >= 1:
                 break
 
-            # Find matching key in temporal_frames
             temporal_key = None
             if temporal_frames:
-                # Try to match view_name with keys in temporal_frames
-                # view_name could be "agent" or "wrist"
-                # keys could be "base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb", etc.
                 for k in temporal_frames.keys():
                     if view_name == "agent" and ("base" in k or "high" in k or "exterior" in k):
                         temporal_key = k
@@ -810,83 +800,52 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
                     elif view_name in k:
                         temporal_key = k
                         break
-                
-                # If still not found, just use the first available key
                 if not temporal_key and temporal_frames:
                     temporal_key = next(iter(temporal_frames.keys()))
-                    print(f"[Viz] Using first available key: {temporal_key} for view {view_name}")
 
-            # Display 4 frames: [t-2, t-1, t, t+1]
-            # Row 1: GT t-2, GT t-1, GT t (columns 0, 1, 2) for multi-frame mode
-            # Row 1: GT t (column 1 only) for single-frame mode
-            # Row 2: GT t+1, Rendered t+1, Diff (columns 0, 1, 2)
             if temporal_key and temporal_key in temporal_frames:
-                frames = temporal_frames[temporal_key][idx]  # [T, H, W, C] where T=4 for multi-frame or T=2 for single-frame
+                frames = temporal_frames[temporal_key][idx]
                 num_temporal_frames = frames.shape[0]
+                context_count = min(3, max(1, num_temporal_frames - 1))
+                labels = temporal_labels[:context_count] if temporal_labels else None
+                context_frames = frames[:context_count]
 
-                # Detect single-frame mode: only 2 frames [t, t+1]
-                is_single_frame_mode = (num_temporal_frames == 2)
-
-                if is_single_frame_mode:
-                    # Single-frame mode: only show t in row 1, center column
-                    frame_t = frames[0]  # [H, W, C] - current frame t
-                    frame_t_np = frame_t.detach().cpu().numpy()
-                    frame_t_viz = np.clip((frame_t_np + 1.0) / 2.0, 0, 1)
-
-                    ax = fig.add_subplot(gs[0, 1])  # Center column
-                    ax.imshow(frame_t_viz)
-                    ax.set_title("t", fontsize=14)
+                if context_count == 1:
+                    frame_np = context_frames[0].detach().cpu().numpy()
+                    frame_viz = np.clip((frame_np + 1.0) / 2.0, 0, 1)
+                    ax = fig.add_subplot(gs[0, 1])
+                    ax.imshow(frame_viz)
+                    ax.set_title(labels[0] if labels else "t", fontsize=14)
                     ax.axis('off')
-
-                    # Leave side columns empty
                     for col in [0, 2]:
                         ax = fig.add_subplot(gs[0, col])
                         ax.axis('off')
-
-                    # Row 2, Column 0: Display t+1 frame
-                    frame_t1 = frames[1]  # [H, W, C] - future frame t+1
-                    frame_t1_np = frame_t1.detach().cpu().numpy()
-                    frame_t1_viz = np.clip((frame_t1_np + 1.0) / 2.0, 0, 1)
-
-                    ax_gt_t1 = fig.add_subplot(gs[1, 0])
-                    ax_gt_t1.imshow(frame_t1_viz)
-                    ax_gt_t1.set_title("t+1", fontsize=14)
-                    ax_gt_t1.axis('off')
                 else:
-                    # Multi-frame mode: Display first 3 frames (t-2, t-1, t)
-                    for t_idx in range(3):
-                        if t_idx < num_temporal_frames:
-                            frame = frames[t_idx]  # [H, W, C]
-                            frame_np = frame.detach().cpu().numpy()
-                            # Normalize from [-1, 1] to [0, 1]
-                            frame_viz = np.clip((frame_np + 1.0) / 2.0, 0, 1)
+                    for t_idx in range(min(3, context_count)):
+                        frame_np = context_frames[t_idx].detach().cpu().numpy()
+                        frame_viz = np.clip((frame_np + 1.0) / 2.0, 0, 1)
+                        ax = fig.add_subplot(gs[0, t_idx])
+                        ax.imshow(frame_viz)
+                        title = labels[t_idx] if labels and t_idx < len(labels) else f"ctx_{t_idx}"
+                        ax.set_title(title, fontsize=14)
+                        ax.axis('off')
 
-                            ax = fig.add_subplot(gs[0, t_idx])
-                            ax.imshow(frame_viz)
-                            ax.set_title(f"GT t-{2-t_idx}", fontsize=14)
-                            ax.axis('off')
-
-                    # Row 2, Column 0: Display 4th frame (t+1)
-                    if num_temporal_frames >= 4:
-                        frame_t1 = frames[3]  # [H, W, C]
-                        frame_t1_np = frame_t1.detach().cpu().numpy()
-                        frame_t1_viz = np.clip((frame_t1_np + 1.0) / 2.0, 0, 1)
-
-                        ax_gt_t1 = fig.add_subplot(gs[1, 0])
-                        ax_gt_t1.imshow(frame_t1_viz)
-                        ax_gt_t1.set_title(f"GT t+1", fontsize=14)
-                        ax_gt_t1.axis('off')
+                future_frame_idx = context_count if num_temporal_frames > context_count else num_temporal_frames - 1
+                frame_future = frames[future_frame_idx]
+                frame_future_np = frame_future.detach().cpu().numpy()
+                frame_future_viz = np.clip((frame_future_np + 1.0) / 2.0, 0, 1)
+                ax_gt_future = fig.add_subplot(gs[1, 0])
+                ax_gt_future.imshow(frame_future_viz)
+                ax_gt_future.set_title(future_label, fontsize=14)
+                ax_gt_future.axis('off')
             else:
-                # If no temporal frames, show placeholder
                 for row in range(2):
                     for col in range(3 if row == 0 else 1):
                         ax = fig.add_subplot(gs[row, col])
                         ax.text(0.5, 0.5, 'No temporal data', ha='center', va='center', fontsize=12)
                         ax.axis('off')
 
-            # Row 2, Column 1: Render t+1
             cam_params = {k: v[idx:idx+1] if isinstance(v, torch.Tensor) else v for k, v in cam_params_dict[view_name].items()}
-
             params_single = {
                "xyz": gaussian_params["xyz"][idx:idx+1],
                "sh": gaussian_params["sh"][idx:idx+1],
@@ -895,39 +854,26 @@ def visualize_rendering_comparison(step, gaussian_params, target_obs, cam_params
                "rotations": gaussian_params["rotations"][idx:idx+1]
             }
 
-            rendered_img = renderer(params_single, cam_params)  # [1, 3, H, W]
-            rendered_img = rendered_img.float()
-            rendered_np = rendered_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()  # [H, W, 3]
+            rendered_img = renderer(params_single, cam_params).float()
+            rendered_np = rendered_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
             rendered_viz = np.clip(rendered_np, 0, 1)
 
             ax_rendered = fig.add_subplot(gs[1, 1])
             ax_rendered.imshow(rendered_viz)
-            ax_rendered.set_title("render t+1", fontsize=14)
+            ax_rendered.set_title(f"render {future_label}", fontsize=14)
             ax_rendered.axis('off')
 
-            # Row 2, Column 2: Difference
-            # Get GT t+1 for comparison
-            gt_img = target_obs[f"{view_name}_image"][idx]  # [3, H, W]
-            gt_img = gt_img.float()
+            gt_img = target_obs[f"{view_name}_image"][idx].float()
             gt_np = gt_img.permute(1, 2, 0).detach().cpu().numpy()
             gt_viz = np.clip(gt_np, 0, 1)
-            
             diff_np = np.abs(rendered_viz - gt_viz)
 
             ax_diff = fig.add_subplot(gs[1, 2])
             ax_diff.imshow(diff_np)
-            ax_diff.set_title(f"Diff", fontsize=14)
+            ax_diff.set_title("Diff", fontsize=14)
             ax_diff.axis('off')
 
-            print(f"[Viz] Rendered {view_name} range: min={rendered_np.min():.4f}, max={rendered_np.max():.4f}, mean={rendered_np.mean():.4f}")
-            if rendered_np.max() < 1e-6:
-                print(f"[Viz] WARNING: Rendered image is all zeros or very small (max={rendered_np.max():.6f})!")
-
-    # Save visualization
-    if time_suffix:
-        save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}.png")
-    else:
-        save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}.png")
+    save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}.png" if time_suffix else f"render_viz_step_{step:06d}.png")
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Saved Rendering Visualization to {save_path}")
@@ -946,6 +892,7 @@ def visualize_future_rollout_comparison(
     base_rendered_obs=None,
     base_label="t/base",
     motion_weight_seq=None,
+    context_labels=None,
 ):
     """Visualize context + base render + multi-horizon future GT/render/diff in one figure."""
     import matplotlib
@@ -990,6 +937,17 @@ def visualize_future_rollout_comparison(
     if horizon_labels is None:
         horizon_labels = [f"t+{idx + 1}" for idx in range(horizon)]
 
+    if context_labels is None:
+        if len(context_frames) == 1:
+            context_labels = ["t"]
+        else:
+            context_labels = [
+                "t" if label_offset == 0 else f"t-{label_offset}"
+                for label_offset in range(len(context_frames) - 1, -1, -1)
+            ]
+    else:
+        context_labels = list(context_labels)
+
     show_base = base_target_obs is not None or base_rendered_obs is not None
     show_future_vs_base = base_rendered_obs is not None
     show_motion = motion_weight_seq is not None and len(motion_weight_seq) > 0
@@ -1017,11 +975,10 @@ def visualize_future_rollout_comparison(
     for col_idx, frame in enumerate(context_frames[:total_future_cols]):
         dst_col = start_col + col_idx
         axes[0, dst_col].imshow(frame)
-        if len(context_frames) == 1:
-            axes[0, dst_col].set_title("t", fontsize=13)
+        if col_idx < len(context_labels):
+            axes[0, dst_col].set_title(context_labels[col_idx], fontsize=13)
         else:
-            label_offset = len(context_frames) - col_idx - 1
-            axes[0, dst_col].set_title("t" if label_offset == 0 else f"t-{label_offset}", fontsize=13)
+            axes[0, dst_col].set_title(f"ctx_{col_idx}", fontsize=13)
 
     gt_key = f"{view_name}_image"
     base_gt_img = None

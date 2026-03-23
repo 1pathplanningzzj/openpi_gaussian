@@ -42,6 +42,10 @@ class Pi0Config(_model.BaseModelConfig):
     # Number of future frames to supervise in the world-model branch when using dense rollout.
     # When set to 5, the model predicts t+1 ... t+5 from a single future seed.
     future_prediction_horizon: int = 5
+    # Optional sparse temporal context offsets (in frame steps) for Gaussian/VGGT conditioning.
+    # These define the history slots packed before future supervision, e.g. (-10, -5, 0).
+    # The last offset should correspond to the current frame.
+    temporal_context_offsets: tuple[int, ...] | None = (-2, -1, 0)
     # Optional sparse future offsets (in frame steps) for world-model supervision, e.g. (2, 5, 10, 15, 20).
     # If provided, this overrides the dense t+1...t+H schedule while keeping H=len(offsets).
     future_prediction_offsets: tuple[int, ...] | None = None

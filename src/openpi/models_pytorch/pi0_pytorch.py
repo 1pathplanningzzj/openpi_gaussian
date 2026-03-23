@@ -38,6 +38,24 @@ def _resolve_future_prediction_offsets(config, default_horizon: int) -> list[int
     return list(range(1, max(1, int(default_horizon)) + 1))
 
 
+
+
+def _resolve_temporal_context_offsets(config, use_single_frame_mode: bool) -> list[int]:
+    """Resolve temporal context offsets in frame steps for context packing and labels."""
+    if use_single_frame_mode:
+        return [0]
+    raw_offsets = getattr(config, "temporal_context_offsets", None)
+    if raw_offsets:
+        offsets = [int(value) for value in raw_offsets]
+    else:
+        offsets = [-2, -1, 0]
+    if not offsets:
+        offsets = [0]
+    if offsets[-1] != 0:
+        raise ValueError(f"temporal_context_offsets must end with 0, got {tuple(offsets)}")
+    return offsets
+
+
 def create_sinusoidal_pos_embedding(
     time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
@@ -52,13 +70,12 @@ def create_sinusoidal_pos_embedding(
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
-    # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
     sin_input = scaling_factor[None, :] * time[:, None]
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
 
-# Timestep Sampling Schedule
-def sample_beta(alpha, beta, bsize, device):
+def sample_beta(alpha: float, beta: float, bsize: int, device) -> Tensor:
+    """Sample Beta-distributed timesteps."""
     alpha_t = torch.as_tensor(alpha, dtype=torch.float32, device=device)
     beta_t = torch.as_tensor(beta, dtype=torch.float32, device=device)
     dist = torch.distributions.Beta(alpha_t, beta_t)
@@ -138,6 +155,8 @@ class PI0Pytorch(nn.Module):
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
         use_single_frame_mode = getattr(config, "use_single_frame_mode", False)
+        self.temporal_context_offsets = _resolve_temporal_context_offsets(config, use_single_frame_mode)
+        self.temporal_context_count = len(self.temporal_context_offsets)
         # Typically Gaussian features join the prefix, so they must match the VLM width
         # Disable LGPD for now to test training stability
         # Option to unfreeze VGGT encoder/decoder for reconstruction loss training
@@ -148,7 +167,9 @@ class PI0Pytorch(nn.Module):
             use_gaussian,
             paligemma_config.width,
             use_lgpd=False,
+            num_frames=self.temporal_context_count,
             use_single_frame_mode=use_single_frame_mode,
+            temporal_context_offsets=tuple(self.temporal_context_offsets),
             unfreeze_encoder=unfreeze_vggt_encoder,
             unfreeze_decoder_only=unfreeze_vggt_decoder_only,
             use_lora=use_lora
@@ -180,9 +201,13 @@ class PI0Pytorch(nn.Module):
                 torch.randn(1, self.future_token_count, paligemma_config.width) * 0.02
             )
 
-            # Temporal base weights: learnable weights for combining [t-2, t-1, t] to form base
-            # Initialized to favor recent frames: [0.1, 0.2, 0.7]
-            self.temporal_base_w = nn.Parameter(torch.tensor([0.1, 0.2, 0.7]))
+            # Temporal base weights: learnable weights for combining configured context frames to form base
+            # Initialized to favor recent frames, especially the current frame at offset 0.
+            if self.temporal_context_count == 3:
+                init_temporal_base_w = torch.tensor([0.1, 0.2, 0.7], dtype=torch.float32)
+            else:
+                init_temporal_base_w = torch.linspace(0.0, 1.0, steps=self.temporal_context_count, dtype=torch.float32)
+            self.temporal_base_w = nn.Parameter(init_temporal_base_w)
 
             # Delta scale raw parameter. We optimize a raw scalar and map it via softplus
             # so the effective scale stays positive. Initialize so softplus(raw) = 0.3.
@@ -222,6 +247,9 @@ class PI0Pytorch(nn.Module):
             )
             self.future_query_cross_attn_q_norm = nn.LayerNorm(paligemma_config.width)
             self.future_query_cross_attn_kv_norm = nn.LayerNorm(paligemma_config.width)
+            self.future_query_frame_offset_embed = nn.Parameter(
+                torch.randn(self.temporal_context_count, paligemma_config.width) * 0.02
+            )
 
             # Roll out a single future seed into short-horizon latents [t+1, ..., t+H].
             self.future_horizon_embed = nn.Parameter(
@@ -245,7 +273,8 @@ class PI0Pytorch(nn.Module):
                 f"  - Token count: {self.future_token_count}\n"
                 f"  - Spatial structure: {self.future_grid_size}×{self.future_grid_size}\n"
                 f"  - Spatial positional encoding: {'Sinusoidal + Learnable' if self.use_sinusoidal_spatial else 'Learnable only'}\n"
-                f"  - Aligned with VGGT tokens: 768 (3 frames × 256 tokens/frame)\n"
+                f"  - Aligned with VGGT tokens: {self.temporal_context_count * self.future_token_count} "
+                f"({self.temporal_context_count} frames × {self.future_token_count} tokens/frame)\n"
                 f"  - Future rollout horizon: {self.future_prediction_horizon}\n"
                 f"  - Future rollout offsets: {self.future_prediction_offsets}"
             )
@@ -257,6 +286,7 @@ class PI0Pytorch(nn.Module):
             self.future_query_cross_attn = None
             self.future_query_cross_attn_q_norm = None
             self.future_query_cross_attn_kv_norm = None
+            self.future_query_frame_offset_embed = None
             self.future_horizon_embed = None
             self.future_rollout_mlp = None
         
@@ -487,24 +517,30 @@ class PI0Pytorch(nn.Module):
 
         return pe
 
-    def _prepare_attention_masks_4d(self, att_2d_masks):
-        """Helper method to prepare 4D attention masks for transformer."""
-        att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+    def _temporal_context_labels(self) -> list[str]:
+        labels = []
+        for offset in self.temporal_context_offsets:
+            if offset == 0:
+                labels.append("t")
+            elif offset > 0:
+                labels.append(f"t+{offset}")
+            else:
+                labels.append(f"t{offset}")
+        return labels
 
     def _temporal_context_future_indices(self, time_dim: int, use_single_frame_mode: bool) -> tuple[list[int], list[int], int]:
-        """Pick context / future frame indices along T.
+        """Pick context / future frame indices from packed temporal slots.
 
-        In single-frame world-model mode, the dataloader already materializes sparse supervision
-        slots in order ``[t, t+o1, t+o2, ...]`` for ``future_prediction_offsets=(o1, o2, ...)``.
-        In that case we should index those slots directly instead of reinterpreting T as a dense
-        consecutive timeline.
-
-        Otherwise (no world model, or multi-frame mode), keep the legacy dense-index behavior.
+        Expected packed layout:
+          - single-frame mode: [t, future...]
+          - multi-frame mode: [context..., future...]
+            where context is configured by temporal_context_offsets and ends at offset 0.
         """
-        context_frames = 1 if use_single_frame_mode else min(3, time_dim)
+        context_count = 1 if use_single_frame_mode else self.temporal_context_count
+        future_count = len(self.future_prediction_offsets) if self.use_world_tokens_in_prefix else 0
 
         def _legacy_consecutive() -> tuple[list[int], list[int], int]:
+            context_frames = 1 if use_single_frame_mode else min(context_count, time_dim)
             future_steps = max(0, min(self.future_prediction_horizon, time_dim - context_frames))
             context_start = max(0, time_dim - future_steps - context_frames)
             ctx = list(range(context_start, context_start + context_frames))
@@ -514,49 +550,36 @@ class PI0Pytorch(nn.Module):
         if not self.use_world_tokens_in_prefix:
             return _legacy_consecutive()
 
-        offsets = self.future_prediction_offsets
+        expected_t = context_count + future_count
+        if time_dim >= expected_t:
+            context_indices = list(range(context_count))
+            future_indices = list(range(context_count, expected_t))
+            return context_indices, future_indices, context_indices[-1]
 
-        if use_single_frame_mode:
-            expected_t = 1 + len(offsets)
-            if time_dim >= expected_t:
-                return [0], list(range(1, expected_t)), 0
-            if not getattr(self, "_warned_future_offset_fallback", False):
-                logging.warning(
-                    "World model: sparse future supervision expects time_dim >= %s for [t, %s], got %s. "
-                    "Using consecutive tail fallback.",
-                    expected_t,
-                    ", ".join(f"t+{offset}" for offset in offsets),
-                    time_dim,
-                )
-                self._warned_future_offset_fallback = True
-            return _legacy_consecutive()
+        if not getattr(self, "_warned_future_offset_fallback", False):
+            context_desc = ", ".join(self._temporal_context_labels()[:context_count])
+            future_desc = ", ".join(f"t+{offset}" for offset in self.future_prediction_offsets)
+            logging.warning(
+                "World model: packed temporal slots expect time_dim >= %s for [%s, %s], got %s. "
+                "Using consecutive tail fallback.",
+                expected_t,
+                context_desc,
+                future_desc,
+                time_dim,
+            )
+            self._warned_future_offset_fallback = True
+        return _legacy_consecutive()
 
-        max_off = max(offsets)
-        c_end = time_dim - 1 - max_off
-        need_t = max_off + context_frames
-        bad = c_end < 0 or (context_frames > 1 and c_end < context_frames - 1)
-        ctx_start = c_end - (context_frames - 1)
-        fut_try = [c_end + o for o in offsets]
-        if not bad:
-            bad = any(i < 0 or i >= time_dim for i in fut_try)
+    def _prepare_attention_masks_4d(self, att_2d_masks: torch.Tensor) -> torch.Tensor:
+        """Convert boolean pairwise attention mask [B, N, N] to additive 4D mask [B, 1, N, N]."""
+        if att_2d_masks.ndim != 3:
+            raise ValueError(f"Expected att_2d_masks with shape [B, N, N], got {att_2d_masks.shape}")
+        min_dtype = torch.finfo(torch.float32).min
+        additive_mask = torch.zeros_like(att_2d_masks, dtype=torch.float32)
+        additive_mask = additive_mask.masked_fill(~att_2d_masks, min_dtype)
+        return additive_mask[:, None, :, :]
 
-        if bad:
-            if not getattr(self, "_warned_future_offset_fallback", False):
-                logging.warning(
-                    "World model: time_dim=%s cannot fit future_prediction_offsets=%s (need T >= %s with "
-                    "this context_frames=%s). Using consecutive tail fallback — increase sequence length in data.",
-                    time_dim,
-                    offsets,
-                    need_t,
-                    context_frames,
-                )
-                self._warned_future_offset_fallback = True
-            return _legacy_consecutive()
-
-        ctx = list(range(ctx_start, c_end + 1))
-        return ctx, fut_try, c_end
-
-    def _preprocess_observation(self, observation, *, train=True):
+    def _preprocess_observation(self, observation, train: bool = True):
         """Helper method to preprocess observation."""
 
         # Check if single-frame mode is enabled
@@ -591,6 +614,12 @@ class PI0Pytorch(nn.Module):
                     curr_imgs, fut_imgs = {}, {}
                     # Save original temporal images for visualization before slicing
                     raw_temporal_images = {}
+                    if use_single_frame_mode:
+                        raw_temporal_labels = ["t"] + [f"t+{offset}" for offset in self.future_prediction_offsets]
+                    else:
+                        raw_temporal_labels = self._temporal_context_labels() + [
+                            f"t+{offset}" for offset in self.future_prediction_offsets
+                        ]
 
                     def _select_time_slices(tensor, indices, *, collapse_single=False):
                         if tensor is None or tensor.ndim < 2:
@@ -615,7 +644,11 @@ class PI0Pytorch(nn.Module):
                         if observation.state.ndim == 3:
                             # State has temporal dimension [B, T, D]
                             if observation.state.shape[1] == time_dim:
-                                curr_state = observation.state[:, idx_curr]
+                                curr_state = _select_time_slices(
+                                    observation.state,
+                                    context_indices,
+                                    collapse_single=use_single_frame_mode,
+                                )
                                 fut_state = _select_time_slices(
                                     observation.state, future_indices, collapse_single=len(future_indices) == 1
                                 )
@@ -720,7 +753,7 @@ class PI0Pytorch(nn.Module):
                         tokenized_prompt_mask=curr_prompt_mask,
                         depth=curr_depth  # Set depth for current frame
                     )
-                    
+
                     # Also preprocess future observation (normalization etc)
                     future_observation = _preprocessing.preprocess_observation_pytorch(future_observation, train=False)
 
@@ -731,10 +764,9 @@ class PI0Pytorch(nn.Module):
         # with preserved temporal dimension, not the original one
         preprocessed_observation = observation
 
-        # Attach raw temporal images for visualization if available
         if 'raw_temporal_images' in locals() and raw_temporal_images:
-            # Store as a separate attribute for visualization
             preprocessed_observation.raw_temporal_images = raw_temporal_images
+            preprocessed_observation.raw_temporal_labels = raw_temporal_labels
 
         return (
             list(observation.images.values()),
@@ -1261,6 +1293,7 @@ class PI0Pytorch(nn.Module):
                     with torch.no_grad():
                         try:
                             temporal_frames = {}
+                            temporal_labels = getattr(preprocessed_observation, "raw_temporal_labels", None)
                             if hasattr(preprocessed_observation, "raw_temporal_images"):
                                 temporal_frames = preprocessed_observation.raw_temporal_images
                                 for key, value in temporal_frames.items():
@@ -1271,6 +1304,10 @@ class PI0Pytorch(nn.Module):
                                         temporal_frames[key] = value
                                         logging.info(f"[Viz] Extracted {key} with shape {value.shape}")
 
+                            future_label = "future"
+                            if time_suffix.startswith("_tplus"):
+                                future_label = time_suffix[len("_"):].replace("_pred_vlm", "")
+
                             self._visualize_rendering_comparison(
                                 step,
                                 gaussian_params,
@@ -1279,6 +1316,8 @@ class PI0Pytorch(nn.Module):
                                 view_names=render_views,
                                 time_suffix=time_suffix,
                                 temporal_frames=temporal_frames,
+                                temporal_labels=temporal_labels,
+                                future_label=future_label,
                             )
                         except Exception as viz_error:
                             logging.warning(f"Step {step}{time_suffix}: Visualization failed: {viz_error}")
@@ -1461,44 +1500,43 @@ class PI0Pytorch(nn.Module):
 
                 if use_single_frame_mode:
                     # Single-frame mode: use current frame t as base
-                    # gaussian_embs: [B, 256, D] (1 frame × 256 tokens)
-                    # Semantic: future = current_latent + learnable_delta
-                    if num_tokens == 256:
+                    if num_tokens == self.future_token_count:
                         z_base = gaussian_embs  # [B, 256, D]
+                        gaussian_for_cross_attn = gaussian_embs
                     else:
-                        # Unexpected shape in single-frame mode
-                        logging.warning(f"Single-frame mode expects 256 tokens, got {num_tokens}. Using zero base.")
+                        logging.warning(f"Single-frame mode expects {self.future_token_count} tokens, got {num_tokens}. Using zero base.")
                         z_base = torch.zeros(B, self.future_token_count, D, device=device, dtype=future_dtype)
+                        gaussian_for_cross_attn = gaussian_embs
                 else:
-                    # Multi-frame mode: weighted fusion of [t-2, t-1, t]
-                    # gaussian_embs: [B, 768, D] (3 frames × 256 tokens)
-                    # Semantic: future = weighted_history + learnable_delta
-                    if num_tokens == 768:  # 3 frames * 256 tokens (training)
-                        # Reshape to [B, 3, 256, D] for [t-2, t-1, t]
-                        g = gaussian_embs.view(B, 3, 256, -1)
-                        z_t2, z_t1, z_t = g[:, 0], g[:, 1], g[:, 2]  # Each [B, 256, D]
+                    expected_context_tokens = self.temporal_context_count * self.future_token_count
+                    if num_tokens == expected_context_tokens:
+                        g = gaussian_embs.view(B, self.temporal_context_count, self.future_token_count, -1)
+                        w = torch.softmax(self.temporal_base_w[: self.temporal_context_count], dim=0)
+                        z_base = torch.sum(w.view(1, self.temporal_context_count, 1, 1) * g, dim=1)
 
-                        # Learnable temporal weighting (softmax to ensure sum=1, stable)
-                        w = torch.softmax(self.temporal_base_w, dim=0)  # [3]
-                        z_base = w[0] * z_t2 + w[1] * z_t1 + w[2] * z_t  # [B, 256, D]
-
-                    elif num_tokens == 256:  # Single frame (inference fallback or single-frame mode)
-                        # Use the single frame as base
-                        z_base = gaussian_embs  # [B, 256, D]
-
+                        frame_offset_embed = self.future_query_frame_offset_embed[: self.temporal_context_count].to(gaussian_embs.dtype)
+                        gaussian_for_cross_attn = (
+                            g + frame_offset_embed.view(1, self.temporal_context_count, 1, -1)
+                        ).reshape(B, expected_context_tokens, -1)
+                    elif num_tokens == self.future_token_count:
+                        z_base = gaussian_embs
+                        gaussian_for_cross_attn = gaussian_embs
                     else:
-                        # Unexpected shape: use zero base
-                        logging.warning(f"Multi-frame mode expects 768 tokens, got {num_tokens}. Using zero base.")
+                        logging.warning(
+                            f"Multi-frame mode expects {expected_context_tokens} tokens, got {num_tokens}. Using zero base."
+                        )
                         z_base = torch.zeros(B, self.future_token_count, D, device=device, dtype=future_dtype)
+                        gaussian_for_cross_attn = gaussian_embs
             else:
                 # No gaussian_embs: use zero base
                 z_base = torch.zeros(B, self.future_token_count, token_dim, device=device, dtype=future_dtype)
+                gaussian_for_cross_attn = None
 
             # 2. Delta query tokens (learnable, predict changes)
             delta_q = self.future_query_tokens.expand(B, -1, -1)  # [B, 256, D]
-            if gaussian_embs is not None and self.future_query_cross_attn is not None:
+            if gaussian_for_cross_attn is not None and self.future_query_cross_attn is not None:
                 query_tokens = self.future_query_cross_attn_q_norm(delta_q)
-                key_value_tokens = self.future_query_cross_attn_kv_norm(gaussian_embs.to(delta_q.dtype))
+                key_value_tokens = self.future_query_cross_attn_kv_norm(gaussian_for_cross_attn.to(delta_q.dtype))
                 cross_attn_out, _ = self.future_query_cross_attn(
                     query_tokens,
                     key_value_tokens,
@@ -1788,7 +1826,7 @@ class PI0Pytorch(nn.Module):
         
         return total_loss
 
-    def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names, time_suffix="", temporal_frames=None):
+    def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names, time_suffix="", temporal_frames=None, temporal_labels=None, future_label="future"):
         """Helper to visualize Rendered vs GT images. Delegated to GaussianRenderer."""
         # Cleanly moved to gaussian_renderer.py
         from openpi.models_pytorch.gaussian_renderer import visualize_rendering_comparison
@@ -1802,7 +1840,9 @@ class PI0Pytorch(nn.Module):
             view_names,
             save_dir=self.vis_save_dir,
             time_suffix=time_suffix,
-            temporal_frames=temporal_frames
+            temporal_frames=temporal_frames,
+            temporal_labels=temporal_labels,
+            future_label=future_label,
         )
 
     def _get_temporal_frames_for_viz(self, preprocessed_observation):
@@ -2017,6 +2057,7 @@ class PI0Pytorch(nn.Module):
             base_rendered_obs=base_rendered_obs,
             base_label="t/base",
             motion_weight_seq=motion_weight_seq,
+            context_labels=getattr(preprocessed_observation, "raw_temporal_labels", self._temporal_context_labels()),
         )
         self._log_future_rollout_pixel_lpips(step, rendered_obs_seq)
 

@@ -425,6 +425,7 @@ class GaussianDecoder(nn.Module):
         static_reference_params: dict,
         velocity_time_factor: float,
         step: int | None,
+        base_depth: torch.Tensor | None = None,
     ) -> dict:
         """Reuse the base Gaussian template and predict gated future dynamics via delta xyz only."""
         B, num_tokens, D = z.shape
@@ -457,6 +458,17 @@ class GaussianDecoder(nn.Module):
 
         z_cam = xyz[..., 2].reshape(B, H, W)
         depth_map = z_cam.unsqueeze(1).clamp(min=0.0, max=8.0)
+        depth_delta_map = None
+        if base_depth is not None:
+            if base_depth.ndim == 4:
+                base_depth_map = base_depth.squeeze(1)
+            else:
+                base_depth_map = base_depth
+            if base_depth_map.shape[-2:] != depth_map.shape[-2:]:
+                base_depth_map = F.interpolate(
+                    base_depth_map.unsqueeze(1), size=depth_map.shape[-2:], mode="bilinear", align_corners=False
+                ).squeeze(1)
+            depth_delta_map = depth_map - base_depth_map.unsqueeze(1)
         motion_gate_map = motion_gate.reshape(B, H, W)
 
         if step is not None and step % 400 == 0:
@@ -475,7 +487,7 @@ class GaussianDecoder(nn.Module):
             "sh": static_reference_params["sh"],
             "rotations": static_reference_params["rotations"],
             "depth_map": depth_map,
-            "depth_delta_map": None,
+            "depth_delta_map": depth_delta_map,
             "motion_gate_map": motion_gate_map,
             "raw_delta_xyz": raw_delta,
         }
@@ -514,7 +526,7 @@ class GaussianDecoder(nn.Module):
             and self.velocity_token_mlp is not None
         ):
             return self._decode_velocity_from_static(
-                z, static_reference_params, velocity_time_factor, step
+                z, static_reference_params, velocity_time_factor, step, base_depth=base_depth
             )
 
         vggt_obs = current_observation if current_observation is not None else future_observation

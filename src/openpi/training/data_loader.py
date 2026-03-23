@@ -19,6 +19,23 @@ import openpi.transforms as _transforms
 T_co = TypeVar("T_co", covariant=True)
 
 
+def _resolve_temporal_context_offsets(model_config: _model.BaseModelConfig, fps: float) -> list[float]:
+    """Resolve temporal context offsets in seconds from config."""
+    raw_offsets = getattr(model_config, "temporal_context_offsets", None)
+    if raw_offsets:
+        offsets = [int(value) for value in raw_offsets]
+    else:
+        offsets = [-2, -1, 0]
+
+    if not offsets:
+        offsets = [0]
+    if offsets[-1] != 0:
+        raise ValueError(
+            f"temporal_context_offsets must end with 0 (current frame), got {tuple(offsets)}"
+        )
+    return [round(value / fps, 2) for value in offsets]
+
+
 def _resolve_future_prediction_offsets(model_config: _model.BaseModelConfig, fps: float) -> list[float]:
     """Resolve future supervision offsets in seconds from config.
 
@@ -162,7 +179,7 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.dataset_root)
-    
+
     # Calculate delta timestamps
     # LeRobot validation expects timestamps to be multiples of 1/10 (0.1) seconds
     # If dataset fps is not 10, we need to round timestamps to 0.1 second intervals
@@ -172,29 +189,33 @@ def create_torch_dataset(
     delta_timestamps = {
         key: [round(t / action_fps, 2) for t in range(action_horizon)] for key in data_config.action_sequence_keys
     }
-    
+
     # Log actual fps for debugging
     if dataset_meta.fps != action_fps:
         print(f"WARNING: Dataset fps ({dataset_meta.fps}) != action_fps ({action_fps}). "
               f"Using {action_fps} fps for action delta_timestamps to match LeRobot validation.")
-    
+
     # Detect image keys from features
     # robustly find any key containing "image" or "rgb" if the strict prefix check fails
     image_keys = [k for k, f in dataset_meta.features.items() if k.startswith("observation.images")]
     if not image_keys:
         image_keys = [k for k in dataset_meta.features.keys() if "image" in k or "rgb" in k]
         # Filter out depth or other things if necessary, but usually ok
-        
+
     print(f"DEBUG: Found image keys: {image_keys} with FPS: {dataset_meta.fps}")
 
     # Request frames for images based on mode.
-    # Multi-frame mode: [t-2, t-1, t, t+1, ..., t+H]
-    # Single-frame mode: [t, t+1, ..., t+H]
-    # where H is the world-model future supervision horizon.
-    # Use 0.1 second intervals to match LeRobot validation.
+    # Multi-frame mode: [ctx..., future...]
+    # Single-frame mode: [t, future...]
+    # where ctx is configured by temporal_context_offsets and H is the future supervision horizon.
     image_fps = 10.0  # Use standard 10 fps for image timestamps
+    context_image_offsets = _resolve_temporal_context_offsets(model_config, image_fps)
     future_image_offsets = _resolve_future_prediction_offsets(model_config, image_fps)
     future_prediction_horizon = len(future_image_offsets)
+    context_offset_labels = ", ".join(
+        "t" if abs(offset) < 1e-6 else f"t{int(round(offset * image_fps)):+d}"
+        for offset in context_image_offsets
+    )
     future_offset_labels = ", ".join(f"t+{int(round(offset * image_fps))}" for offset in future_image_offsets)
     for key in image_keys:
         if use_single_frame_mode:
@@ -205,16 +226,11 @@ def create_torch_dataset(
                 f"(VGGT uses [t], World Model uses [{future_offset_labels}])"
             )
         else:
-            delta_timestamps[key] = [
-                round(-2.0 / image_fps, 2),
-                round(-1.0 / image_fps, 2),
-                0.0,
-                *future_image_offsets,
-            ]
+            delta_timestamps[key] = [*context_image_offsets, *future_image_offsets]
             print(
                 "DEBUG: [Multi-frame mode] Requesting frames "
                 f"{delta_timestamps[key]} for key {key} "
-                f"(VGGT uses [t-2, t-1, t], World Model uses [{future_offset_labels}])"
+                f"(VGGT uses [{context_offset_labels}], World Model uses [{future_offset_labels}])"
             )
         print(f"DEBUG: Using image_fps={image_fps} (dataset_meta.fps={dataset_meta.fps})")
 
@@ -247,15 +263,10 @@ def create_torch_dataset(
                     f"({1 + future_prediction_horizon} frames for [t, {future_offset_labels}])"
                 )
             else:
-                delta_timestamps[depth_key] = [
-                    round(-2.0 / image_fps, 2),
-                    round(-1.0 / image_fps, 2),
-                    0.0,
-                    *future_image_offsets,
-                ]
+                delta_timestamps[depth_key] = [*context_image_offsets, *future_image_offsets]
                 print(
                     f"DEBUG: [Multi-frame mode] Added depth data with key: {depth_key} "
-                    f"({3 + future_prediction_horizon} frames for [t-2, t-1, t, {future_offset_labels}])"
+                    f"({len(context_image_offsets) + future_prediction_horizon} frames for [{context_offset_labels}, {future_offset_labels}])"
                 )
             break
 
