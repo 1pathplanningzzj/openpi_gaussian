@@ -114,6 +114,101 @@ def make_att_2d_masks(pad_masks, att_masks):
     return att_2d_masks & pad_2d_masks
 
 
+class MotionAwareTemporalBlock(nn.Module):
+    """Implements DynamicVGGT-style temporal-only MTA over the frame axis."""
+
+    def __init__(self, embed_dim: int = 512, num_heads: int = 8, dropout: float = 0.1, max_temporal_frames: int = 8):
+        super().__init__()
+        self.max_temporal_frames = max_temporal_frames
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=dropout,
+        )
+        self.temporal_bias = nn.Parameter(torch.zeros(max_temporal_frames, max_temporal_frames))
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 4, embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Apply self-attention independently for each token slot along time.
+
+        Args:
+            x: [B, T, K, D]
+        Returns:
+            [B, T, K, D]
+        """
+        bsz, num_frames, num_slots, dim = x.shape
+        if num_frames > self.max_temporal_frames:
+            raise ValueError(
+                f"MotionAwareTemporalBlock supports up to {self.max_temporal_frames} temporal frames, got {num_frames}"
+            )
+        x_norm = self.norm1(x)
+        x_time = x_norm.permute(0, 2, 1, 3).reshape(bsz * num_slots, num_frames, dim)
+        temporal_bias = self.temporal_bias[:num_frames, :num_frames].to(device=x_time.device, dtype=x_time.dtype)
+        attn_out, _ = self.attn(x_time, x_time, x_time, attn_mask=temporal_bias, need_weights=False)
+        attn_out = attn_out.reshape(bsz, num_slots, num_frames, dim).permute(0, 2, 1, 3)
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class MotionAwareTemporalEncoder(nn.Module):
+    """Three-layer MTA encoder following paper equations (5)-(9)."""
+
+    def __init__(
+        self,
+        embed_dim: int = 512,
+        num_heads: int = 8,
+        num_layers: int = 3,
+        dropout: float = 0.1,
+        max_temporal_frames: int = 8,
+    ):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            MotionAwareTemporalBlock(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                max_temporal_frames=max_temporal_frames,
+            )
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, motion_tokens: Tensor, layer_features: list[Tensor]) -> Tensor:
+        """Run layer-wise MTA and return motion tokens from the final layer.
+
+        Args:
+            motion_tokens: [B, T, M, D]
+            layer_features: three tensors of shape [B, T, N, D] corresponding to layers 11/17/23
+        Returns:
+            final motion tokens: [B, T, M, D]
+        """
+        if len(layer_features) != len(self.blocks):
+            raise ValueError(f"Expected {len(self.blocks)} layer features, got {len(layer_features)}")
+
+        prev_patch = None
+        current_motion = motion_tokens
+        for block, patch_tokens in zip(self.blocks, layer_features, strict=True):
+            if prev_patch is not None:
+                patch_input = patch_tokens + prev_patch
+            else:
+                patch_input = patch_tokens
+            block_input = torch.cat([current_motion, patch_input], dim=2)
+            block_output = block(block_input)
+            motion_dim = current_motion.shape[2]
+            current_motion = block_output[:, :, :motion_dim, :]
+            prev_patch = patch_tokens
+        return current_motion
+
+
 class PI0Pytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -129,7 +224,6 @@ class PI0Pytorch(nn.Module):
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
         )
-
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
 
@@ -238,6 +332,15 @@ class PI0Pytorch(nn.Module):
                     )
                 )
 
+            self.future_query_to_mta = nn.Linear(paligemma_config.width, 512)
+            self.future_mta_encoder = MotionAwareTemporalEncoder(
+                embed_dim=512,
+                num_heads=8,
+                num_layers=3,
+                max_temporal_frames=max(1, self.temporal_context_count),
+            )
+            self.mta_to_future = nn.Linear(512, paligemma_config.width)
+
             # Let future queries read the current Gaussian scene tokens before
             # forming the future seed tokens.
             self.future_query_cross_attn = nn.MultiheadAttention(
@@ -283,12 +386,17 @@ class PI0Pytorch(nn.Module):
             self.future_token_count = 0
             self.world_token_proj = None
             self.future_query_tokens = None
+            self.future_query_to_mta = None
+            self.future_mta_encoder = None
+            self.mta_to_future = None
             self.future_query_cross_attn = None
             self.future_query_cross_attn_q_norm = None
             self.future_query_cross_attn_kv_norm = None
             self.future_query_frame_offset_embed = None
             self.future_horizon_embed = None
+            self.future_rollout_attn = None
             self.future_rollout_mlp = None
+
         
         # --- VAE Token Compressor (Option B: Hybrid) ---
         # VAE is used only for reconstruction supervision (auxiliary loss)
@@ -313,16 +421,26 @@ class PI0Pytorch(nn.Module):
 
         # --- GaussianDecoder (replaces CrossAttentionWorldModel) ---
         self.use_velocity_future_gaussians = False
+        self.use_shared_motion_query_velocity = False
         if hasattr(config, "use_world_model") and config.use_world_model:
             logging.info("Initializing GaussianDecoder...")
 
             _vel_g = bool(getattr(config, "use_velocity_future_gaussians", False)) and self.use_world_tokens_in_prefix
             self.use_velocity_future_gaussians = _vel_g
+            self.use_shared_motion_query_velocity = _vel_g and bool(
+                getattr(config, "use_shared_motion_query_velocity", True)
+            )
             if _vel_g:
-                logging.info(
-                    "Velocity future Gaussians: horizon 0 = full decode; h>0 = static + v(z_h) "
-                    f"(velocity_world_model_scale={getattr(config, 'velocity_world_model_scale', 0.15)})"
-                )
+                if self.use_shared_motion_query_velocity:
+                    logging.info(
+                        "Velocity future Gaussians: paper-style shared motion query with static current template "
+                        f"(velocity_world_model_scale={getattr(config, 'velocity_world_model_scale', 0.15)})"
+                    )
+                else:
+                    logging.info(
+                        "Velocity future Gaussians: horizon 0 = full decode; h>0 = static + v(z_h) "
+                        f"(velocity_world_model_scale={getattr(config, 'velocity_world_model_scale', 0.15)})"
+                    )
 
             self.world_model = GaussianDecoder(
                 token_dim=paligemma_config.width,
@@ -362,6 +480,7 @@ class PI0Pytorch(nn.Module):
         else:
             self.world_model = None
             self.gaussian_renderer = None
+            self.use_shared_motion_query_velocity = False
 
         # Initialize render loss weight (can be changed dynamically for staged training)
         self.render_loss_weight = getattr(config, "render_loss_weight", 0.1)  # 降低render loss权重，让action loss主导
@@ -919,6 +1038,29 @@ class PI0Pytorch(nn.Module):
 
         return torch.stack(rollout_tokens, dim=1), torch.stack(rollout_deltas, dim=1)  # [B, H, N, D]
 
+    def _build_shared_motion_query_rollout(
+        self, future_motion_query: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build paper-style shared constant-velocity motion queries for all horizons."""
+        horizon = max(0, self.future_prediction_horizon)
+        if horizon <= 0:
+            empty = future_motion_query[:, None, :, :].new_zeros(
+                future_motion_query.shape[0], 0, future_motion_query.shape[1], future_motion_query.shape[2]
+            )
+            return empty, empty
+
+        device = future_motion_query.device
+        dtype = future_motion_query.dtype
+        offsets = torch.tensor(
+            self.future_prediction_offsets[:horizon], device=device, dtype=dtype
+        )
+        base_offset = offsets[0].clamp_min(1.0)
+        time_factors = (offsets / base_offset).view(1, horizon, 1, 1)
+        shared_queries = future_motion_query.unsqueeze(1).expand(-1, horizon, -1, -1)
+        motion_deltas = shared_queries * time_factors
+        future_motion_queries = shared_queries
+        return future_motion_queries, motion_deltas
+
     def _get_temporal_observation_length(self, observation) -> int:
         """Infer the temporal length stored in a future observation sequence."""
         if observation is None:
@@ -1068,6 +1210,314 @@ class PI0Pytorch(nn.Module):
         gate_target = torch.clamp(gate_target, min=0.0, max=1.0)
         return gate_target
 
+    def _compute_gaussian_supervision_loss(
+        self,
+        gaussian_params: dict,
+        target_observation,
+        reference_observation,
+        *,
+        step: int | None = None,
+        time_suffix: str = "",
+        visualize: bool = True,
+        horizon_idx: int = 0,
+        return_gaussian_params: bool = False,
+    ):
+        """Compute depth / render supervision for already-decoded Gaussian parameters."""
+        device = next(
+            (value.device for value in gaussian_params.values() if torch.is_tensor(value)),
+            None,
+        )
+        if device is None:
+            raise ValueError("gaussian_params must contain at least one tensor")
+
+        total_loss = torch.zeros((), dtype=torch.float32, device=device)
+
+        import torch.distributed as dist
+
+        is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+        gaussian_params = dict(gaussian_params)
+
+        base_depth = getattr(reference_observation, "depth", None)
+        if base_depth is not None and base_depth.ndim == 5:
+            base_depth = base_depth[:, -1]
+
+        depth_map = gaussian_params.pop("depth_map", None)
+        depth_delta_map = gaussian_params.pop("depth_delta_map", None)
+        motion_gate_map = gaussian_params.pop("motion_gate_map", None)
+        raw_delta_xyz = gaussian_params.pop("raw_delta_xyz", None)
+
+        if step is not None and step % 400 == 0:
+            depth_delta_mean = float("nan")
+            depth_delta_abs_mean = float("nan")
+            depth_delta_abs_max = float("nan")
+            raw_delta_abs_mean = float("nan")
+            if depth_delta_map is not None:
+                delta_stats_map = depth_delta_map.float()
+                depth_delta_mean = delta_stats_map.mean().item()
+                depth_delta_abs_mean = delta_stats_map.abs().mean().item()
+                depth_delta_abs_max = delta_stats_map.abs().max().item()
+            if raw_delta_xyz is not None:
+                raw_delta_abs_mean = raw_delta_xyz.float().abs().mean().item()
+            logging.info(
+                f"Step {step}{time_suffix}: depth_map={depth_map is not None}, "
+                f"depth_delta_map={depth_delta_map is not None}, "
+                f"motion_gate_map={motion_gate_map is not None}, "
+                f"raw_delta_abs_mean={raw_delta_abs_mean:.6f}, "
+                f"has_depth_attr={hasattr(target_observation, 'depth')}, "
+                f"depth_value={target_observation.depth is not None if hasattr(target_observation, 'depth') else 'N/A'}, "
+                f"depth_delta_mean={depth_delta_mean:.6f}, "
+                f"depth_delta_abs_mean={depth_delta_abs_mean:.6f}, "
+                f"depth_delta_abs_max={depth_delta_abs_max:.6f}"
+            )
+
+        if depth_map is not None and hasattr(target_observation, "depth") and target_observation.depth is not None:
+            gt_depth = target_observation.depth
+            if depth_map.shape != gt_depth.shape:
+                depth_map = F.interpolate(
+                    depth_map, size=gt_depth.shape[-2:], mode="bilinear", align_corners=False
+                )
+            depth_loss = F.l1_loss(depth_map, gt_depth)
+            if torch.isfinite(depth_loss):
+                total_loss = total_loss + self.depth_loss_weight * depth_loss
+            if step is not None and step % 400 == 0:
+                logging.info(
+                    f"Step {step}{time_suffix}: Depth Loss = {depth_loss.item():.6f}, "
+                    f"weight={self.depth_loss_weight}"
+                )
+
+            if (
+                depth_delta_map is not None
+                and base_depth is not None
+                and self.delta_depth_loss_weight > 0.0
+                and (not self.delta_depth_first_horizon_only or horizon_idx == 0)
+            ):
+                if base_depth.ndim == 3:
+                    base_depth_for_delta = base_depth.unsqueeze(1)
+                else:
+                    base_depth_for_delta = base_depth
+                if base_depth_for_delta.shape[-2:] != gt_depth.shape[-2:]:
+                    base_depth_for_delta = F.interpolate(
+                        base_depth_for_delta, size=gt_depth.shape[-2:], mode="bilinear", align_corners=False
+                    )
+                gt_depth_delta = gt_depth - base_depth_for_delta
+                if depth_delta_map.shape != gt_depth_delta.shape:
+                    depth_delta_map = F.interpolate(
+                        depth_delta_map, size=gt_depth_delta.shape[-2:], mode="bilinear", align_corners=False
+                    )
+                delta_depth_loss = F.smooth_l1_loss(depth_delta_map, gt_depth_delta)
+                if torch.isfinite(delta_depth_loss):
+                    total_loss = total_loss + self.delta_depth_loss_weight * delta_depth_loss
+                if step is not None and step % 400 == 0:
+                    logging.info(
+                        f"Step {step}{time_suffix}: Delta Depth Loss = {delta_depth_loss.item():.6f}, "
+                        f"weight={self.delta_depth_loss_weight}, horizon_idx={horizon_idx}"
+                    )
+
+        for key, value in gaussian_params.items():
+            if torch.is_tensor(value) and (torch.isnan(value).any() or torch.isinf(value).any()):
+                gaussian_params[key] = torch.where(torch.isfinite(value), value, torch.zeros_like(value))
+
+        target_obs = {}
+        cam_params_dict = {}
+        valid_views = []
+
+        for key, value in target_observation.images.items():
+            img_tensor = value
+            key_lower = key.lower()
+            view_name = None
+            if key == "image" or "agent" in key_lower or "high" in key_lower or "cam_high" in key_lower or "exterior" in key_lower or "base" in key_lower:
+                view_name = "agent"
+            elif "left_wrist" in key_lower or "wrist_left" in key_lower:
+                view_name = "wrist"
+            elif "right_wrist" in key_lower or "wrist_right" in key_lower:
+                if img_tensor.min() == img_tensor.max() == -1.0:
+                    continue
+                view_name = "wrist"
+            elif "wrist" in key_lower or "bravo" in key_lower:
+                view_name = "wrist"
+
+            if view_name:
+                if img_tensor.shape[1] != 3 and img_tensor.shape[-1] == 3:
+                    img_tensor = img_tensor.permute(0, 3, 1, 2)
+                img_tensor = (img_tensor + 1.0) / 2.0
+                view_key = f"{view_name}_image"
+                if view_key not in target_obs:
+                    target_obs[view_key] = img_tensor
+                    cam_params_dict[view_name] = self._get_camera_params_for_view(view_name, device, img_tensor.shape[0])
+                    valid_views.append(view_name)
+
+        if valid_views:
+            render_views = ["agent"] if "agent" in valid_views else valid_views
+            motion_weight_maps = {}
+            for render_view in render_views:
+                view_key = f"{render_view}_image"
+                current_image = self._extract_reference_view_image(reference_observation, render_view)
+                future_image = target_obs[view_key]
+                current_depth_for_view = base_depth if render_view == "agent" else None
+                future_depth_for_view = (
+                    target_observation.depth
+                    if render_view == "agent" and hasattr(target_observation, "depth")
+                    else None
+                )
+                motion_weight_maps[render_view] = self._build_future_motion_weight_map(
+                    current_image,
+                    future_image,
+                    current_depth_for_view,
+                    future_depth_for_view,
+                )
+
+            render_loss, render_loss_dict = compute_multi_view_rendering_loss(
+                gaussian_params,
+                target_obs,
+                cam_params_dict,
+                self.gaussian_renderer,
+                M_attn_dict=motion_weight_maps,
+                view_names=render_views,
+                step=step,
+                depth_map=depth_map,
+                lambda_scale=0.001,
+                lambda_opacity=0.01,
+                lambda_edge_smooth=0.01,
+                lpips_fn=self.lpips_fn,
+                lpips_weight=self.lpips_weight,
+            )
+            if torch.isfinite(render_loss):
+                total_loss = total_loss + self.render_loss_weight * render_loss.to(total_loss.dtype)
+
+            if motion_gate_map is not None and "agent" in motion_weight_maps:
+                gate_target = self._build_future_motion_gate_target(motion_weight_maps["agent"])
+                gate_pred = motion_gate_map.float()
+                if gate_pred.shape != gate_target.shape:
+                    gate_pred = F.interpolate(
+                        gate_pred.unsqueeze(1), size=gate_target.shape[-2:], mode="bilinear", align_corners=False
+                    ).squeeze(1)
+                motion_gate_loss = F.smooth_l1_loss(gate_pred, gate_target)
+                if torch.isfinite(motion_gate_loss):
+                    total_loss = total_loss + self.future_motion_gate_loss_weight * motion_gate_loss
+                render_loss_dict["loss_motion_gate"] = motion_gate_loss
+                if step is not None and step % 400 == 0:
+                    logging.info(
+                        f"Step {step}{time_suffix}: Motion Gate Loss = {motion_gate_loss.item():.6f}, "
+                        f"weight={self.future_motion_gate_loss_weight}, gate_mean={gate_pred.mean().item():.4f}, "
+                        f"target_mean={gate_target.mean().item():.4f}"
+                    )
+
+            if "sh" in gaussian_params:
+                sh_dc = gaussian_params["sh"]
+                sh_dc_reg = (sh_dc ** 2).mean() * 0.01
+                total_loss = total_loss + sh_dc_reg
+                if step is not None and step % 400 == 0:
+                    logging.info(
+                        f"Step {step}{time_suffix}: SH DC Reg = {sh_dc_reg.item():.6f}, "
+                        f"SH DC mean = {sh_dc.mean().item():.6f}"
+                    )
+
+            should_log = step is not None and step % 400 == 0
+            if should_log:
+                loss_parts = ", ".join(f"{k}={v.item():.6f}" for k, v in render_loss_dict.items())
+                weight_parts = ", ".join(
+                    f"{name}=mean:{weight.mean().item():.4f}/max:{weight.max().item():.4f}"
+                    for name, weight in motion_weight_maps.items()
+                )
+                logging.info(
+                    f"Step {step}{time_suffix}: Render Loss = {render_loss.item():.4f}, "
+                    f"weight={self.render_loss_weight}, breakdown: {loss_parts}, motion_weights: {weight_parts}"
+                )
+
+            if visualize and should_log and is_main_process:
+                with torch.no_grad():
+                    try:
+                        temporal_frames = {}
+                        temporal_labels = getattr(reference_observation, "raw_temporal_labels", None)
+                        if hasattr(reference_observation, "raw_temporal_images"):
+                            temporal_frames = reference_observation.raw_temporal_images
+                            for key, value in temporal_frames.items():
+                                logging.info(f"[Viz] Extracted raw temporal {key} with shape {value.shape}")
+                        elif hasattr(reference_observation, "images"):
+                            for key, value in reference_observation.images.items():
+                                if value.ndim == 5 and value.shape[1] >= 2:
+                                    temporal_frames[key] = value
+                                    logging.info(f"[Viz] Extracted {key} with shape {value.shape}")
+
+                        future_label = "current" if "current" in time_suffix or "static" in time_suffix else "future"
+                        if time_suffix.startswith("_tplus"):
+                            future_label = time_suffix[len("_"):].replace("_pred_vlm", "")
+
+                        self._visualize_rendering_comparison(
+                            step,
+                            gaussian_params,
+                            target_obs,
+                            cam_params_dict,
+                            view_names=render_views,
+                            time_suffix=time_suffix,
+                            temporal_frames=temporal_frames,
+                            temporal_labels=temporal_labels,
+                            future_label=future_label,
+                        )
+                    except Exception as viz_error:
+                        logging.warning(f"Step {step}{time_suffix}: Visualization failed: {viz_error}")
+
+        if return_gaussian_params:
+            return total_loss, gaussian_params
+        return total_loss
+
+    def _compute_current_frame_recon_loss(
+        self,
+        z_current: torch.Tensor,
+        current_target,
+        *,
+        step: int | None = None,
+        time_suffix: str = "_t_current_static",
+        visualize: bool = False,
+        static_gaussian_params: dict | None = None,
+        return_gaussian_params: bool = False,
+    ):
+        """Decode the current frame static template and compute reconstruction supervision."""
+        device = z_current.device
+        total_loss = torch.zeros((), dtype=torch.float32, device=device)
+        if self.world_model is None or self.gaussian_renderer is None or current_target is None:
+            return (total_loss, {}) if return_gaussian_params else total_loss
+
+        gaussian_params: dict = {}
+        try:
+            if static_gaussian_params is not None:
+                gaussian_params = dict(static_gaussian_params)
+            else:
+                camera_params_for_decode = self._get_camera_params_for_view("agent", device, z_current.shape[0])
+                base_depth = getattr(current_target, "depth", None)
+                if base_depth is not None and base_depth.ndim == 5:
+                    base_depth = base_depth[:, -1]
+                gaussian_params = self.world_model.decode_gaussian_prefix_template(
+                    z_current.float(),
+                    gaussian_adapter=self.gaussian_adapter,
+                    current_observation=current_target,
+                    camera_params=camera_params_for_decode,
+                    base_depth=base_depth,
+                    step=step,
+                )
+
+            return self._compute_gaussian_supervision_loss(
+                gaussian_params,
+                current_target,
+                current_target,
+                step=step,
+                time_suffix=time_suffix,
+                visualize=visualize,
+                horizon_idx=0,
+                return_gaussian_params=return_gaussian_params,
+            )
+        except Exception as error:
+            import traceback
+
+            logging.warning(f"Step {step}{time_suffix}: Current-frame static reconstruction failed: {error}")
+            if step is not None and step % 400 == 0:
+                traceback.print_exc()
+                logging.warning(traceback.format_exc())
+
+        if return_gaussian_params:
+            return total_loss, gaussian_params
+        return total_loss
+
     def _compute_world_model_frame_loss(
         self,
         z_next: torch.Tensor,
@@ -1087,10 +1537,6 @@ class PI0Pytorch(nn.Module):
         total_loss = torch.zeros((), dtype=torch.float32, device=device)
         if self.world_model is None or self.gaussian_renderer is None or future_target is None:
             return (total_loss, {}) if return_gaussian_params else total_loss
-
-        import torch.distributed as dist
-
-        is_main_process = not dist.is_initialized() or dist.get_rank() == 0
 
         gaussian_params: dict = {}
         try:
@@ -1112,215 +1558,16 @@ class PI0Pytorch(nn.Module):
                 velocity_time_factor=velocity_time_factor,
             )
 
-            depth_map = gaussian_params.pop("depth_map", None)
-            depth_delta_map = gaussian_params.pop("depth_delta_map", None)
-            motion_gate_map = gaussian_params.pop("motion_gate_map", None)
-            raw_delta_xyz = gaussian_params.pop("raw_delta_xyz", None)
-
-            if step is not None and step % 400 == 0:
-                depth_delta_mean = float("nan")
-                depth_delta_abs_mean = float("nan")
-                depth_delta_abs_max = float("nan")
-                if depth_delta_map is not None:
-                    delta_stats_map = depth_delta_map.float()
-                    depth_delta_mean = delta_stats_map.mean().item()
-                    depth_delta_abs_mean = delta_stats_map.abs().mean().item()
-                    depth_delta_abs_max = delta_stats_map.abs().max().item()
-                logging.info(
-                    f"Step {step}{time_suffix}: depth_map={depth_map is not None}, "
-                    f"depth_delta_map={depth_delta_map is not None}, "
-                    f"has_depth_attr={hasattr(future_target, 'depth')}, "
-                    f"depth_value={future_target.depth is not None if hasattr(future_target, 'depth') else 'N/A'}, "
-                    f"depth_delta_mean={depth_delta_mean:.6f}, "
-                    f"depth_delta_abs_mean={depth_delta_abs_mean:.6f}, "
-                    f"depth_delta_abs_max={depth_delta_abs_max:.6f}"
-                )
-
-            if depth_map is not None and hasattr(future_target, "depth") and future_target.depth is not None:
-                gt_depth = future_target.depth
-                if depth_map.shape != gt_depth.shape:
-                    depth_map = F.interpolate(
-                        depth_map, size=gt_depth.shape[-2:], mode="bilinear", align_corners=False
-                    )
-                depth_loss = F.l1_loss(depth_map, gt_depth)
-                if torch.isfinite(depth_loss):
-                    total_loss = total_loss + self.depth_loss_weight * depth_loss
-                if step is not None and step % 400 == 0:
-                    logging.info(
-                        f"Step {step}{time_suffix}: Depth Loss = {depth_loss.item():.6f}, "
-                        f"weight={self.depth_loss_weight}"
-                    )
-
-                if (
-                    depth_delta_map is not None
-                    and base_depth is not None
-                    and self.delta_depth_loss_weight > 0.0
-                    and (not self.delta_depth_first_horizon_only or horizon_idx == 0)
-                ):
-                    if base_depth.ndim == 3:
-                        base_depth_for_delta = base_depth.unsqueeze(1)
-                    else:
-                        base_depth_for_delta = base_depth
-                    if base_depth_for_delta.shape[-2:] != gt_depth.shape[-2:]:
-                        base_depth_for_delta = F.interpolate(
-                            base_depth_for_delta, size=gt_depth.shape[-2:], mode="bilinear", align_corners=False
-                        )
-                    gt_depth_delta = gt_depth - base_depth_for_delta
-                    if depth_delta_map.shape != gt_depth_delta.shape:
-                        depth_delta_map = F.interpolate(
-                            depth_delta_map, size=gt_depth_delta.shape[-2:], mode="bilinear", align_corners=False
-                        )
-                    delta_depth_loss = F.smooth_l1_loss(depth_delta_map, gt_depth_delta)
-                    if torch.isfinite(delta_depth_loss):
-                        total_loss = total_loss + self.delta_depth_loss_weight * delta_depth_loss
-                    if step is not None and step % 400 == 0:
-                        logging.info(
-                            f"Step {step}{time_suffix}: Delta Depth Loss = {delta_depth_loss.item():.6f}, "
-                            f"weight={self.delta_depth_loss_weight}, horizon_idx={horizon_idx}"
-                        )
-
-            for key, value in gaussian_params.items():
-                if torch.isnan(value).any() or torch.isinf(value).any():
-                    gaussian_params[key] = torch.where(torch.isfinite(value), value, torch.zeros_like(value))
-
-            target_obs = {}
-            cam_params_dict = {}
-            valid_views = []
-
-            for key, value in future_target.images.items():
-                img_tensor = value
-                view_name = None
-                if key == "image" or "agent" in key or "high" in key or "cam_high" in key or "exterior" in key or "base" in key:
-                    view_name = "agent"
-                elif "left_wrist" in key or "wrist_left" in key:
-                    view_name = "wrist"
-                elif "right_wrist" in key or "wrist_right" in key:
-                    if img_tensor.min() == img_tensor.max() == -1.0:
-                        continue
-                    view_name = "wrist"
-                elif "wrist" in key or "bravo" in key:
-                    view_name = "wrist"
-
-                if view_name:
-                    if img_tensor.shape[1] != 3 and img_tensor.shape[-1] == 3:
-                        img_tensor = img_tensor.permute(0, 3, 1, 2)
-                    img_tensor = (img_tensor + 1.0) / 2.0
-                    view_key = f"{view_name}_image"
-                    if view_key not in target_obs:
-                        target_obs[view_key] = img_tensor
-                        cam_params_dict[view_name] = self._get_camera_params_for_view(view_name, device, z_next.shape[0])
-                        valid_views.append(view_name)
-
-            if valid_views:
-                render_views = ["agent"] if "agent" in valid_views else valid_views
-                motion_weight_maps = {}
-                for render_view in render_views:
-                    view_key = f"{render_view}_image"
-                    current_image = self._extract_reference_view_image(preprocessed_observation, render_view)
-                    future_image = target_obs[view_key]
-                    current_depth_for_view = base_depth if render_view == "agent" else None
-                    future_depth_for_view = (
-                        future_target.depth
-                        if render_view == "agent" and hasattr(future_target, "depth")
-                        else None
-                    )
-                    motion_weight_maps[render_view] = self._build_future_motion_weight_map(
-                        current_image,
-                        future_image,
-                        current_depth_for_view,
-                        future_depth_for_view,
-                    )
-
-                render_loss, render_loss_dict = compute_multi_view_rendering_loss(
-                    gaussian_params,
-                    target_obs,
-                    cam_params_dict,
-                    self.gaussian_renderer,
-                    M_attn_dict=motion_weight_maps,
-                    view_names=render_views,
-                    step=step,
-                    depth_map=depth_map,
-                    lambda_scale=0.001,
-                    lambda_opacity=0.01,
-                    lambda_edge_smooth=0.01,
-                    lpips_fn=self.lpips_fn,
-                    lpips_weight=self.lpips_weight,
-                )
-                if torch.isfinite(render_loss):
-                    total_loss = total_loss + self.render_loss_weight * render_loss.to(total_loss.dtype)
-
-                if motion_gate_map is not None and "agent" in motion_weight_maps:
-                    gate_target = self._build_future_motion_gate_target(motion_weight_maps["agent"])
-                    gate_pred = motion_gate_map.float()
-                    if gate_pred.shape != gate_target.shape:
-                        gate_pred = F.interpolate(
-                            gate_pred.unsqueeze(1), size=gate_target.shape[-2:], mode="bilinear", align_corners=False
-                        ).squeeze(1)
-                    motion_gate_loss = F.smooth_l1_loss(gate_pred, gate_target)
-                    if torch.isfinite(motion_gate_loss):
-                        total_loss = total_loss + self.future_motion_gate_loss_weight * motion_gate_loss
-                    render_loss_dict["loss_motion_gate"] = motion_gate_loss
-                    if step is not None and step % 400 == 0:
-                        logging.info(
-                            f"Step {step}{time_suffix}: Motion Gate Loss = {motion_gate_loss.item():.6f}, "
-                            f"weight={self.future_motion_gate_loss_weight}, gate_mean={gate_pred.mean().item():.4f}, "
-                            f"target_mean={gate_target.mean().item():.4f}"
-                        )
-
-                if "sh" in gaussian_params:
-                    sh_dc = gaussian_params["sh"]
-                    sh_dc_reg = (sh_dc ** 2).mean() * 0.01
-                    total_loss = total_loss + sh_dc_reg
-                    if step is not None and step % 400 == 0:
-                        logging.info(
-                            f"Step {step}{time_suffix}: SH DC Reg = {sh_dc_reg.item():.6f}, "
-                            f"SH DC mean = {sh_dc.mean().item():.6f}"
-                        )
-
-                should_log = step is not None and step % 400 == 0
-                if should_log:
-                    loss_parts = ", ".join(f"{k}={v.item():.6f}" for k, v in render_loss_dict.items())
-                    weight_parts = ", ".join(
-                        f"{name}=mean:{weight.mean().item():.4f}/max:{weight.max().item():.4f}"
-                        for name, weight in motion_weight_maps.items()
-                    )
-                    logging.info(
-                        f"Step {step}{time_suffix}: Render Loss = {render_loss.item():.4f}, "
-                        f"weight={self.render_loss_weight}, breakdown: {loss_parts}, motion_weights: {weight_parts}"
-                    )
-
-                if visualize and should_log and is_main_process:
-                    with torch.no_grad():
-                        try:
-                            temporal_frames = {}
-                            temporal_labels = getattr(preprocessed_observation, "raw_temporal_labels", None)
-                            if hasattr(preprocessed_observation, "raw_temporal_images"):
-                                temporal_frames = preprocessed_observation.raw_temporal_images
-                                for key, value in temporal_frames.items():
-                                    logging.info(f"[Viz] Extracted raw temporal {key} with shape {value.shape}")
-                            elif hasattr(preprocessed_observation, "images"):
-                                for key, value in preprocessed_observation.images.items():
-                                    if value.ndim == 5 and value.shape[1] >= 2:
-                                        temporal_frames[key] = value
-                                        logging.info(f"[Viz] Extracted {key} with shape {value.shape}")
-
-                            future_label = "future"
-                            if time_suffix.startswith("_tplus"):
-                                future_label = time_suffix[len("_"):].replace("_pred_vlm", "")
-
-                            self._visualize_rendering_comparison(
-                                step,
-                                gaussian_params,
-                                target_obs,
-                                cam_params_dict,
-                                view_names=render_views,
-                                time_suffix=time_suffix,
-                                temporal_frames=temporal_frames,
-                                temporal_labels=temporal_labels,
-                                future_label=future_label,
-                            )
-                        except Exception as viz_error:
-                            logging.warning(f"Step {step}{time_suffix}: Visualization failed: {viz_error}")
+            return self._compute_gaussian_supervision_loss(
+                gaussian_params,
+                future_target,
+                preprocessed_observation,
+                step=step,
+                time_suffix=time_suffix,
+                visualize=visualize,
+                horizon_idx=horizon_idx,
+                return_gaussian_params=return_gaussian_params,
+            )
         except Exception as error:
             import traceback
 
@@ -1411,9 +1658,18 @@ class PI0Pytorch(nn.Module):
         # World tokens removed — redundant with Gaussian tokens (300).
         # The block below is intentionally empty; kept for code structure clarity.
 
-        # Original Gaussian embeddings (for backward compatibility, if not using world tokens)
-        gaussian_embs, g_mask = self.gaussian_adapter(gaussian_inputs, text_embedding=text_embedding)
-        
+        gaussian_embs = None
+        g_mask = None
+        mta_features = None
+        gaussian_result = self.gaussian_adapter(
+            gaussian_inputs,
+            text_embedding=text_embedding,
+            return_mta_features=self.use_world_tokens_in_prefix,
+        )
+        if self.use_world_tokens_in_prefix:
+            gaussian_embs, g_mask, mta_features = gaussian_result
+        else:
+            gaussian_embs, g_mask = gaussian_result
         if gaussian_embs is not None:
              embs.append(gaussian_embs)
              pad_masks.append(g_mask)
@@ -1534,7 +1790,58 @@ class PI0Pytorch(nn.Module):
 
             # 2. Delta query tokens (learnable, predict changes)
             delta_q = self.future_query_tokens.expand(B, -1, -1)  # [B, 256, D]
-            if gaussian_for_cross_attn is not None and self.future_query_cross_attn is not None:
+            if (
+                mta_features is not None
+                and self.future_query_to_mta is not None
+                and self.future_mta_encoder is not None
+                and self.mta_to_future is not None
+            ):
+                layer_order = [11, 17, 23]
+                layer_features = [mta_features.get(layer_idx) for layer_idx in layer_order]
+                expected_frames = self.temporal_context_count
+                has_all_layers = all(feature is not None for feature in layer_features)
+                frames_match = has_all_layers and all(
+                    feature.shape[1] == expected_frames for feature in layer_features
+                )
+                if has_all_layers and frames_match:
+                    motion_tokens = self.future_query_to_mta(delta_q)  # [B, 256, 512]
+                    motion_tokens = motion_tokens.unsqueeze(1).expand(-1, expected_frames, -1, -1)
+                    motion_tokens = self.future_mta_encoder(motion_tokens, layer_features)
+                    ta_current = motion_tokens[:, expected_frames - 1]
+                    delta_q = delta_q + self.mta_to_future(ta_current).to(delta_q.dtype)
+                else:
+                    missing_layers = [
+                        str(layer_idx)
+                        for layer_idx, feature in zip(layer_order, layer_features, strict=True)
+                        if feature is None
+                    ]
+                    frame_mismatches = [
+                        f"{layer_idx}:{feature.shape[1]}"
+                        for layer_idx, feature in zip(layer_order, layer_features, strict=True)
+                        if feature is not None and feature.shape[1] != expected_frames
+                    ]
+                    if missing_layers:
+                        logging.warning(
+                            "Missing MTA features for layers %s. Falling back to future query cross-attention.",
+                            ", ".join(missing_layers),
+                        )
+                    elif frame_mismatches:
+                        logging.warning(
+                            "MTA feature frame count mismatch (expected %s, got %s). Falling back to future query cross-attention.",
+                            expected_frames,
+                            ", ".join(frame_mismatches),
+                        )
+                    if gaussian_for_cross_attn is not None and self.future_query_cross_attn is not None:
+                        query_tokens = self.future_query_cross_attn_q_norm(delta_q)
+                        key_value_tokens = self.future_query_cross_attn_kv_norm(gaussian_for_cross_attn.to(delta_q.dtype))
+                        cross_attn_out, _ = self.future_query_cross_attn(
+                            query_tokens,
+                            key_value_tokens,
+                            key_value_tokens,
+                            need_weights=False,
+                        )
+                        delta_q = delta_q + cross_attn_out
+            elif gaussian_for_cross_attn is not None and self.future_query_cross_attn is not None:
                 query_tokens = self.future_query_cross_attn_q_norm(delta_q)
                 key_value_tokens = self.future_query_cross_attn_kv_norm(gaussian_for_cross_attn.to(delta_q.dtype))
                 cross_attn_out, _ = self.future_query_cross_attn(
@@ -1865,6 +2172,7 @@ class PI0Pytorch(nn.Module):
         future_observation,
         preprocessed_observation,
         static_template: dict | None = None,
+        per_step_delta: torch.Tensor | None = None,
     ):
         """Visualize context + future rollout GT/render/diff in one grid.
 
@@ -1902,6 +2210,11 @@ class PI0Pytorch(nn.Module):
         target_obs_seq = []
         rendered_obs_seq = []
         motion_weight_seq = []
+        encoded_latent_seq = []
+        gt_future_latent_seq = []
+        pred_gt_latent_diff_seq = []
+        future_latent_seq = []
+        future_delta_seq = []
         render_views = None
         base_target_obs = None
         base_rendered_obs = None
@@ -1959,6 +2272,113 @@ class PI0Pytorch(nn.Module):
             return rendered_obs
 
         with torch.no_grad():
+            if getattr(self.gaussian_adapter, "use_gaussian", False):
+                try:
+                    gaussian_inputs_viz = self._prepare_gaussian_inputs(
+                        preprocessed_observation,
+                        z_future_pred_tokens.device,
+                        z_future_pred_tokens.shape[0],
+                        is_training=True,
+                    )
+                    if gaussian_inputs_viz is not None:
+                        gaussian_embs_viz, _ = self.gaussian_adapter(
+                            gaussian_inputs_viz,
+                            step=step,
+                            visualize=False,
+                        )
+                        tokens_per_frame = int(getattr(self.gaussian_adapter, "tokens_per_frame", 0) or 0)
+                        if step is not None and step % 400 == 0:
+                            logging.info(
+                                "Step %s: encoded latent viz status | gaussian_inputs_viz=%s | gaussian_embs_viz=%s | tokens_per_frame=%s",
+                                step,
+                                tuple(gaussian_inputs_viz.shape),
+                                None if gaussian_embs_viz is None else tuple(gaussian_embs_viz.shape),
+                                tokens_per_frame,
+                            )
+                        if gaussian_embs_viz is not None and tokens_per_frame > 0 and gaussian_embs_viz.shape[1] >= tokens_per_frame:
+                            num_frames = gaussian_embs_viz.shape[1] // tokens_per_frame
+                            encoded_latent_seq = [
+                                gaussian_embs_viz[:1, frame_idx * tokens_per_frame:(frame_idx + 1) * tokens_per_frame].float()
+                                for frame_idx in range(num_frames)
+                            ]
+                            if step is not None and step % 400 == 0:
+                                logging.info(
+                                    "Step %s: encoded latent viz extracted %s frame chunks from %s tokens",
+                                    step,
+                                    len(encoded_latent_seq),
+                                    gaussian_embs_viz.shape[1],
+                                )
+                        elif step is not None and step % 400 == 0:
+                            logging.warning(
+                                "Step %s: encoded latent viz skipped | gaussian_embs_viz is None=%s | tokens_per_frame=%s | total_tokens=%s",
+                                step,
+                                gaussian_embs_viz is None,
+                                tokens_per_frame,
+                                None if gaussian_embs_viz is None else gaussian_embs_viz.shape[1],
+                            )
+                except Exception as latent_viz_error:
+                    logging.warning(f"Step {step}: encoded latent visualization prep failed: {latent_viz_error}")
+
+            future_latent_seq = [
+                z_future_pred_tokens[:1, horizon_idx].float()
+                for horizon_idx in range(rollout_horizon)
+            ]
+            if per_step_delta is not None:
+                future_delta_seq = [
+                    per_step_delta[:1, horizon_idx].float()
+                    for horizon_idx in range(min(rollout_horizon, per_step_delta.shape[1]))
+                ]
+
+            gt_future_latent_seq = []
+            pred_gt_latent_diff_seq = []
+            if getattr(self.gaussian_adapter, "use_gaussian", False) and future_observation is not None:
+                try:
+                    available_future_steps = self._get_temporal_observation_length(future_observation)
+                    tokens_per_frame = int(getattr(self.gaussian_adapter, "tokens_per_frame", 0) or 0)
+                    for horizon_idx in range(min(rollout_horizon, available_future_steps)):
+                        future_target = self._slice_temporal_observation(future_observation, horizon_idx)
+                        future_inputs_viz = self._prepare_gaussian_inputs(
+                            future_target,
+                            z_future_pred_tokens.device,
+                            z_future_pred_tokens.shape[0],
+                            is_training=False,
+                        )
+                        if future_inputs_viz is None:
+                            gt_future_latent_seq.append(None)
+                            pred_gt_latent_diff_seq.append(None)
+                            continue
+
+                        gt_future_embs, _ = self.gaussian_adapter(
+                            future_inputs_viz,
+                            step=step,
+                            visualize=False,
+                        )
+                        if gt_future_embs is None:
+                            gt_future_latent_seq.append(None)
+                            pred_gt_latent_diff_seq.append(None)
+                            continue
+
+                        gt_tokens = gt_future_embs[:1].float()
+                        if tokens_per_frame > 0 and gt_tokens.shape[1] >= tokens_per_frame:
+                            gt_tokens = gt_tokens[:, :tokens_per_frame]
+                        gt_future_latent_seq.append(gt_tokens)
+
+                        pred_tokens = z_future_pred_tokens[:1, horizon_idx].float()
+                        min_tokens = min(pred_tokens.shape[1], gt_tokens.shape[1])
+                        min_width = min(pred_tokens.shape[2], gt_tokens.shape[2])
+                        pred_gt_latent_diff_seq.append(
+                            (pred_tokens[:, :min_tokens, :min_width] - gt_tokens[:, :min_tokens, :min_width]).abs()
+                        )
+
+                    if step is not None and step % 400 == 0:
+                        logging.info(
+                            "Step %s: gt future latent viz extracted %s horizons",
+                            step,
+                            sum(latent is not None for latent in gt_future_latent_seq),
+                        )
+                except Exception as future_latent_viz_error:
+                    logging.warning(f"Step {step}: gt future latent visualization prep failed: {future_latent_viz_error}")
+
             base_depth = getattr(preprocessed_observation, "depth", None)
             if base_depth is not None and base_depth.ndim == 5:
                 base_depth = base_depth[:, -1]
@@ -2058,6 +2478,11 @@ class PI0Pytorch(nn.Module):
             base_label="t/base",
             motion_weight_seq=motion_weight_seq,
             context_labels=getattr(preprocessed_observation, "raw_temporal_labels", self._temporal_context_labels()),
+            encoded_latent_seq=encoded_latent_seq,
+            future_latent_seq=future_latent_seq,
+            gt_future_latent_seq=gt_future_latent_seq,
+            pred_gt_latent_diff_seq=pred_gt_latent_diff_seq,
+            future_delta_seq=future_delta_seq,
         )
         self._log_future_rollout_pixel_lpips(step, rendered_obs_seq)
 
@@ -2151,6 +2576,7 @@ class PI0Pytorch(nn.Module):
         # --- Extract Future Frame Tokens from Prefix Output (NEW) ---
         z_t1_pred_tokens = None
         z_future_pred_tokens = None
+        per_step_delta = None
         if self.use_world_tokens_in_prefix and 'future' in segment_lengths:
             # Calculate the start position of future tokens in prefix_output
             # Order: gaussian (if exists) -> images -> language -> future
@@ -2168,11 +2594,12 @@ class PI0Pytorch(nn.Module):
             future_end = future_start + segment_lengths['future']
             z_t1_pred_tokens = prefix_out[:, future_start:future_end, :]  # [B, future_token_count, D]
 
-            if step is not None and step % 400 == 0:
-                print(f"[DEBUG] Extracted future tokens: shape={z_t1_pred_tokens.shape}, "
-                      f"start={future_start}, end={future_end}, segment_lengths={segment_lengths}")
-
-            z_future_pred_tokens, per_step_delta = self._rollout_future_latents(z_t1_pred_tokens)
+            # Paper-style path: one shared motion query predicts a short-horizon constant-velocity field.
+            # Compatibility path: keep the old autoregressive latent rollout when explicitly disabled.
+            if self.use_shared_motion_query_velocity:
+                z_future_pred_tokens, per_step_delta = self._build_shared_motion_query_rollout(z_t1_pred_tokens)
+            else:
+                z_future_pred_tokens, per_step_delta = self._rollout_future_latents(z_t1_pred_tokens)
 
             # Future-rollout regularization: penalise per-step delta magnitude.
             # For autoregressive rollout, regularise each step's increment separately.
@@ -2196,11 +2623,11 @@ class PI0Pytorch(nn.Module):
                 )
 
                 if step is not None and step % 400 == 0:
+                    mode_desc = "shared motion-query velocity" if self.use_shared_motion_query_velocity else "autoregressive latent rollout"
                     logging.info(
-                        f"Step {step}: Future Rollout Delta Reg = {delta_reg.item():.6f}, "
-                        f"raw={raw_delta_reg.item():.6f}, weight={self.future_delta_reg_weight}"
+                        f"Step {step}: Future Motion Delta Reg = {delta_reg.item():.6f}, "
+                        f"raw={raw_delta_reg.item():.6f}, weight={self.future_delta_reg_weight}, mode={mode_desc}"
                     )
-
         # --- World Model Render Loss (render-only, no forward loss) ---
         if self.use_world_tokens_in_prefix and z_future_pred_tokens is not None and future_observation is not None:
             available_future_steps = self._get_temporal_observation_length(future_observation)
@@ -2210,28 +2637,36 @@ class PI0Pytorch(nn.Module):
                 step, rollout_horizon, loss.device, torch.float32
             )
 
-            # Decode the current/base Gaussian template once from prefix Gaussian tokens.
+            current_template_loss = torch.zeros((), dtype=torch.float32, device=loss.device)
             static_template: dict | None = None
-            if getattr(self, "use_velocity_future_gaussians", False) and "gaussian" in segment_lengths:
-                g_len = segment_lengths["gaussian"]
-                z_gaussian_vlm = prefix_out[:, :g_len, :]
+            g_len = segment_lengths.get("gaussian", 0)
+            z_gaussian_vlm = prefix_out[:, :g_len, :] if g_len > 0 else None
+            current_target = self._slice_temporal_observation(preprocessed_observation, self.temporal_context_count - 1)
+            if current_target is None:
+                current_target = preprocessed_observation
+
+            if z_gaussian_vlm is not None:
                 try:
-                    camera_params_for_template = self._get_camera_params_for_view(
-                        "agent", prefix_out.device, prefix_out.shape[0]
-                    )
-                    base_depth_for_template = getattr(preprocessed_observation, "depth", None)
-                    if base_depth_for_template is not None and base_depth_for_template.ndim == 5:
-                        base_depth_for_template = base_depth_for_template[:, -1]
-                    static_template = self.world_model.decode_gaussian_prefix_template(
-                        z_gaussian_vlm.float(),
-                        gaussian_adapter=self.gaussian_adapter,
-                        current_observation=preprocessed_observation,
-                        camera_params=camera_params_for_template,
-                        base_depth=base_depth_for_template,
+                    current_template_loss, static_template_raw = self._compute_current_frame_recon_loss(
+                        z_gaussian_vlm,
+                        current_target,
                         step=step,
+                        time_suffix="_t_current_static",
+                        visualize=False,
+                        return_gaussian_params=True,
                     )
+                    static_template = {
+                        k: v.detach() if torch.is_tensor(v) else v for k, v in static_template_raw.items()
+                    }
+                    if torch.isfinite(current_template_loss):
+                        loss = loss + self.current_frame_recon_loss_weight * current_template_loss.to(loss.dtype)
+                    if step is not None and step % 400 == 0:
+                        logging.info(
+                            f"Step {step}: Current Frame Static Recon = {current_template_loss.item():.6f}, "
+                            f"weight={self.current_frame_recon_loss_weight}"
+                        )
                 except Exception as e:
-                    logging.warning(f"decode_gaussian_prefix_template failed: {e}, fallback to h=0 full decode")
+                    logging.warning(f"Current-frame static reconstruction failed: {e}")
                     static_template = None
 
             for horizon_idx in range(rollout_horizon):
@@ -2242,40 +2677,30 @@ class PI0Pytorch(nn.Module):
                 )
                 reused_template = None
                 vtf = 1.0
-                if self.use_velocity_future_gaussians:
+                if self.use_velocity_future_gaussians and static_template is not None:
                     reused_template = static_template
                     o0 = self.future_prediction_offsets[0]
                     oh = self.future_prediction_offsets[horizon_idx]
                     vtf = float(oh) / float(o0) if o0 else 1.0
 
-                if self.use_velocity_future_gaussians and horizon_idx == 0 and reused_template is None:
-                    horizon_loss, gp = self._compute_world_model_frame_loss(
-                        z_future_pred_tokens[:, horizon_idx],
-                        future_target,
-                        preprocessed_observation,
-                        step=step,
-                        time_suffix=f"_tplus{self.future_prediction_offsets[horizon_idx]}_pred_vlm",
-                        visualize=False,
-                        horizon_idx=horizon_idx,
-                        static_gaussian_params=reused_template,
-                        velocity_time_factor=vtf,
-                        return_gaussian_params=True,
+                if self.use_velocity_future_gaussians and reused_template is None:
+                    logging.warning(
+                        "Step %s: Missing static template for future horizon t+%s, falling back to independent decode.",
+                        step,
+                        self.future_prediction_offsets[horizon_idx],
                     )
-                    static_template = {
-                        k: v.detach() if torch.is_tensor(v) else v for k, v in gp.items()
-                    }
-                else:
-                    horizon_loss = self._compute_world_model_frame_loss(
-                        z_future_pred_tokens[:, horizon_idx],
-                        future_target,
-                        preprocessed_observation,
-                        step=step,
-                        time_suffix=f"_tplus{self.future_prediction_offsets[horizon_idx]}_pred_vlm",
-                        visualize=False,
-                        horizon_idx=horizon_idx,
-                        static_gaussian_params=reused_template,
-                        velocity_time_factor=vtf,
-                    )
+
+                horizon_loss = self._compute_world_model_frame_loss(
+                    z_future_pred_tokens[:, horizon_idx],
+                    future_target,
+                    preprocessed_observation,
+                    step=step,
+                    time_suffix=f"_tplus{self.future_prediction_offsets[horizon_idx]}_pred_vlm",
+                    visualize=False,
+                    horizon_idx=horizon_idx,
+                    static_gaussian_params=reused_template,
+                    velocity_time_factor=vtf,
+                )
                 world_model_loss = world_model_loss + horizon_loss_weights[horizon_idx] * horizon_loss
 
             if rollout_horizon > 0:
@@ -2293,6 +2718,7 @@ class PI0Pytorch(nn.Module):
                             future_observation,
                             preprocessed_observation,
                             static_template=static_template,
+                            per_step_delta=per_step_delta[:, :rollout_horizon],
                         )
                     except Exception as viz_error:
                         logging.warning(f"Step {step}: Future rollout visualization failed: {viz_error}")

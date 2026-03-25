@@ -492,6 +492,23 @@ class GaussianDecoder(nn.Module):
             "raw_delta_xyz": raw_delta,
         }
 
+    def decode_dynamic_gaussians_from_static(
+        self,
+        z: torch.Tensor,
+        static_reference_params: dict,
+        velocity_time_factor: float,
+        step: int | None,
+        base_depth: torch.Tensor | None = None,
+    ) -> dict:
+        """Decode shared motion-query tokens into a constant-velocity dynamic Gaussian update."""
+        return self._decode_velocity_from_static(
+            z,
+            static_reference_params,
+            velocity_time_factor,
+            step,
+            base_depth=base_depth,
+        )
+
     def _decode_independent(
         self, z, gaussian_adapter=None, camera_params=None,
         current_observation=None, future_observation=None, step=None, actions=None,
@@ -525,8 +542,12 @@ class GaussianDecoder(nn.Module):
             and static_reference_params is not None
             and self.velocity_token_mlp is not None
         ):
-            return self._decode_velocity_from_static(
-                z, static_reference_params, velocity_time_factor, step, base_depth=base_depth
+            return self.decode_dynamic_gaussians_from_static(
+                z,
+                static_reference_params,
+                velocity_time_factor,
+                step,
+                base_depth=base_depth,
             )
 
         vggt_obs = current_observation if current_observation is not None else future_observation

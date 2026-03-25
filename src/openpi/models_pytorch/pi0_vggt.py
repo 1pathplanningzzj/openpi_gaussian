@@ -94,6 +94,51 @@ class TemporalConv3DEncoder(nn.Module):
         return x
 
 
+class MotionAwareTemporalBlock(nn.Module):
+    """Temporal-only attention block that matches DynamicVGGT MTA equations (6)-(8).
+
+    Input is `[B, T, K, D]`, where temporal attention is computed independently for
+    each token slot `K` along the frame axis `T`.
+    """
+
+    def __init__(self, embed_dim: int = 512, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=dropout,
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 4, embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply temporal self-attention over the frame axis only.
+
+        Args:
+            x: [B, T, K, D]
+        Returns:
+            [B, T, K, D]
+        """
+        bsz, num_frames, num_slots, dim = x.shape
+
+        x_norm = self.norm1(x)
+        x_time = x_norm.permute(0, 2, 1, 3).reshape(bsz * num_slots, num_frames, dim)
+        attn_out, _ = self.attn(x_time, x_time, x_time, need_weights=False)
+        attn_out = attn_out.reshape(bsz, num_slots, num_frames, dim).permute(0, 2, 1, 3)
+
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
 class CausalTemporalAttention(nn.Module):
     """Causal temporal attention for modeling t-2, t-1 → t dependencies.
 
@@ -531,6 +576,12 @@ class GaussianAdapter(nn.Module):
                     )
                     self.temporal_offset_proj = nn.Linear(1, 512)
 
+                    # Dedicated projections for exposing per-layer MTA patch tokens.
+                    self.mta_layer_pool = nn.AdaptiveAvgPool2d((16, 16))
+                    self.mta_layer_projs = nn.ModuleList([
+                        nn.Linear(512, 512) for _ in self.layer_indices
+                    ])
+
                     # 5. Projection to action_expert_width
                     self.proj = nn.Linear(512, action_expert_width)
 
@@ -643,7 +694,7 @@ class GaussianAdapter(nn.Module):
             # Exclude wrist views
             if "wrist" not in key_lower:
                 # Accept keys that are agent views (base, agent, etc.) or contain _image/_rgb
-                if any(prefix in key_lower for prefix in ["base", "agent", "sideview"]) or \
+                if key == "image" or any(prefix in key_lower for prefix in ["base", "agent", "sideview"]) or \
                    "_image" in key_lower or "_rgb" in key_lower:
                     agent_images[key] = images_dict[key]
         
@@ -769,14 +820,50 @@ class GaussianAdapter(nn.Module):
              
         return imgs_stacked.to(device)
 
-    def forward(self, gaussian_inputs, text_embedding=None, return_gaussian_params=False, return_raw_tokens=False, step=None, visualize=False):
+    def _extract_layer_mta_features(self, aggregated_tokens_list) -> Optional[Dict[int, torch.Tensor]]:
+        """Extract pooled per-layer patch tokens for MTA.
+
+        Returns a dict mapping VGGT layer index -> [B, T, 256, 512].
+        """
+        if not (hasattr(self, 'use_multi_scale') and self.use_multi_scale and self.layer_projs is not None):
+            return None
+
+        mta_features: Dict[int, torch.Tensor] = {}
+        patch_start_idx_val = None
+        if hasattr(self.encoder, 'aggregator') and hasattr(self.encoder.aggregator, 'patch_start_idx'):
+            patch_start_idx_val = self.encoder.aggregator.patch_start_idx
+
+        for idx, layer_idx in enumerate(self.layer_indices):
+            layer_tokens = aggregated_tokens_list[layer_idx]  # [B, T, N, 2048]
+            if patch_start_idx_val is not None and layer_tokens.shape[2] > 1369:
+                layer_tokens = layer_tokens[:, :, patch_start_idx_val:]
+
+            bsz, num_frames, n_patches, _ = layer_tokens.shape
+            if n_patches != 1369:
+                logging.warning(
+                    f"Expected 1369 patch tokens for MTA at layer {layer_idx}, got {n_patches}. Skipping layer."
+                )
+                continue
+
+            layer_tokens = self.layer_projs[idx](layer_tokens)  # [B, T, 1369, 512]
+            layer_tokens_2d = layer_tokens.permute(0, 1, 3, 2).reshape(bsz * num_frames, 512, 37, 37)
+            layer_tokens_pooled = self.mta_layer_pool(layer_tokens_2d)  # [B*T, 512, 16, 16]
+            layer_tokens_flat = layer_tokens_pooled.reshape(bsz, num_frames, 512, 16, 16)
+            layer_tokens_flat = layer_tokens_flat.permute(0, 1, 3, 4, 2).reshape(bsz, num_frames, 256, 512)
+            layer_tokens_flat = self.mta_layer_projs[idx](layer_tokens_flat)
+            mta_features[layer_idx] = layer_tokens_flat
+
+        return mta_features if mta_features else None
+
+    def forward(self, gaussian_inputs, text_embedding=None, return_gaussian_params=False, return_raw_tokens=False, return_mta_features=False, step=None, visualize=False):
         """
         Processes gaussian inputs and returns embeddings.
-        Input: 
+        Input:
             gaussian_inputs: [B, S, 3, H, W]
             text_embedding: [B, D] Optional text embedding for LGPD.
             return_gaussian_params: If True, also return decoded Gaussian parameters from VGGT.
             return_raw_tokens: If True, also return raw tokens before pooling (for VAE supervision).
+            return_mta_features: If True, also return per-layer MTA patch tokens.
             step: Current training step (for visualization)
             visualize: If True and step % 100 == 0, save visualization
         Returns:
@@ -784,6 +871,7 @@ class GaussianAdapter(nn.Module):
             g_mask: [B, N] - Mask for tokens
             gaussian_params (optional): Dict with depth, rot, scale, opacity, sh if return_gaussian_params=True
             raw_tokens (optional): [B, S, 1369, D] - Raw patch tokens before pooling if return_raw_tokens=True
+            mta_features (optional): Dict[layer_idx, [B, T, 256, 512]]
         """
         if not self.use_gaussian or gaussian_inputs is None:
             return (None, None) if not return_gaussian_params else (None, None, None)
@@ -832,6 +920,8 @@ class GaussianAdapter(nn.Module):
         gaussian_params_dict = None
         if return_gaussian_params:
             logging.warning("return_gaussian_params=True but VGGT heads are skipped. Returning None.")
+
+        mta_features = self._extract_layer_mta_features(aggregated_tokens_list) if return_mta_features else None
 
         # Visualize if requested and step is a multiple of 100
         # Note: LGPD gate will be available after LGPD is applied below
@@ -1058,28 +1148,48 @@ class GaussianAdapter(nn.Module):
                 logging.warning(f"Failed to visualize VGGT and LGPD at step {step}: {e}")
         
         # Prepare return values
-        if return_gaussian_params and return_raw_tokens:
+        if return_gaussian_params and return_raw_tokens and return_mta_features:
+            raw_tokens_proj = None
+            if hasattr(self, 'proj') and self.proj is not None:
+                B, S, N, D = raw_tokens.shape
+                raw_tokens_flat = raw_tokens.view(B * S, N, D)
+                raw_tokens_proj_flat = self.proj(raw_tokens_flat)
+                raw_tokens_proj = raw_tokens_proj_flat.view(B, S, N, -1)
+            return gaussian_embs, g_mask, gaussian_params_dict, raw_tokens_proj, mta_features
+        elif return_gaussian_params and return_raw_tokens:
             # Project raw_tokens to action_expert_width for VAE supervision
             # raw_tokens: [B, S, 1369, D] where D is VGGT embed_dim (2048)
             # VAE expects tokens in action_expert_width dimension
             raw_tokens_proj = None
-            if hasattr(self, 'proj'):
+            if hasattr(self, 'proj') and self.proj is not None:
                 # Project each frame's tokens: [B, S, 1369, D] -> [B, S, 1369, action_expert_width]
                 B, S, N, D = raw_tokens.shape
                 raw_tokens_flat = raw_tokens.view(B * S, N, D)
                 raw_tokens_proj_flat = self.proj(raw_tokens_flat)  # [B*S, 1369, action_expert_width]
                 raw_tokens_proj = raw_tokens_proj_flat.view(B, S, N, -1)  # [B, S, 1369, action_expert_width]
             return gaussian_embs, g_mask, gaussian_params_dict, raw_tokens_proj
+        elif return_gaussian_params and return_mta_features:
+            return gaussian_embs, g_mask, gaussian_params_dict, mta_features
         elif return_gaussian_params:
             return gaussian_embs, g_mask, gaussian_params_dict
+        elif return_raw_tokens and return_mta_features:
+            raw_tokens_proj = None
+            if hasattr(self, 'proj') and self.proj is not None:
+                B, S, N, D = raw_tokens.shape
+                raw_tokens_flat = raw_tokens.view(B * S, N, D)
+                raw_tokens_proj_flat = self.proj(raw_tokens_flat)
+                raw_tokens_proj = raw_tokens_proj_flat.view(B, S, N, -1)
+            return gaussian_embs, g_mask, raw_tokens_proj, mta_features
         elif return_raw_tokens:
             # Project raw_tokens to action_expert_width for VAE supervision
             raw_tokens_proj = None
-            if hasattr(self, 'proj'):
+            if hasattr(self, 'proj') and self.proj is not None:
                 B, S, N, D = raw_tokens.shape
                 raw_tokens_flat = raw_tokens.view(B * S, N, D)
                 raw_tokens_proj_flat = self.proj(raw_tokens_flat)
                 raw_tokens_proj = raw_tokens_proj_flat.view(B, S, N, -1)
             return gaussian_embs, g_mask, raw_tokens_proj
+        elif return_mta_features:
+            return gaussian_embs, g_mask, mta_features
         else:
             return gaussian_embs, g_mask
