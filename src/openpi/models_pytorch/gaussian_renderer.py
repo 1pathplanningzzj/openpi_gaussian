@@ -949,13 +949,8 @@ def visualize_future_rollout_comparison(
     base_label="t/base",
     motion_weight_seq=None,
     context_labels=None,
-    encoded_latent_seq=None,
-    future_latent_seq=None,
-    gt_future_latent_seq=None,
-    pred_gt_latent_diff_seq=None,
-    future_delta_seq=None,
 ):
-    """Visualize context + latent diagnostics + multi-horizon future rollout in one figure."""
+    """Visualize context + multi-horizon future rollout in one figure."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -1011,30 +1006,15 @@ def visualize_future_rollout_comparison(
     show_base = base_target_obs is not None or base_rendered_obs is not None
     show_future_vs_base = base_rendered_obs is not None
     show_motion = motion_weight_seq is not None and len(motion_weight_seq) > 0
-    show_encoded_latent = encoded_latent_seq is not None and len(encoded_latent_seq) > 0
-    show_future_latent = future_latent_seq is not None and len(future_latent_seq) > 0
-    show_gt_future_latent = gt_future_latent_seq is not None and len(gt_future_latent_seq) > 0
-    show_pred_gt_latent_diff = pred_gt_latent_diff_seq is not None and len(pred_gt_latent_diff_seq) > 0
-    show_future_delta = future_delta_seq is not None and len(future_delta_seq) > 0
 
     total_future_cols = max(
         horizon,
         len(context_frames),
-        len(encoded_latent_seq or []),
-        len(future_latent_seq or []),
-        len(gt_future_latent_seq or []),
-        len(pred_gt_latent_diff_seq or []),
-        len(future_delta_seq or []),
         1,
     )
     num_cols = total_future_cols + (1 if show_base else 0)
 
     row_titles = []
-    encoded_row = None
-    if show_encoded_latent:
-        encoded_row = len(row_titles)
-        row_titles.append("Encoded Latent")
-
     context_row = len(row_titles)
     row_titles.append("Context")
     gt_row = len(row_titles)
@@ -1054,26 +1034,6 @@ def visualize_future_rollout_comparison(
         motion_row = len(row_titles)
         row_titles.append("Motion Weight")
 
-    future_latent_row = None
-    if show_future_latent:
-        future_latent_row = len(row_titles)
-        row_titles.append("Future Latent")
-
-    gt_future_latent_row = None
-    if show_gt_future_latent:
-        gt_future_latent_row = len(row_titles)
-        row_titles.append("GT Future Encoded")
-
-    pred_gt_latent_diff_row = None
-    if show_pred_gt_latent_diff:
-        pred_gt_latent_diff_row = len(row_titles)
-        row_titles.append("|Pred-GT Encoded|")
-
-    future_delta_row = None
-    if show_future_delta:
-        future_delta_row = len(row_titles)
-        row_titles.append("Delta Latent")
-
     num_rows = len(row_titles)
     fig, axes = plt.subplots(num_rows, num_cols, figsize=(4 * num_cols, 3.6 * num_rows))
     if num_rows == 1 and num_cols == 1:
@@ -1092,36 +1052,20 @@ def visualize_future_rollout_comparison(
 
     start_col = 1 if show_base else 0
 
-    if show_encoded_latent:
-        for col_idx, latent_entry in enumerate((encoded_latent_seq or [])[:total_future_cols]):
-            dst_col = start_col + col_idx
-            latent_map = _latent_entry_to_heatmap(latent_entry)
-            if latent_map is None:
-                continue
-            axes[encoded_row, dst_col].imshow(latent_map, cmap="viridis", vmin=0.0, vmax=1.0)
-            label = context_labels[col_idx] if col_idx < len(context_labels) else f"ctx_{col_idx}"
-            axes[encoded_row, dst_col].set_title(label, fontsize=13)
-
     for col_idx, frame in enumerate(context_frames[:total_future_cols]):
         dst_col = start_col + col_idx
         axes[context_row, dst_col].imshow(frame)
-        if not show_encoded_latent:
-            if col_idx < len(context_labels):
-                axes[context_row, dst_col].set_title(context_labels[col_idx], fontsize=13)
-            else:
-                axes[context_row, dst_col].set_title(f"ctx_{col_idx}", fontsize=13)
+        if col_idx < len(context_labels):
+            axes[context_row, dst_col].set_title(context_labels[col_idx], fontsize=13)
+        else:
+            axes[context_row, dst_col].set_title(f"ctx_{col_idx}", fontsize=13)
 
     gt_key = f"{view_name}_image"
     base_gt_img = None
     base_render_img = None
 
     if show_base:
-        base_title_row = encoded_row if show_encoded_latent else context_row
-        axes[base_title_row, 0].set_title(base_label, fontsize=13)
-        if show_encoded_latent and encoded_latent_seq:
-            base_latent_map = _latent_entry_to_heatmap(encoded_latent_seq[min(len(encoded_latent_seq) - 1, len(context_labels) - 1)])
-            if base_latent_map is not None:
-                axes[encoded_row, 0].imshow(base_latent_map, cmap="viridis", vmin=0.0, vmax=1.0)
+        axes[context_row, 0].set_title(base_label, fontsize=13)
         if base_target_obs is not None and gt_key in base_target_obs:
             base_gt_img = base_target_obs[gt_key][idx].permute(1, 2, 0).detach().cpu().numpy()
             base_gt_img = np.clip(base_gt_img, 0, 1)
@@ -1138,18 +1082,6 @@ def visualize_future_rollout_comparison(
         if motion_row is not None:
             blank_motion = _blank_latent_like(base_gt_img, fallback_size=224)
             axes[motion_row, 0].imshow(blank_motion, cmap="magma", vmin=0.0, vmax=1.0)
-        if future_latent_row is not None:
-            axes[future_latent_row, 0].text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=16, color="gray")
-            axes[future_latent_row, 0].set_facecolor("white")
-        if gt_future_latent_row is not None:
-            axes[gt_future_latent_row, 0].text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=16, color="gray")
-            axes[gt_future_latent_row, 0].set_facecolor("white")
-        if pred_gt_latent_diff_row is not None:
-            axes[pred_gt_latent_diff_row, 0].text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=16, color="gray")
-            axes[pred_gt_latent_diff_row, 0].set_facecolor("white")
-        if future_delta_row is not None:
-            axes[future_delta_row, 0].text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=16, color="gray")
-            axes[future_delta_row, 0].set_facecolor("white")
 
     for horizon_idx in range(min(horizon, total_future_cols)):
         col = start_col + horizon_idx
@@ -1170,22 +1102,6 @@ def visualize_future_rollout_comparison(
             if gt_key in motion_entry:
                 motion_map = motion_entry[gt_key][idx].detach().cpu().numpy()
                 axes[motion_row, col].imshow(motion_map, cmap="magma")
-        if future_latent_row is not None and horizon_idx < len(future_latent_seq):
-            latent_map = _latent_entry_to_heatmap(future_latent_seq[horizon_idx])
-            if latent_map is not None:
-                axes[future_latent_row, col].imshow(latent_map, cmap="viridis", vmin=0.0, vmax=1.0)
-        if gt_future_latent_row is not None and horizon_idx < len(gt_future_latent_seq):
-            gt_latent_map = _latent_entry_to_heatmap(gt_future_latent_seq[horizon_idx])
-            if gt_latent_map is not None:
-                axes[gt_future_latent_row, col].imshow(gt_latent_map, cmap="viridis", vmin=0.0, vmax=1.0)
-        if pred_gt_latent_diff_row is not None and horizon_idx < len(pred_gt_latent_diff_seq):
-            pred_gt_diff_map = _latent_entry_to_heatmap(pred_gt_latent_diff_seq[horizon_idx])
-            if pred_gt_diff_map is not None:
-                axes[pred_gt_latent_diff_row, col].imshow(pred_gt_diff_map, cmap="viridis", vmin=0.0, vmax=1.0)
-        if future_delta_row is not None and horizon_idx < len(future_delta_seq):
-            delta_map = _latent_entry_to_heatmap(future_delta_seq[horizon_idx])
-            if delta_map is not None:
-                axes[future_delta_row, col].imshow(delta_map, cmap="viridis", vmin=0.0, vmax=1.0)
 
     fig.suptitle(f"Future Rollout Visualization - Step {step}", fontsize=16)
     save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}.png")

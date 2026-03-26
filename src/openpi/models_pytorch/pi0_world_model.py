@@ -262,7 +262,7 @@ class GaussianDecoder(nn.Module):
         use_incremental_depth: bool = True,
         future_prediction_horizon: int = 1,
         use_velocity_future_gaussians: bool = False,
-        velocity_world_model_scale: float = 0.15,
+        velocity_world_model_scale: float = 0.5,
     ):
         super().__init__()
         self.token_dim = token_dim
@@ -296,23 +296,18 @@ class GaussianDecoder(nn.Module):
             predict_depth=predict_depth,
         )
 
-        # Future-query dynamics heads: predict a motion gate and 3D velocity / delta xyz in camera space.
+        # Future-query dynamics head: decode 16×16 motion tokens into a denser 64×64
+        # velocity field before projecting to the static Gaussian grid.
         if use_velocity_future_gaussians:
-            self.motion_gate_token_mlp = nn.Sequential(
-                nn.LayerNorm(token_dim),
-                nn.Linear(token_dim, token_dim),
-                nn.SiLU(),
-                nn.Linear(token_dim, 1),
+            self.velocity_head = nn.Sequential(
+                _UpsampleBlock(token_dim, 256),   # 16×16 -> 32×32
+                _UpsampleBlock(256, 128),         # 32×32 -> 64×64
+                nn.Conv2d(128, 3, 3, padding=1),
             )
-            self.velocity_token_mlp = nn.Sequential(
-                nn.LayerNorm(token_dim),
-                nn.Linear(token_dim, token_dim),
-                nn.SiLU(),
-                nn.Linear(token_dim, 3),
-            )
+            nn.init.xavier_uniform_(self.velocity_head[-1].weight, gain=0.01)
+            nn.init.zeros_(self.velocity_head[-1].bias)
         else:
-            self.motion_gate_token_mlp = None
-            self.velocity_token_mlp = None
+            self.velocity_head = None
 
     # ------------------------------------------------------------------
     # depth2pc — real-camera unprojection  (adapted from AD-FFgsStudio)
@@ -425,18 +420,17 @@ class GaussianDecoder(nn.Module):
         static_reference_params: dict,
         velocity_time_factor: float,
         step: int | None,
+        horizon_idx: int = 0,
         base_depth: torch.Tensor | None = None,
     ) -> dict:
-        """Reuse the base Gaussian template and predict gated future dynamics via delta xyz only."""
+        """Reuse the base Gaussian template and predict future dynamics via delta xyz only."""
         B, num_tokens, D = z.shape
         g = int(math.sqrt(num_tokens))
         if g * g != num_tokens:
             raise ValueError(f"velocity path expects square token grid, got N={num_tokens}")
 
-        gate_tok = self.motion_gate_token_mlp(z)  # [B, N, 1]
-        vel_tok = self.velocity_token_mlp(z)  # [B, N, 3]
-        gate_map = gate_tok.view(B, g, g, 1).permute(0, 3, 1, 2).contiguous()  # [B, 1, g, g]
-        vel_map = vel_tok.view(B, g, g, 3).permute(0, 3, 1, 2).contiguous()  # [B, 3, g, g]
+        motion_feat = z.permute(0, 2, 1).reshape(B, D, g, g)  # [B, D, 16, 16]
+        vel_map = self.velocity_head(motion_feat)  # [B, 3, 64, 64]
 
         xyz0 = static_reference_params["xyz"]
         Npts = xyz0.shape[1]
@@ -444,14 +438,11 @@ class GaussianDecoder(nn.Module):
         if H * W != Npts:
             raise ValueError(f"static xyz N={Npts} is not a square grid")
 
-        gate_up = F.interpolate(gate_map, size=(H, W), mode="bilinear", align_corners=False)
         vel_up = F.interpolate(vel_map, size=(H, W), mode="bilinear", align_corners=False)
-        gate_flat = gate_up.permute(0, 2, 3, 1).reshape(B, Npts, 1)
         vel_flat = vel_up.permute(0, 2, 3, 1).reshape(B, Npts, 3)
 
-        motion_gate = torch.sigmoid(gate_flat)
         raw_delta = torch.tanh(vel_flat) * self.velocity_world_model_scale * float(velocity_time_factor)
-        delta = motion_gate * raw_delta
+        delta = raw_delta
         xyz = xyz0 + delta.to(dtype=xyz0.dtype)
         xyz = torch.clamp(xyz, min=-100.0, max=100.0)
         xyz = torch.where(torch.isnan(xyz) | torch.isinf(xyz), torch.zeros_like(xyz), xyz)
@@ -469,15 +460,18 @@ class GaussianDecoder(nn.Module):
                     base_depth_map.unsqueeze(1), size=depth_map.shape[-2:], mode="bilinear", align_corners=False
                 ).squeeze(1)
             depth_delta_map = depth_map - base_depth_map.unsqueeze(1)
-        motion_gate_map = motion_gate.reshape(B, H, W)
 
         if step is not None and step % 400 == 0:
             import logging
 
+            static_scale_mean = static_reference_params["scales"].float().mean().item()
+            static_scale_max = static_reference_params["scales"].float().max().item()
             logging.info(
-                f"[VelocityDecoder] delta_xyz: scale={self.velocity_world_model_scale}, "
-                f"time_factor={velocity_time_factor:.4f}, gate_mean={motion_gate.mean().item():.6f}, "
-                f"gate_max={motion_gate.max().item():.6f}, |delta|_mean={delta.abs().mean().item():.6f}"
+                f"[VelocityDecoder][h={horizon_idx}][t+~{horizon_idx + 1}] delta_xyz: "
+                f"motion_scale={self.velocity_world_model_scale}, "
+                f"time_factor={velocity_time_factor:.4f}, |delta|_mean={delta.abs().mean().item():.6f}, "
+                f"|delta|_max={delta.abs().max().item():.6f}, static_gaussian_scale_mean={static_scale_mean:.6f}, "
+                f"static_gaussian_scale_max={static_scale_max:.6f}"
             )
 
         return {
@@ -488,7 +482,6 @@ class GaussianDecoder(nn.Module):
             "rotations": static_reference_params["rotations"],
             "depth_map": depth_map,
             "depth_delta_map": depth_delta_map,
-            "motion_gate_map": motion_gate_map,
             "raw_delta_xyz": raw_delta,
         }
 
@@ -498,6 +491,7 @@ class GaussianDecoder(nn.Module):
         static_reference_params: dict,
         velocity_time_factor: float,
         step: int | None,
+        horizon_idx: int = 0,
         base_depth: torch.Tensor | None = None,
     ) -> dict:
         """Decode shared motion-query tokens into a constant-velocity dynamic Gaussian update."""
@@ -506,6 +500,7 @@ class GaussianDecoder(nn.Module):
             static_reference_params,
             velocity_time_factor,
             step,
+            horizon_idx=horizon_idx,
             base_depth=base_depth,
         )
 
@@ -521,7 +516,7 @@ class GaussianDecoder(nn.Module):
         """Decode VLM tokens into Gaussian parameters.
 
         Current/base template decode uses the full ConvNet head.
-        Future decode reuses a provided static template and predicts only gated delta xyz.
+        Future decode reuses a provided static template and predicts only delta xyz.
         """
         if not skip_horizon_embedding:
             horizon_idx = max(0, min(int(horizon_idx), self.future_prediction_horizon - 1))
@@ -540,13 +535,14 @@ class GaussianDecoder(nn.Module):
         if (
             self.use_velocity_future_gaussians
             and static_reference_params is not None
-            and self.velocity_token_mlp is not None
+            and self.velocity_head is not None
         ):
             return self.decode_dynamic_gaussians_from_static(
                 z,
                 static_reference_params,
                 velocity_time_factor,
                 step,
+                horizon_idx=horizon_idx,
                 base_depth=base_depth,
             )
 

@@ -244,7 +244,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0321_lpips_future_5_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0325_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -279,6 +279,12 @@ class PI0Pytorch(nn.Module):
             config, 5 if self.use_world_tokens_in_prefix else 1
         )
         self.future_prediction_horizon = len(self.future_prediction_offsets)
+        self.use_velocity_future_gaussians = False
+        self.use_shared_motion_query_velocity = False
+        self.world_model = None
+        self.gaussian_renderer = None
+        self.lpips_fn = None
+        self.lpips_weight = getattr(config, "lpips_weight", 0.1)
         if self.use_world_tokens_in_prefix:
             # === Priority 1: Aligned Future Query Tokens ===
             # 256 future query tokens (matches 16×16 decoder grid)
@@ -293,24 +299,6 @@ class PI0Pytorch(nn.Module):
             # These represent "delta queries" for predicting changes from current frame
             self.future_query_tokens = nn.Parameter(
                 torch.randn(1, self.future_token_count, paligemma_config.width) * 0.02
-            )
-
-            # Temporal base weights: learnable weights for combining configured context frames to form base
-            # Initialized to favor recent frames, especially the current frame at offset 0.
-            if self.temporal_context_count == 3:
-                init_temporal_base_w = torch.tensor([0.1, 0.2, 0.7], dtype=torch.float32)
-            else:
-                init_temporal_base_w = torch.linspace(0.0, 1.0, steps=self.temporal_context_count, dtype=torch.float32)
-            self.temporal_base_w = nn.Parameter(init_temporal_base_w)
-
-            # Delta scale raw parameter. We optimize a raw scalar and map it via softplus
-            # so the effective scale stays positive. Initialize so softplus(raw) = 0.3.
-            init_delta_scale = torch.tensor(0.3, dtype=torch.float32)
-            self.delta_scale = nn.Parameter(torch.log(torch.expm1(init_delta_scale)))
-
-            # Delta role embedding: signals that future tokens predict changes, not full state
-            self.future_delta_embed = nn.Parameter(
-                torch.randn(1, 1, paligemma_config.width) * 0.02
             )
 
             # === NEW: Spatial Positional Encoding (16×16 grid) ===
@@ -341,106 +329,9 @@ class PI0Pytorch(nn.Module):
             )
             self.mta_to_future = nn.Linear(512, paligemma_config.width)
 
-            # Let future queries read the current Gaussian scene tokens before
-            # forming the future seed tokens.
-            self.future_query_cross_attn = nn.MultiheadAttention(
-                embed_dim=paligemma_config.width,
-                num_heads=8,
-                batch_first=True,
-            )
-            self.future_query_cross_attn_q_norm = nn.LayerNorm(paligemma_config.width)
-            self.future_query_cross_attn_kv_norm = nn.LayerNorm(paligemma_config.width)
-            self.future_query_frame_offset_embed = nn.Parameter(
-                torch.randn(self.temporal_context_count, paligemma_config.width) * 0.02
-            )
-
-            # Roll out a single future seed into short-horizon latents [t+1, ..., t+H].
-            self.future_horizon_embed = nn.Parameter(
-                torch.randn(self.future_prediction_horizon, paligemma_config.width) * 0.02
-            )
-            # Add a self-attention layer for spatial consistency during rollout
-            self.future_rollout_attn = nn.MultiheadAttention(
-                embed_dim=paligemma_config.width,
-                num_heads=8,
-                batch_first=True
-            )
-            self.future_rollout_mlp = nn.Sequential(
-                nn.LayerNorm(paligemma_config.width),
-                nn.Linear(paligemma_config.width, paligemma_config.width),
-                nn.SiLU(),
-                nn.Linear(paligemma_config.width, paligemma_config.width),
-            )
-
-            logging.info(
-                f"Initialized aligned future query tokens:\n"
-                f"  - Token count: {self.future_token_count}\n"
-                f"  - Spatial structure: {self.future_grid_size}×{self.future_grid_size}\n"
-                f"  - Spatial positional encoding: {'Sinusoidal + Learnable' if self.use_sinusoidal_spatial else 'Learnable only'}\n"
-                f"  - Aligned with VGGT tokens: {self.temporal_context_count * self.future_token_count} "
-                f"({self.temporal_context_count} frames × {self.future_token_count} tokens/frame)\n"
-                f"  - Future rollout horizon: {self.future_prediction_horizon}\n"
-                f"  - Future rollout offsets: {self.future_prediction_offsets}"
-            )
-        else:
-            self.world_token_count = 0
-            self.future_token_count = 0
-            self.world_token_proj = None
-            self.future_query_tokens = None
-            self.future_query_to_mta = None
-            self.future_mta_encoder = None
-            self.mta_to_future = None
-            self.future_query_cross_attn = None
-            self.future_query_cross_attn_q_norm = None
-            self.future_query_cross_attn_kv_norm = None
-            self.future_query_frame_offset_embed = None
-            self.future_horizon_embed = None
-            self.future_rollout_attn = None
-            self.future_rollout_mlp = None
-
-        
-        # --- VAE Token Compressor (Option B: Hybrid) ---
-        # VAE is used only for reconstruction supervision (auxiliary loss)
-        # Main pipeline still uses pooling/upsampling for efficiency
-        use_vae_supervision = getattr(config, "use_vae_supervision", False)
-        self.use_vae_supervision = use_vae_supervision
-        if use_vae_supervision and use_gaussian:
-            from .vae_token_compressor import VAETokenCompressor
-            # VAE compresses 1369 tokens to 100 tokens
-            # token_dim is the VGGT embed_dim (2048) or action_expert_width
-            vae_token_dim = paligemma_config.width  # Match action_expert_width
-            vae_beta = getattr(config, "vae_beta", 0.01)  # KL divergence weight
-            self.vae_compressor = VAETokenCompressor(
-                token_dim=vae_token_dim,
-                latent_tokens=100,  # Match pooled tokens
-                hidden_dim=512,
-                beta=vae_beta
-            )
-            logging.info(f"Initialized VAE Token Compressor for supervision (beta={vae_beta})")
-        else:
-            self.vae_compressor = None
-
-        # --- GaussianDecoder (replaces CrossAttentionWorldModel) ---
-        self.use_velocity_future_gaussians = False
-        self.use_shared_motion_query_velocity = False
-        if hasattr(config, "use_world_model") and config.use_world_model:
-            logging.info("Initializing GaussianDecoder...")
-
-            _vel_g = bool(getattr(config, "use_velocity_future_gaussians", False)) and self.use_world_tokens_in_prefix
+            _vel_g = bool(getattr(config, "use_velocity_future_gaussians", False))
             self.use_velocity_future_gaussians = _vel_g
-            self.use_shared_motion_query_velocity = _vel_g and bool(
-                getattr(config, "use_shared_motion_query_velocity", True)
-            )
-            if _vel_g:
-                if self.use_shared_motion_query_velocity:
-                    logging.info(
-                        "Velocity future Gaussians: paper-style shared motion query with static current template "
-                        f"(velocity_world_model_scale={getattr(config, 'velocity_world_model_scale', 0.15)})"
-                    )
-                else:
-                    logging.info(
-                        "Velocity future Gaussians: horizon 0 = full decode; h>0 = static + v(z_h) "
-                        f"(velocity_world_model_scale={getattr(config, 'velocity_world_model_scale', 0.15)})"
-                    )
+            self.use_shared_motion_query_velocity = _vel_g
 
             self.world_model = GaussianDecoder(
                 token_dim=paligemma_config.width,
@@ -451,7 +342,7 @@ class PI0Pytorch(nn.Module):
                 use_incremental_depth=getattr(config, "use_incremental_depth", True),
                 future_prediction_horizon=self.future_prediction_horizon,
                 use_velocity_future_gaussians=_vel_g,
-                velocity_world_model_scale=float(getattr(config, "velocity_world_model_scale", 0.15)),
+                velocity_world_model_scale=float(getattr(config, "velocity_world_model_scale", 0.5)),
             )
 
             # Initialize Gaussian Renderer (sh_degree=1 for DC + 1st order SH)
@@ -463,8 +354,6 @@ class PI0Pytorch(nn.Module):
                 logging.warning("Gaussian Renderer not available. Skipping rendering loss.")
 
             # Initialize LPIPS perceptual loss (optional)
-            self.lpips_fn = None
-            self.lpips_weight = getattr(config, "lpips_weight", 0.1)
             if getattr(config, "use_lpips", False):
                 try:
                     import lpips
@@ -478,9 +367,16 @@ class PI0Pytorch(nn.Module):
                 except ImportError:
                     logging.warning("lpips package not installed. Install with: pip install lpips")
         else:
-            self.world_model = None
-            self.gaussian_renderer = None
-            self.use_shared_motion_query_velocity = False
+            self.future_token_count = 0
+            self.future_grid_size = 0
+            self.world_token_count = 0
+            self.world_token_proj = None
+            self.future_query_tokens = None
+            self.future_query_to_mta = None
+            self.future_mta_encoder = None
+            self.mta_to_future = None
+            self.future_spatial_pos = None
+            self.use_sinusoidal_spatial = False
 
         # Initialize render loss weight (can be changed dynamically for staged training)
         self.render_loss_weight = getattr(config, "render_loss_weight", 0.1)  # 降低render loss权重，让action loss主导
@@ -496,7 +392,6 @@ class PI0Pytorch(nn.Module):
         self.future_motion_loss_min_weight = float(getattr(config, "future_motion_loss_min_weight", 0.35))
         self.future_motion_loss_max_weight = float(getattr(config, "future_motion_loss_max_weight", 4.0))
         self.future_motion_blur_kernel = max(1, int(getattr(config, "future_motion_blur_kernel", 9)))
-        self.future_motion_gate_loss_weight = float(getattr(config, "future_motion_gate_loss_weight", 0.1))
         if self.future_motion_blur_kernel % 2 == 0:
             self.future_motion_blur_kernel += 1
         self.future_horizon_curriculum_steps = int(getattr(config, "future_horizon_curriculum_steps", 0))
@@ -938,7 +833,7 @@ class PI0Pytorch(nn.Module):
         per_step_delta: torch.Tensor,
         horizon_weights: torch.Tensor,
     ) -> None:
-        """Log latent-space rollout diagnostics on the visualization cadence."""
+        """Log future-token / rollout diagnostics on the visualization cadence."""
         if step is None or step % 400 != 0:
             return
 
@@ -951,25 +846,26 @@ class PI0Pytorch(nn.Module):
         future_fp32 = z_future_pred_tokens.float()
         delta_rms_by_h = delta_fp32.pow(2).mean(dim=(0, 2, 3)).sqrt()
 
-        inter_horizon_l2 = torch.zeros(0, device=future_fp32.device, dtype=torch.float32)
-        t1_tH_l2 = torch.zeros((), device=future_fp32.device, dtype=torch.float32)
-        if future_fp32.shape[1] > 1:
-            inter_horizon_l2 = (future_fp32[:, 1:] - future_fp32[:, :-1]).pow(2).mean(dim=(0, 2, 3)).sqrt()
-            t1_tH_l2 = (future_fp32[:, -1] - future_fp32[:, 0]).pow(2).mean().sqrt()
+        inter_horizon_l2 = torch.zeros(0, device=delta_fp32.device, dtype=torch.float32)
+        t1_tH_l2 = torch.zeros((), device=delta_fp32.device, dtype=torch.float32)
+        if delta_fp32.shape[1] > 1:
+            inter_horizon_l2 = (delta_fp32[:, 1:] - delta_fp32[:, :-1]).pow(2).mean(dim=(0, 2, 3)).sqrt()
+            t1_tH_l2 = (delta_fp32[:, -1] - delta_fp32[:, 0]).pow(2).mean().sqrt()
 
-        seed_to_tH_l2 = (future_fp32[:, -1] - future_seed_tokens.float()).pow(2).mean().sqrt()
+        seed_to_token_l2 = (future_fp32 - future_seed_tokens.float()).pow(2).mean().sqrt()
         weights_str = ", ".join(f"{value:.3f}" for value in horizon_weights.detach().cpu().tolist())
         delta_rms_str = ", ".join(f"{value:.6f}" for value in delta_rms_by_h.detach().cpu().tolist())
         inter_l2_str = ", ".join(f"{value:.6f}" for value in inter_horizon_l2.detach().cpu().tolist()) or "N/A"
         logging.info(
             f"Step {step}: Future Rollout Diagnostics | "
-            f"raw_delta_abs_mean={delta_fp32.abs().mean().item():.6f}, "
-            f"raw_delta_rms={delta_fp32.pow(2).mean().sqrt().item():.6f}, "
-            f"raw_delta_abs_max={delta_fp32.abs().max().item():.6f}, "
+            f"motion_token_abs_mean={future_fp32.abs().mean().item():.6f}, "
+            f"motion_token_rms={future_fp32.pow(2).mean().sqrt().item():.6f}, "
+            f"scaled_delta_abs_mean={delta_fp32.abs().mean().item():.6f}, "
+            f"scaled_delta_rms={delta_fp32.pow(2).mean().sqrt().item():.6f}, "
             f"delta_rms_by_h=[{delta_rms_str}], "
             f"inter_horizon_l2=[{inter_l2_str}], "
             f"t1_tH_l2={t1_tH_l2.item():.6f}, "
-            f"seed_to_tH_l2={seed_to_tH_l2.item():.6f}, "
+            f"seed_to_token_l2={seed_to_token_l2.item():.6f}, "
             f"horizon_weights=[{weights_str}]"
         )
 
@@ -1003,63 +899,6 @@ class PI0Pytorch(nn.Module):
         logging.info(
             f"Step {step}: Future Rollout Pixel LPIPS(t1,t{len(rendered_obs_seq)})[{view_key}] = {lpips_value.item():.6f}"
         )
-
-    def _rollout_future_latents(self, future_seed_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Autoregressive rollout: z_{t+h} = z_{t+h-1} + delta_h.
-
-        Each step's MLP input is the *previous* latent + horizon embedding,
-        so the model can condition on accumulated state rather than
-        predicting all horizons independently from the same seed.
-        """
-        if self.future_rollout_mlp is None or self.future_horizon_embed is None:
-            zero_delta = torch.zeros_like(future_seed_tokens[:, None, :, :])
-            return future_seed_tokens[:, None, :, :], zero_delta
-
-        bsize, num_tokens, width = future_seed_tokens.shape
-        horizon = self.future_horizon_embed.shape[0]
-
-        rollout_tokens = []
-        rollout_deltas = []
-        running = future_seed_tokens  # [B, N, D]
-        for h in range(horizon):
-            mlp_input = running + self.future_horizon_embed[h][None, None, :]  # [B, N, D]
-            
-            # 1. Spatial Self-Attention for structural consistency
-            attn_out, _ = self.future_rollout_attn(mlp_input, mlp_input, mlp_input)
-            mlp_input = mlp_input + attn_out  # Residual connection
-            
-            # 2. Point-wise MLP
-            delta_h = self.future_rollout_mlp(mlp_input.reshape(bsize * num_tokens, width))
-            delta_h = delta_h.view(bsize, num_tokens, width)
-            
-            running = running + delta_h
-            rollout_tokens.append(running)
-            rollout_deltas.append(delta_h)
-
-        return torch.stack(rollout_tokens, dim=1), torch.stack(rollout_deltas, dim=1)  # [B, H, N, D]
-
-    def _build_shared_motion_query_rollout(
-        self, future_motion_query: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build paper-style shared constant-velocity motion queries for all horizons."""
-        horizon = max(0, self.future_prediction_horizon)
-        if horizon <= 0:
-            empty = future_motion_query[:, None, :, :].new_zeros(
-                future_motion_query.shape[0], 0, future_motion_query.shape[1], future_motion_query.shape[2]
-            )
-            return empty, empty
-
-        device = future_motion_query.device
-        dtype = future_motion_query.dtype
-        offsets = torch.tensor(
-            self.future_prediction_offsets[:horizon], device=device, dtype=dtype
-        )
-        base_offset = offsets[0].clamp_min(1.0)
-        time_factors = (offsets / base_offset).view(1, horizon, 1, 1)
-        shared_queries = future_motion_query.unsqueeze(1).expand(-1, horizon, -1, -1)
-        motion_deltas = shared_queries * time_factors
-        future_motion_queries = shared_queries
-        return future_motion_queries, motion_deltas
 
     def _get_temporal_observation_length(self, observation) -> int:
         """Infer the temporal length stored in a future observation sequence."""
@@ -1204,12 +1043,6 @@ class PI0Pytorch(nn.Module):
         )
         return weight_map.squeeze(1)
 
-    def _build_future_motion_gate_target(self, motion_weight_map: torch.Tensor) -> torch.Tensor:
-        """Convert the soft motion weight map into a bounded gate target in [0, 1]."""
-        gate_target = (motion_weight_map.float() - 1.0) / max(self.future_motion_loss_gain, 1e-6)
-        gate_target = torch.clamp(gate_target, min=0.0, max=1.0)
-        return gate_target
-
     def _compute_gaussian_supervision_loss(
         self,
         gaussian_params: dict,
@@ -1243,7 +1076,6 @@ class PI0Pytorch(nn.Module):
 
         depth_map = gaussian_params.pop("depth_map", None)
         depth_delta_map = gaussian_params.pop("depth_delta_map", None)
-        motion_gate_map = gaussian_params.pop("motion_gate_map", None)
         raw_delta_xyz = gaussian_params.pop("raw_delta_xyz", None)
 
         if step is not None and step % 400 == 0:
@@ -1261,7 +1093,6 @@ class PI0Pytorch(nn.Module):
             logging.info(
                 f"Step {step}{time_suffix}: depth_map={depth_map is not None}, "
                 f"depth_delta_map={depth_delta_map is not None}, "
-                f"motion_gate_map={motion_gate_map is not None}, "
                 f"raw_delta_abs_mean={raw_delta_abs_mean:.6f}, "
                 f"has_depth_attr={hasattr(target_observation, 'depth')}, "
                 f"depth_value={target_observation.depth is not None if hasattr(target_observation, 'depth') else 'N/A'}, "
@@ -1383,24 +1214,6 @@ class PI0Pytorch(nn.Module):
             )
             if torch.isfinite(render_loss):
                 total_loss = total_loss + self.render_loss_weight * render_loss.to(total_loss.dtype)
-
-            if motion_gate_map is not None and "agent" in motion_weight_maps:
-                gate_target = self._build_future_motion_gate_target(motion_weight_maps["agent"])
-                gate_pred = motion_gate_map.float()
-                if gate_pred.shape != gate_target.shape:
-                    gate_pred = F.interpolate(
-                        gate_pred.unsqueeze(1), size=gate_target.shape[-2:], mode="bilinear", align_corners=False
-                    ).squeeze(1)
-                motion_gate_loss = F.smooth_l1_loss(gate_pred, gate_target)
-                if torch.isfinite(motion_gate_loss):
-                    total_loss = total_loss + self.future_motion_gate_loss_weight * motion_gate_loss
-                render_loss_dict["loss_motion_gate"] = motion_gate_loss
-                if step is not None and step % 400 == 0:
-                    logging.info(
-                        f"Step {step}{time_suffix}: Motion Gate Loss = {motion_gate_loss.item():.6f}, "
-                        f"weight={self.future_motion_gate_loss_weight}, gate_mean={gate_pred.mean().item():.4f}, "
-                        f"target_mean={gate_target.mean().item():.4f}"
-                    )
 
             if "sh" in gaussian_params:
                 sh_dc = gaussian_params["sh"]
@@ -1670,11 +1483,23 @@ class PI0Pytorch(nn.Module):
             gaussian_embs, g_mask, mta_features = gaussian_result
         else:
             gaussian_embs, g_mask = gaussian_result
-        if gaussian_embs is not None:
-             embs.append(gaussian_embs)
-             pad_masks.append(g_mask)
-             # Attention: 3DGS tokens act as context
-             g_len = gaussian_embs.shape[1]
+
+        gaussian_embs_for_prefix = gaussian_embs
+        g_mask_for_prefix = g_mask
+        if (
+            gaussian_embs is not None
+            and self.use_world_tokens_in_prefix
+            and self.future_token_count > 0
+            and gaussian_embs.shape[1] >= self.future_token_count
+        ):
+            gaussian_embs_for_prefix = gaussian_embs[:, -self.future_token_count :, :]
+            g_mask_for_prefix = g_mask[:, -self.future_token_count :]
+
+        if gaussian_embs_for_prefix is not None:
+             embs.append(gaussian_embs_for_prefix)
+             pad_masks.append(g_mask_for_prefix)
+             # Attention: only current-t 3DGS tokens enter the VLM prefix; earlier frames stay in MTA only.
+             g_len = gaussian_embs_for_prefix.shape[1]
              att_masks += [0] * g_len
              segment_lengths['gaussian'] = g_len
 
@@ -1741,54 +1566,11 @@ class PI0Pytorch(nn.Module):
             # World tokens can attend to all previous tokens (images, language, gaussian)
             att_masks += [0] * self.world_token_count
         
-        # --- Add Future Query Tokens (Coupled Mask) with Temporal Base ---
         if self.use_world_tokens_in_prefix and self.future_query_tokens is not None:
             B = pad_masks[0].shape[0] if pad_masks else 1
             device = pad_masks[0].device if pad_masks else next(self.parameters()).device
-            token_dim = self.future_query_tokens.shape[-1]
             future_dtype = self.future_query_tokens.dtype
-            use_single_frame_mode = getattr(self.config, "use_single_frame_mode", False)
 
-            # 1. Construct temporal base from gaussian_embs
-            if gaussian_embs is not None:
-                num_tokens = gaussian_embs.shape[1]
-                D = gaussian_embs.shape[-1]
-
-                if use_single_frame_mode:
-                    # Single-frame mode: use current frame t as base
-                    if num_tokens == self.future_token_count:
-                        z_base = gaussian_embs  # [B, 256, D]
-                        gaussian_for_cross_attn = gaussian_embs
-                    else:
-                        logging.warning(f"Single-frame mode expects {self.future_token_count} tokens, got {num_tokens}. Using zero base.")
-                        z_base = torch.zeros(B, self.future_token_count, D, device=device, dtype=future_dtype)
-                        gaussian_for_cross_attn = gaussian_embs
-                else:
-                    expected_context_tokens = self.temporal_context_count * self.future_token_count
-                    if num_tokens == expected_context_tokens:
-                        g = gaussian_embs.view(B, self.temporal_context_count, self.future_token_count, -1)
-                        w = torch.softmax(self.temporal_base_w[: self.temporal_context_count], dim=0)
-                        z_base = torch.sum(w.view(1, self.temporal_context_count, 1, 1) * g, dim=1)
-
-                        frame_offset_embed = self.future_query_frame_offset_embed[: self.temporal_context_count].to(gaussian_embs.dtype)
-                        gaussian_for_cross_attn = (
-                            g + frame_offset_embed.view(1, self.temporal_context_count, 1, -1)
-                        ).reshape(B, expected_context_tokens, -1)
-                    elif num_tokens == self.future_token_count:
-                        z_base = gaussian_embs
-                        gaussian_for_cross_attn = gaussian_embs
-                    else:
-                        logging.warning(
-                            f"Multi-frame mode expects {expected_context_tokens} tokens, got {num_tokens}. Using zero base."
-                        )
-                        z_base = torch.zeros(B, self.future_token_count, D, device=device, dtype=future_dtype)
-                        gaussian_for_cross_attn = gaussian_embs
-            else:
-                # No gaussian_embs: use zero base
-                z_base = torch.zeros(B, self.future_token_count, token_dim, device=device, dtype=future_dtype)
-                gaussian_for_cross_attn = None
-
-            # 2. Delta query tokens (learnable, predict changes)
             delta_q = self.future_query_tokens.expand(B, -1, -1)  # [B, 256, D]
             if (
                 mta_features is not None
@@ -1803,72 +1585,39 @@ class PI0Pytorch(nn.Module):
                 frames_match = has_all_layers and all(
                     feature.shape[1] == expected_frames for feature in layer_features
                 )
-                if has_all_layers and frames_match:
-                    motion_tokens = self.future_query_to_mta(delta_q)  # [B, 256, 512]
-                    motion_tokens = motion_tokens.unsqueeze(1).expand(-1, expected_frames, -1, -1)
-                    motion_tokens = self.future_mta_encoder(motion_tokens, layer_features)
-                    ta_current = motion_tokens[:, expected_frames - 1]
-                    delta_q = delta_q + self.mta_to_future(ta_current).to(delta_q.dtype)
-                else:
+                if not has_all_layers:
                     missing_layers = [
                         str(layer_idx)
                         for layer_idx, feature in zip(layer_order, layer_features, strict=True)
                         if feature is None
                     ]
+                    raise RuntimeError(
+                        "Missing MTA features for layers " + ", ".join(missing_layers)
+                    )
+                if not frames_match:
                     frame_mismatches = [
                         f"{layer_idx}:{feature.shape[1]}"
                         for layer_idx, feature in zip(layer_order, layer_features, strict=True)
                         if feature is not None and feature.shape[1] != expected_frames
                     ]
-                    if missing_layers:
-                        logging.warning(
-                            "Missing MTA features for layers %s. Falling back to future query cross-attention.",
-                            ", ".join(missing_layers),
-                        )
-                    elif frame_mismatches:
-                        logging.warning(
-                            "MTA feature frame count mismatch (expected %s, got %s). Falling back to future query cross-attention.",
-                            expected_frames,
-                            ", ".join(frame_mismatches),
-                        )
-                    if gaussian_for_cross_attn is not None and self.future_query_cross_attn is not None:
-                        query_tokens = self.future_query_cross_attn_q_norm(delta_q)
-                        key_value_tokens = self.future_query_cross_attn_kv_norm(gaussian_for_cross_attn.to(delta_q.dtype))
-                        cross_attn_out, _ = self.future_query_cross_attn(
-                            query_tokens,
-                            key_value_tokens,
-                            key_value_tokens,
-                            need_weights=False,
-                        )
-                        delta_q = delta_q + cross_attn_out
-            elif gaussian_for_cross_attn is not None and self.future_query_cross_attn is not None:
-                query_tokens = self.future_query_cross_attn_q_norm(delta_q)
-                key_value_tokens = self.future_query_cross_attn_kv_norm(gaussian_for_cross_attn.to(delta_q.dtype))
-                cross_attn_out, _ = self.future_query_cross_attn(
-                    query_tokens,
-                    key_value_tokens,
-                    key_value_tokens,
-                    need_weights=False,
-                )
-                delta_q = delta_q + cross_attn_out
-            z_base = z_base.to(delta_q.dtype)
-            delta_scale = F.softplus(self.delta_scale)
+                    raise RuntimeError(
+                        f"MTA feature frame count mismatch (expected {expected_frames}, got {', '.join(frame_mismatches)})"
+                    )
 
-            # 3. Future delta without action coupling.
-            future_tokens = z_base + delta_scale * delta_q + self.future_delta_embed  # [B, 256, D]
+                motion_tokens = self.future_query_to_mta(delta_q)  # [B, 256, 512]
+                motion_tokens = motion_tokens.unsqueeze(1).expand(-1, expected_frames, -1, -1)
+                motion_tokens = self.future_mta_encoder(motion_tokens, layer_features)
+                ta_current = motion_tokens[:, expected_frames - 1]
+                future_tokens = self.mta_to_future(ta_current).to(future_dtype)
+            else:
+                raise RuntimeError("MTA-only future token path requires mta_features and MTA modules")
 
-            # 5. Add spatial positional encoding (16×16 grid structure)
-            # Reshape spatial pos: [16, 16, D] -> [256, D]
             spatial_pos = self.future_spatial_pos.reshape(1, self.future_token_count, -1)  # [1, 256, D]
-
-            # Add sinusoidal encoding if enabled
             if hasattr(self, 'use_sinusoidal_spatial') and self.use_sinusoidal_spatial:
                 sinusoidal_pos = self.future_spatial_sinusoidal.reshape(1, self.future_token_count, -1)  # [1, 256, D]
                 spatial_pos = spatial_pos + sinusoidal_pos
 
-            # Add spatial positional encoding to future tokens
-            future_tokens = future_tokens + spatial_pos  # [B, 256, D]
-
+            future_tokens = future_tokens + spatial_pos.to(future_tokens.dtype)
             future_mask = torch.ones(B, self.future_token_count, dtype=torch.bool, device=device)
 
             embs.append(future_tokens)
@@ -2186,7 +1935,7 @@ class PI0Pytorch(nn.Module):
 
         temporal_frames = self._get_temporal_frames_for_viz(preprocessed_observation)
         available_future_steps = self._get_temporal_observation_length(future_observation)
-        rollout_horizon = min(z_future_pred_tokens.shape[1], available_future_steps or 1)
+        rollout_horizon = min(self.future_prediction_horizon, available_future_steps or 1)
         if rollout_horizon <= 0:
             return
 
@@ -2210,11 +1959,6 @@ class PI0Pytorch(nn.Module):
         target_obs_seq = []
         rendered_obs_seq = []
         motion_weight_seq = []
-        encoded_latent_seq = []
-        gt_future_latent_seq = []
-        pred_gt_latent_diff_seq = []
-        future_latent_seq = []
-        future_delta_seq = []
         render_views = None
         base_target_obs = None
         base_rendered_obs = None
@@ -2272,113 +2016,6 @@ class PI0Pytorch(nn.Module):
             return rendered_obs
 
         with torch.no_grad():
-            if getattr(self.gaussian_adapter, "use_gaussian", False):
-                try:
-                    gaussian_inputs_viz = self._prepare_gaussian_inputs(
-                        preprocessed_observation,
-                        z_future_pred_tokens.device,
-                        z_future_pred_tokens.shape[0],
-                        is_training=True,
-                    )
-                    if gaussian_inputs_viz is not None:
-                        gaussian_embs_viz, _ = self.gaussian_adapter(
-                            gaussian_inputs_viz,
-                            step=step,
-                            visualize=False,
-                        )
-                        tokens_per_frame = int(getattr(self.gaussian_adapter, "tokens_per_frame", 0) or 0)
-                        if step is not None and step % 400 == 0:
-                            logging.info(
-                                "Step %s: encoded latent viz status | gaussian_inputs_viz=%s | gaussian_embs_viz=%s | tokens_per_frame=%s",
-                                step,
-                                tuple(gaussian_inputs_viz.shape),
-                                None if gaussian_embs_viz is None else tuple(gaussian_embs_viz.shape),
-                                tokens_per_frame,
-                            )
-                        if gaussian_embs_viz is not None and tokens_per_frame > 0 and gaussian_embs_viz.shape[1] >= tokens_per_frame:
-                            num_frames = gaussian_embs_viz.shape[1] // tokens_per_frame
-                            encoded_latent_seq = [
-                                gaussian_embs_viz[:1, frame_idx * tokens_per_frame:(frame_idx + 1) * tokens_per_frame].float()
-                                for frame_idx in range(num_frames)
-                            ]
-                            if step is not None and step % 400 == 0:
-                                logging.info(
-                                    "Step %s: encoded latent viz extracted %s frame chunks from %s tokens",
-                                    step,
-                                    len(encoded_latent_seq),
-                                    gaussian_embs_viz.shape[1],
-                                )
-                        elif step is not None and step % 400 == 0:
-                            logging.warning(
-                                "Step %s: encoded latent viz skipped | gaussian_embs_viz is None=%s | tokens_per_frame=%s | total_tokens=%s",
-                                step,
-                                gaussian_embs_viz is None,
-                                tokens_per_frame,
-                                None if gaussian_embs_viz is None else gaussian_embs_viz.shape[1],
-                            )
-                except Exception as latent_viz_error:
-                    logging.warning(f"Step {step}: encoded latent visualization prep failed: {latent_viz_error}")
-
-            future_latent_seq = [
-                z_future_pred_tokens[:1, horizon_idx].float()
-                for horizon_idx in range(rollout_horizon)
-            ]
-            if per_step_delta is not None:
-                future_delta_seq = [
-                    per_step_delta[:1, horizon_idx].float()
-                    for horizon_idx in range(min(rollout_horizon, per_step_delta.shape[1]))
-                ]
-
-            gt_future_latent_seq = []
-            pred_gt_latent_diff_seq = []
-            if getattr(self.gaussian_adapter, "use_gaussian", False) and future_observation is not None:
-                try:
-                    available_future_steps = self._get_temporal_observation_length(future_observation)
-                    tokens_per_frame = int(getattr(self.gaussian_adapter, "tokens_per_frame", 0) or 0)
-                    for horizon_idx in range(min(rollout_horizon, available_future_steps)):
-                        future_target = self._slice_temporal_observation(future_observation, horizon_idx)
-                        future_inputs_viz = self._prepare_gaussian_inputs(
-                            future_target,
-                            z_future_pred_tokens.device,
-                            z_future_pred_tokens.shape[0],
-                            is_training=False,
-                        )
-                        if future_inputs_viz is None:
-                            gt_future_latent_seq.append(None)
-                            pred_gt_latent_diff_seq.append(None)
-                            continue
-
-                        gt_future_embs, _ = self.gaussian_adapter(
-                            future_inputs_viz,
-                            step=step,
-                            visualize=False,
-                        )
-                        if gt_future_embs is None:
-                            gt_future_latent_seq.append(None)
-                            pred_gt_latent_diff_seq.append(None)
-                            continue
-
-                        gt_tokens = gt_future_embs[:1].float()
-                        if tokens_per_frame > 0 and gt_tokens.shape[1] >= tokens_per_frame:
-                            gt_tokens = gt_tokens[:, :tokens_per_frame]
-                        gt_future_latent_seq.append(gt_tokens)
-
-                        pred_tokens = z_future_pred_tokens[:1, horizon_idx].float()
-                        min_tokens = min(pred_tokens.shape[1], gt_tokens.shape[1])
-                        min_width = min(pred_tokens.shape[2], gt_tokens.shape[2])
-                        pred_gt_latent_diff_seq.append(
-                            (pred_tokens[:, :min_tokens, :min_width] - gt_tokens[:, :min_tokens, :min_width]).abs()
-                        )
-
-                    if step is not None and step % 400 == 0:
-                        logging.info(
-                            "Step %s: gt future latent viz extracted %s horizons",
-                            step,
-                            sum(latent is not None for latent in gt_future_latent_seq),
-                        )
-                except Exception as future_latent_viz_error:
-                    logging.warning(f"Step {step}: gt future latent visualization prep failed: {future_latent_viz_error}")
-
             base_depth = getattr(preprocessed_observation, "depth", None)
             if base_depth is not None and base_depth.ndim == 5:
                 base_depth = base_depth[:, -1]
@@ -2409,7 +2046,7 @@ class PI0Pytorch(nn.Module):
                     vtf = float(oh) / float(o0) if o0 else 1.0
 
                 gaussian_params = self.world_model.decode(
-                    z_future_pred_tokens[:, horizon_idx].float(),
+                    z_future_pred_tokens.float(),
                     future_observation=future_target,
                     gaussian_adapter=self.gaussian_adapter,
                     camera_params=camera_params_for_decode,
@@ -2478,11 +2115,6 @@ class PI0Pytorch(nn.Module):
             base_label="t/base",
             motion_weight_seq=motion_weight_seq,
             context_labels=getattr(preprocessed_observation, "raw_temporal_labels", self._temporal_context_labels()),
-            encoded_latent_seq=encoded_latent_seq,
-            future_latent_seq=future_latent_seq,
-            gt_future_latent_seq=gt_future_latent_seq,
-            pred_gt_latent_diff_seq=pred_gt_latent_diff_seq,
-            future_delta_seq=future_delta_seq,
         )
         self._log_future_rollout_pixel_lpips(step, rendered_obs_seq)
 
@@ -2593,45 +2225,19 @@ class PI0Pytorch(nn.Module):
 
             future_end = future_start + segment_lengths['future']
             z_t1_pred_tokens = prefix_out[:, future_start:future_end, :]  # [B, future_token_count, D]
+            z_future_pred_tokens = z_t1_pred_tokens
 
-            # Paper-style path: one shared motion query predicts a short-horizon constant-velocity field.
-            # Compatibility path: keep the old autoregressive latent rollout when explicitly disabled.
-            if self.use_shared_motion_query_velocity:
-                z_future_pred_tokens, per_step_delta = self._build_shared_motion_query_rollout(z_t1_pred_tokens)
-            else:
-                z_future_pred_tokens, per_step_delta = self._rollout_future_latents(z_t1_pred_tokens)
-
-            # Future-rollout regularization: penalise per-step delta magnitude.
-            # For autoregressive rollout, regularise each step's increment separately.
-            horizon = z_future_pred_tokens.shape[1]
-            if horizon > 0:
-                delta_reg_weights = self._get_future_horizon_loss_weights(
-                    step, horizon, per_step_delta.device, torch.float32
+            if step is not None and step % 400 == 0:
+                logging.info(
+                    f"Step {step}: Future Motion Token Stats | "
+                    f"abs_mean={z_t1_pred_tokens.float().abs().mean().item():.6f}, "
+                    f"rms={z_t1_pred_tokens.float().pow(2).mean().sqrt().item():.6f}, "
+                    "mode=direct motion-aware velocity token"
                 )
-                raw_delta_reg = (
-                    per_step_delta.float().pow(2).mean(dim=(0, 2, 3)) * delta_reg_weights
-                ).sum() / delta_reg_weights.sum().clamp_min(1e-6)
-                delta_reg = self.future_delta_reg_weight * raw_delta_reg
-                if torch.isfinite(delta_reg):
-                    loss = loss + delta_reg.to(loss.dtype)
-                self._log_future_rollout_diagnostics(
-                    step,
-                    z_t1_pred_tokens,
-                    z_future_pred_tokens,
-                    per_step_delta,
-                    delta_reg_weights,
-                )
-
-                if step is not None and step % 400 == 0:
-                    mode_desc = "shared motion-query velocity" if self.use_shared_motion_query_velocity else "autoregressive latent rollout"
-                    logging.info(
-                        f"Step {step}: Future Motion Delta Reg = {delta_reg.item():.6f}, "
-                        f"raw={raw_delta_reg.item():.6f}, weight={self.future_delta_reg_weight}, mode={mode_desc}"
-                    )
         # --- World Model Render Loss (render-only, no forward loss) ---
         if self.use_world_tokens_in_prefix and z_future_pred_tokens is not None and future_observation is not None:
             available_future_steps = self._get_temporal_observation_length(future_observation)
-            rollout_horizon = min(z_future_pred_tokens.shape[1], available_future_steps or 1)
+            rollout_horizon = min(self.future_prediction_horizon, available_future_steps or 1)
             world_model_loss = torch.zeros((), dtype=torch.float32, device=loss.device)
             horizon_loss_weights = self._get_future_horizon_loss_weights(
                 step, rollout_horizon, loss.device, torch.float32
@@ -2669,6 +2275,37 @@ class PI0Pytorch(nn.Module):
                     logging.warning(f"Current-frame static reconstruction failed: {e}")
                     static_template = None
 
+            if rollout_horizon > 0:
+                delta_reg_weights = self._get_future_horizon_loss_weights(
+                    step, rollout_horizon, z_future_pred_tokens.device, torch.float32
+                )
+                per_horizon_delta = []
+                for horizon_idx in range(rollout_horizon):
+                    o0 = self.future_prediction_offsets[0]
+                    oh = self.future_prediction_offsets[horizon_idx]
+                    time_factor = float(oh) / float(o0) if o0 else 1.0
+                    per_horizon_delta.append(z_future_pred_tokens.float() * time_factor)
+                per_step_delta = torch.stack(per_horizon_delta, dim=1)
+                raw_delta_reg = (
+                    per_step_delta.pow(2).mean(dim=(0, 2, 3)) * delta_reg_weights
+                ).sum() / delta_reg_weights.sum().clamp_min(1e-6)
+                delta_reg = self.future_delta_reg_weight * raw_delta_reg
+                if torch.isfinite(delta_reg):
+                    loss = loss + delta_reg.to(loss.dtype)
+                self._log_future_rollout_diagnostics(
+                    step,
+                    z_t1_pred_tokens,
+                    z_future_pred_tokens,
+                    per_step_delta,
+                    delta_reg_weights,
+                )
+                if step is not None and step % 400 == 0:
+                    logging.info(
+                        f"Step {step}: Future Motion Delta Reg = {delta_reg.item():.6f}, "
+                        f"raw={raw_delta_reg.item():.6f}, weight={self.future_delta_reg_weight}, "
+                        "mode=direct motion-aware velocity token"
+                    )
+
             for horizon_idx in range(rollout_horizon):
                 future_target = (
                     self._slice_temporal_observation(future_observation, horizon_idx)
@@ -2691,7 +2328,7 @@ class PI0Pytorch(nn.Module):
                     )
 
                 horizon_loss = self._compute_world_model_frame_loss(
-                    z_future_pred_tokens[:, horizon_idx],
+                    z_future_pred_tokens,
                     future_target,
                     preprocessed_observation,
                     step=step,
@@ -2708,17 +2345,17 @@ class PI0Pytorch(nn.Module):
 
                 import torch.distributed as dist
 
-                should_log = step is not None and step % 400 == 0
+                should_log = step is not None and step % 200 == 0
                 is_main_process = not dist.is_initialized() or dist.get_rank() == 0
                 if should_log and is_main_process:
                     try:
                         self._visualize_future_rollout(
                             step,
-                            z_future_pred_tokens[:, :rollout_horizon],
+                            z_future_pred_tokens,
                             future_observation,
                             preprocessed_observation,
                             static_template=static_template,
-                            per_step_delta=per_step_delta[:, :rollout_horizon],
+                            per_step_delta=per_step_delta,
                         )
                     except Exception as viz_error:
                         logging.warning(f"Step {step}: Future rollout visualization failed: {viz_error}")
