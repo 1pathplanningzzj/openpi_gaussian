@@ -70,6 +70,12 @@ class Pi0Config(_model.BaseModelConfig):
     use_velocity_future_gaussians: bool = False
     # Scale for camera-space displacement from predicted velocity (meters-scale heuristic).
     velocity_world_model_scale: float = 2.0
+    # Optional masked 3D flow supervision on raw_delta_xyz.
+    flow_loss_weight: float = 0.0
+    flow_first_horizon_only: bool = True
+    # Optional per-horizon multipliers for flow supervision, e.g. (1.0, 0.7, 0.4, 0.2, 0.1).
+    # If unset, all horizons use weight 1.0.
+    flow_horizon_weights: tuple[float, ...] | None = None
     # LPIPS perceptual loss options
     use_lpips: bool = False  # Whether to use LPIPS perceptual loss for rendering
     lpips_weight: float = 0.1  # Weight for LPIPS perceptual loss

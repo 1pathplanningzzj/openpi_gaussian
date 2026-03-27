@@ -244,7 +244,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0326_lpips_future_5_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0327_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -383,9 +383,13 @@ class PI0Pytorch(nn.Module):
         # Initialize render loss weight (can be changed dynamically for staged training)
         self.render_loss_weight = getattr(config, "render_loss_weight", 0.1)  # 降低render loss权重，让action loss主导
         self.depth_loss_weight = getattr(config, "depth_loss_weight", 0.1)
-        self.delta_depth_loss_weight = getattr(config, "delta_depth_loss_weight", 0.0)
-        # Default to supervising delta depth on every predicted future horizon.
-        self.delta_depth_first_horizon_only = bool(getattr(config, "delta_depth_first_horizon_only", False))
+        self.flow_loss_weight = float(getattr(config, "flow_loss_weight", 0.0))
+        self.flow_first_horizon_only = bool(getattr(config, "flow_first_horizon_only", True))
+        raw_flow_horizon_weights = getattr(config, "flow_horizon_weights", None)
+        if raw_flow_horizon_weights:
+            self.flow_horizon_weights = [float(weight) for weight in raw_flow_horizon_weights]
+        else:
+            self.flow_horizon_weights = None
         self.future_delta_reg_weight = getattr(config, "future_delta_reg_weight", 1e-4)
         self.future_motion_loss_gain = float(getattr(config, "future_motion_loss_gain", 2.0))
         self.future_motion_rgb_threshold = float(getattr(config, "future_motion_rgb_threshold", 0.03))
@@ -954,6 +958,16 @@ class PI0Pytorch(nn.Module):
             else observation.tokenized_prompt_mask
         )
         depth = observation.depth[:, index] if getattr(observation, "depth", None) is not None and observation.depth.ndim == 5 else getattr(observation, "depth", None)
+        flow_3d = (
+            observation.flow_3d[:, index]
+            if getattr(observation, "flow_3d", None) is not None and observation.flow_3d.ndim == 5
+            else getattr(observation, "flow_3d", None)
+        )
+        flow_valid_mask = (
+            observation.flow_valid_mask[:, index]
+            if getattr(observation, "flow_valid_mask", None) is not None and observation.flow_valid_mask.ndim == 4
+            else getattr(observation, "flow_valid_mask", None)
+        )
 
         return SimpleNamespace(
             images=images,
@@ -964,6 +978,8 @@ class PI0Pytorch(nn.Module):
             token_ar_mask=getattr(observation, "token_ar_mask", None),
             token_loss_mask=getattr(observation, "token_loss_mask", None),
             depth=depth,
+            flow_3d=flow_3d,
+            flow_valid_mask=flow_valid_mask,
         )
 
 
@@ -1189,30 +1205,18 @@ class PI0Pytorch(nn.Module):
             base_depth = base_depth[:, -1]
 
         depth_map = gaussian_params.pop("depth_map", None)
-        depth_delta_map = gaussian_params.pop("depth_delta_map", None)
+        gaussian_params.pop("depth_delta_map", None)
         raw_delta_xyz = gaussian_params.pop("raw_delta_xyz", None)
 
         if step is not None and step % 400 == 0:
-            depth_delta_mean = float("nan")
-            depth_delta_abs_mean = float("nan")
-            depth_delta_abs_max = float("nan")
             raw_delta_abs_mean = float("nan")
-            if depth_delta_map is not None:
-                delta_stats_map = depth_delta_map.float()
-                depth_delta_mean = delta_stats_map.mean().item()
-                depth_delta_abs_mean = delta_stats_map.abs().mean().item()
-                depth_delta_abs_max = delta_stats_map.abs().max().item()
             if raw_delta_xyz is not None:
                 raw_delta_abs_mean = raw_delta_xyz.float().abs().mean().item()
             logging.info(
                 f"Step {step}{time_suffix}: depth_map={depth_map is not None}, "
-                f"depth_delta_map={depth_delta_map is not None}, "
                 f"raw_delta_abs_mean={raw_delta_abs_mean:.6f}, "
                 f"has_depth_attr={hasattr(target_observation, 'depth')}, "
-                f"depth_value={target_observation.depth is not None if hasattr(target_observation, 'depth') else 'N/A'}, "
-                f"depth_delta_mean={depth_delta_mean:.6f}, "
-                f"depth_delta_abs_mean={depth_delta_abs_mean:.6f}, "
-                f"depth_delta_abs_max={depth_delta_abs_max:.6f}"
+                f"depth_value={target_observation.depth is not None if hasattr(target_observation, 'depth') else 'N/A'}"
             )
 
         if depth_map is not None and hasattr(target_observation, "depth") and target_observation.depth is not None:
@@ -1230,33 +1234,16 @@ class PI0Pytorch(nn.Module):
                     f"weight={self.depth_loss_weight}"
                 )
 
-            if (
-                depth_delta_map is not None
-                and base_depth is not None
-                and self.delta_depth_loss_weight > 0.0
-                and (not self.delta_depth_first_horizon_only or horizon_idx == 0)
-            ):
-                if base_depth.ndim == 3:
-                    base_depth_for_delta = base_depth.unsqueeze(1)
-                else:
-                    base_depth_for_delta = base_depth
-                if base_depth_for_delta.shape[-2:] != gt_depth.shape[-2:]:
-                    base_depth_for_delta = F.interpolate(
-                        base_depth_for_delta, size=gt_depth.shape[-2:], mode="bilinear", align_corners=False
-                    )
-                gt_depth_delta = gt_depth - base_depth_for_delta
-                if depth_delta_map.shape != gt_depth_delta.shape:
-                    depth_delta_map = F.interpolate(
-                        depth_delta_map, size=gt_depth_delta.shape[-2:], mode="bilinear", align_corners=False
-                    )
-                delta_depth_loss = F.smooth_l1_loss(depth_delta_map, gt_depth_delta)
-                if torch.isfinite(delta_depth_loss):
-                    total_loss = total_loss + self.delta_depth_loss_weight * delta_depth_loss
-                if step is not None and step % 400 == 0:
-                    logging.info(
-                        f"Step {step}{time_suffix}: Delta Depth Loss = {delta_depth_loss.item():.6f}, "
-                        f"weight={self.delta_depth_loss_weight}, horizon_idx={horizon_idx}"
-                    )
+        if self.flow_loss_weight > 0.0:
+            flow_loss = self._compute_flow_supervision_loss(
+                raw_delta_xyz,
+                target_observation,
+                step=step,
+                time_suffix=time_suffix,
+                horizon_idx=horizon_idx,
+            )
+            if torch.isfinite(flow_loss):
+                total_loss = total_loss + self.flow_loss_weight * flow_loss
 
         for key, value in gaussian_params.items():
             if torch.is_tensor(value) and (torch.isnan(value).any() or torch.isinf(value).any()):
@@ -2017,6 +2004,103 @@ class PI0Pytorch(nn.Module):
         )
         
         return total_loss
+
+
+    def _get_flow_horizon_weight(self, horizon_idx: int) -> float:
+        if self.flow_horizon_weights is None:
+            return 1.0
+        if horizon_idx < len(self.flow_horizon_weights):
+            return self.flow_horizon_weights[horizon_idx]
+        return self.flow_horizon_weights[-1]
+
+    def _slice_flow_target(self, observation, horizon_idx: int):
+        """Extract one horizon of optional flow supervision."""
+        flow_3d = getattr(observation, "flow_3d", None)
+        flow_valid_mask = getattr(observation, "flow_valid_mask", None)
+
+        def _slice_flow(value):
+            if value is None:
+                return None
+            if value.ndim >= 5:
+                return value[:, horizon_idx]
+            return value
+
+        def _slice_mask(value):
+            if value is None:
+                return None
+            if value.ndim >= 4:
+                return value[:, horizon_idx]
+            return value
+
+        return _slice_flow(flow_3d), _slice_mask(flow_valid_mask)
+
+    def _compute_flow_supervision_loss(
+        self,
+        raw_delta_xyz: torch.Tensor | None,
+        target_observation,
+        *,
+        step: int | None = None,
+        time_suffix: str = "",
+        horizon_idx: int = 0,
+    ) -> torch.Tensor:
+        if self.flow_loss_weight <= 0.0:
+            return torch.zeros((), dtype=torch.float32, device=raw_delta_xyz.device if raw_delta_xyz is not None else "cpu")
+        if raw_delta_xyz is None or raw_delta_xyz.ndim != 3:
+            target_device = None
+            if target_observation is not None:
+                if getattr(target_observation, "flow_3d", None) is not None:
+                    target_device = target_observation.flow_3d.device
+                elif getattr(target_observation, "state", None) is not None:
+                    target_device = target_observation.state.device
+            return torch.zeros((), dtype=torch.float32, device=target_device or torch.device("cpu"))
+        if self.flow_first_horizon_only and horizon_idx != 0:
+            return torch.zeros((), dtype=torch.float32, device=raw_delta_xyz.device)
+
+        horizon_weight = self._get_flow_horizon_weight(horizon_idx)
+        if horizon_weight <= 0.0:
+            return torch.zeros((), dtype=torch.float32, device=raw_delta_xyz.device)
+
+        flow_target, flow_valid_mask = self._slice_flow_target(target_observation, horizon_idx)
+        if flow_target is None or flow_valid_mask is None:
+            return torch.zeros((), dtype=torch.float32, device=raw_delta_xyz.device)
+
+        flow_target = flow_target.to(device=raw_delta_xyz.device, dtype=torch.float32)
+        flow_valid_mask = flow_valid_mask.to(device=raw_delta_xyz.device, dtype=torch.bool)
+
+        bsize, num_points, coord_dim = raw_delta_xyz.shape
+        if coord_dim != 3:
+            return torch.zeros((), dtype=torch.float32, device=raw_delta_xyz.device)
+
+        grid_size = int(math.isqrt(num_points))
+        if grid_size * grid_size != num_points:
+            return torch.zeros((), dtype=torch.float32, device=raw_delta_xyz.device)
+
+        pred_flow = raw_delta_xyz.float().reshape(bsize, grid_size, grid_size, 3).permute(0, 3, 1, 2)
+        target_flow = flow_target.permute(0, 3, 1, 2)
+        valid_mask = flow_valid_mask.unsqueeze(1)
+
+        if pred_flow.shape[-2:] != target_flow.shape[-2:]:
+            pred_flow = F.interpolate(pred_flow, size=target_flow.shape[-2:], mode="bilinear", align_corners=False)
+        if valid_mask.shape[-2:] != target_flow.shape[-2:]:
+            valid_mask = F.interpolate(valid_mask.float(), size=target_flow.shape[-2:], mode="nearest") > 0.5
+
+        valid_mask_f = valid_mask.float()
+        denom = valid_mask_f.sum().clamp_min(1.0)
+        if denom.item() <= 0:
+            return torch.zeros((), dtype=torch.float32, device=raw_delta_xyz.device)
+
+        diff = F.smooth_l1_loss(pred_flow, target_flow, reduction="none")
+        flow_loss = (diff * valid_mask_f).sum() / (denom * pred_flow.shape[1])
+        flow_loss = flow_loss * horizon_weight
+
+        if step is not None and step % 400 == 0:
+            logging.info(
+                f"Step {step}{time_suffix}: Flow Loss = {flow_loss.item():.6f}, "
+                f"weight={self.flow_loss_weight}, horizon_weight={horizon_weight:.4f}, "
+                f"valid_ratio={(valid_mask_f.mean().item()):.6f}, horizon_idx={horizon_idx}"
+            )
+
+        return flow_loss.to(dtype=torch.float32)
 
     def _build_future_velocity_heatmap(
         self,

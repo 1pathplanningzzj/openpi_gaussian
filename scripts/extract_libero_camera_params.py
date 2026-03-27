@@ -1,201 +1,193 @@
 #!/usr/bin/env python3
-"""Extract camera parameters from LIBERO robosuite environment.
+"""Extract LIBERO camera parameters from robosuite environments.
 
-This script creates a LIBERO environment and extracts camera intrinsics and extrinsics
-for both agent and wrist cameras. The parameters are saved to a JSON file that can be
-loaded during training.
-
-Usage:
-    python scripts/extract_libero_camera_params.py --output camera_params.json
+This script recreates LIBERO tasks and saves camera intrinsics plus explicit
+transform directions for downstream geometry code.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
-import numpy as np
+import os
 import sys
 from pathlib import Path
 
-# Add third_party to path
-base_path = Path(__file__).parent.parent
-sys.path.insert(0, str(base_path / "third_party" / "robosuite"))
-sys.path.insert(0, str(base_path / "third_party" / "libero"))
+import numpy as np
 
-try:
-    import robosuite
-    from robosuite.utils.camera_utils import (
-        get_camera_intrinsic_matrix,
-        get_camera_extrinsic_matrix,
+# Configure headless rendering before importing MuJoCo / LIBERO.
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+BASE_PATH = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_PATH / "third_party" / "robosuite"))
+sys.path.insert(0, str(BASE_PATH / "third_party" / "libero"))
+
+from libero.libero import benchmark, get_libero_path  # noqa: E402
+from libero.libero.envs import OffScreenRenderEnv  # noqa: E402
+from robosuite.utils.camera_utils import (  # noqa: E402
+    get_camera_extrinsic_matrix,
+    get_camera_intrinsic_matrix,
+)
+from robosuite.utils.transform_utils import pose_inv  # noqa: E402
+
+
+def _make_env(task, resolution: int, seed: int):
+    task_bddl_file = Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
+    env = OffScreenRenderEnv(
+        bddl_file_name=task_bddl_file,
+        camera_heights=resolution,
+        camera_widths=resolution,
     )
-except ImportError as e:
-    print(f"Error importing robosuite: {e}")
-    print("Please ensure robosuite is installed and in PYTHONPATH")
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
-
-try:
-    from libero.libero.benchmark import get_benchmark_dict
-    from libero.libero.envs.env_wrapper import ControlEnv
-except ImportError as e:
-    print(f"Error importing libero: {e}")
-    print("Please ensure libero is installed and in PYTHONPATH")
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
+    try:
+        env.seed(seed)
+    except (AttributeError, TypeError):
+        pass
+    return env
 
 
-def extract_camera_params(env, camera_name, image_height=256, image_width=256):
-    """Extract camera intrinsics and extrinsics from robosuite environment.
-    
-    Args:
-        env: robosuite environment instance
-        camera_name: Name of the camera (e.g., "agentview", "robot0_eye_in_hand")
-        image_height: Image height in pixels
-        image_width: Image width in pixels
-    
-    Returns:
-        dict: Camera parameters including intrinsics and extrinsics
-    """
-    sim = env.sim
-    
-    # Get intrinsics
+def _extract_single_camera(sim, camera_name: str, image_height: int, image_width: int) -> dict:
+    cam_id = sim.model.camera_name2id(camera_name)
     intrinsics = get_camera_intrinsic_matrix(
         sim=sim,
         camera_name=camera_name,
         camera_height=image_height,
-        camera_width=image_width
+        camera_width=image_width,
     )
-    
-    # Get extrinsics (4x4 matrix: world to camera)
-    extrinsics = get_camera_extrinsic_matrix(
-        sim=sim,
-        camera_name=camera_name
-    )
-    
-    # Extract FOV from intrinsics
-    # f = fx = fy (assuming square pixels)
-    fx = intrinsics[0, 0]
-    fy = intrinsics[1, 1]
-    cx = intrinsics[0, 2]
-    cy = intrinsics[1, 2]
-    
-    # Calculate FOV from focal length
-    fov_x = 2 * np.arctan(image_width / (2 * fx)) * 180 / np.pi
-    fov_y = 2 * np.arctan(image_height / (2 * fy)) * 180 / np.pi
-    
+    camera_to_world = get_camera_extrinsic_matrix(sim=sim, camera_name=camera_name)
+    world_to_camera = pose_inv(camera_to_world)
+
+    fx = float(intrinsics[0, 0])
+    fy = float(intrinsics[1, 1])
+    cx = float(intrinsics[0, 2])
+    cy = float(intrinsics[1, 2])
+    fov_y = float(sim.model.cam_fovy[cam_id])
+    fov_x = float(2 * np.degrees(np.arctan(image_width / (2 * fx))))
+
+    extent = float(sim.model.stat.extent)
+    near = float(sim.model.vis.map.znear * extent)
+    far = float(sim.model.vis.map.zfar * extent)
+
     return {
-        "intrinsics": intrinsics.tolist(),  # 3x3 matrix
-        "extrinsics": extrinsics.tolist(),  # 4x4 matrix (world to camera)
-        "fov_x_deg": float(fov_x),
-        "fov_y_deg": float(fov_y),
-        "fx": float(fx),
-        "fy": float(fy),
-        "cx": float(cx),
-        "cy": float(cy),
-        "image_height": image_height,
-        "image_width": image_width,
+        "camera_name": camera_name,
+        "intrinsics": intrinsics.tolist(),
+        "camera_to_world": camera_to_world.tolist(),
+        "world_to_camera": world_to_camera.tolist(),
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        "fov_x_deg": fov_x,
+        "fov_y_deg": fov_y,
+        "image_height": int(image_height),
+        "image_width": int(image_width),
+        "near": near,
+        "far": far,
+        "notes": {
+            "get_camera_extrinsic_matrix_returns": "camera pose in world frame (camera_to_world)",
+            "world_to_camera": "inverse of camera_to_world",
+        },
     }
 
 
-def main():
+def _extract_task_entry(task_suite_name: str, task_id: int, resolution: int, seed: int) -> dict:
+    task_suite = benchmark.get_benchmark_dict()[task_suite_name]()
+    task = task_suite.get_task(task_id)
+    init_states = task_suite.get_task_init_states(task_id)
+
+    env = _make_env(task, resolution, seed)
+    try:
+        env.reset()
+        if len(init_states) > 0:
+            env.set_init_state(init_states[0])
+
+        cameras = {}
+        for camera_name in ["agentview", "robot0_eye_in_hand"]:
+            try:
+                cameras[camera_name] = _extract_single_camera(env.sim, camera_name, resolution, resolution)
+            except Exception as exc:  # pragma: no cover - best effort for missing cameras
+                cameras[camera_name] = {"camera_name": camera_name, "error": str(exc)}
+
+        return {
+            "benchmark": task_suite_name,
+            "task_id": int(task_id),
+            "task_name": task.name,
+            "language": task.language,
+            "problem_folder": task.problem_folder,
+            "bddl_file": task.bddl_file,
+            "cameras": cameras,
+        }
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
+
+
+def _iter_task_ids(task_suite_name: str, task_id: int | None):
+    task_suite = benchmark.get_benchmark_dict()[task_suite_name]()
+    if task_id is not None:
+        if task_id < 0 or task_id >= task_suite.n_tasks:
+            raise ValueError(f"task_id {task_id} out of range for {task_suite_name} ({task_suite.n_tasks} tasks)")
+        return [task_id]
+    return list(range(task_suite.n_tasks))
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="Extract LIBERO camera parameters")
+    parser.add_argument("--output", type=str, default="libero_camera_params.json", help="Output JSON path")
+    parser.add_argument("--image-height", type=int, default=256, help="Image height in pixels")
+    parser.add_argument("--image-width", type=int, default=256, help="Image width in pixels")
     parser.add_argument(
-        "--output",
-        type=str,
-        default="libero_camera_params.json",
-        help="Output JSON file path"
-    )
-    parser.add_argument(
-        "--image-height",
-        type=int,
-        default=256,
-        help="Image height in pixels (default: 256)"
-    )
-    parser.add_argument(
-        "--image-width",
-        type=int,
-        default=256,
-        help="Image width in pixels (default: 256)"
-    )
-    parser.add_argument(
-        "--task-name",
+        "--task-suite-name",
         type=str,
         default="libero_10",
-        help="LIBERO task name (default: libero_10)"
+        help="Benchmark suite name or 'all' to extract all suites",
     )
+    parser.add_argument("--task-id", type=int, default=None, help="Optional task id within the suite")
+    parser.add_argument("--seed", type=int, default=0, help="Environment seed")
     args = parser.parse_args()
-    
-    print("Creating LIBERO environment...")
-    
-    # Get a LIBERO task to create environment
-    # We'll use the first available task
-    try:
-        benchmark_dict = get_benchmark_dict()
-        if args.task_name not in benchmark_dict:
-            print(f"Warning: Task '{args.task_name}' not found. Using first available task.")
-            task_name = list(benchmark_dict.keys())[0]
-        else:
-            task_name = args.task_name
-        
-        task_spec = benchmark_dict[task_name][0]  # Get first task in the benchmark
-        
-        # Get BDDL file path
-        bddl_file = task_spec.get_bddl_file()
-        
-        # Create environment using ControlEnv (same as LIBERO uses)
-        env = ControlEnv(
-            bddl_file_name=bddl_file,
-            has_renderer=False,
-            has_offscreen_renderer=True,
-            camera_names=["agentview", "robot0_eye_in_hand"],
-            camera_heights=args.image_height,
-            camera_widths=args.image_width,
-        )
-        
-        print(f"Environment created successfully!")
-        print(f"Task: {task_name}")
-        print(f"Camera names: {env.camera_names}")
-        
-        # Extract camera parameters
-        camera_params = {}
-        
-        # Agent camera (agentview)
-        if "agentview" in env.camera_names:
-            print("\nExtracting agentview camera parameters...")
-            agent_params = extract_camera_params(
-                env, "agentview", args.image_height, args.image_width
-            )
-            camera_params["agent"] = agent_params
-            print(f"  FOV: {agent_params['fov_x_deg']:.2f}° x {agent_params['fov_y_deg']:.2f}°")
-            print(f"  Focal length: fx={agent_params['fx']:.2f}, fy={agent_params['fy']:.2f}")
-            print(f"  Principal point: cx={agent_params['cx']:.2f}, cy={agent_params['cy']:.2f}")
-        
-        # Wrist camera (robot0_eye_in_hand)
-        if "robot0_eye_in_hand" in env.camera_names:
-            print("\nExtracting robot0_eye_in_hand camera parameters...")
-            wrist_params = extract_camera_params(
-                env, "robot0_eye_in_hand", args.image_height, args.image_width
-            )
-            camera_params["wrist"] = wrist_params
-            print(f"  FOV: {wrist_params['fov_x_deg']:.2f}° x {wrist_params['fov_y_deg']:.2f}°")
-            print(f"  Focal length: fx={wrist_params['fx']:.2f}, fy={wrist_params['fy']:.2f}")
-            print(f"  Principal point: cx={wrist_params['cx']:.2f}, cy={wrist_params['cy']:.2f}")
-        
-        # Save to JSON
-        output_path = Path(args.output)
-        with open(output_path, 'w') as f:
-            json.dump(camera_params, f, indent=2)
-        
-        print(f"\nCamera parameters saved to: {output_path}")
-        print("\nSummary:")
-        print(f"  Agent camera FOV: {camera_params['agent']['fov_x_deg']:.2f}°")
-        print(f"  Wrist camera FOV: {camera_params['wrist']['fov_x_deg']:.2f}°")
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+
+    if args.image_height != args.image_width:
+        raise ValueError("This script currently expects square render resolution.")
+
+    benchmark_dict = benchmark.get_benchmark_dict()
+    if args.task_suite_name == "all":
+        suite_names = sorted(benchmark_dict.keys())
+    else:
+        if args.task_suite_name not in benchmark_dict:
+            raise ValueError(f"Unknown task suite: {args.task_suite_name}. Available: {sorted(benchmark_dict.keys())}")
+        suite_names = [args.task_suite_name]
+
+    entries = []
+    for suite_name in suite_names:
+        task_ids = _iter_task_ids(suite_name, args.task_id if len(suite_names) == 1 else None)
+        for task_id in task_ids:
+            print(f"Extracting {suite_name} task {task_id}...")
+            entries.append(_extract_task_entry(suite_name, task_id, args.image_height, args.seed))
+
+    payload = {
+        "format_version": 2,
+        "image_height": int(args.image_height),
+        "image_width": int(args.image_width),
+        "task_suite_name": args.task_suite_name,
+        "entries": entries,
+    }
+
+    if entries:
+        first_cameras = entries[0].get("cameras", {})
+        if "agentview" in first_cameras:
+            payload["agent"] = first_cameras["agentview"]
+        if "robot0_eye_in_hand" in first_cameras:
+            payload["wrist"] = first_cameras["robot0_eye_in_hand"]
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    print(f"Saved camera parameters to {output_path}")
+    print(f"Extracted {len(entries)} task entries")
 
 
 if __name__ == "__main__":

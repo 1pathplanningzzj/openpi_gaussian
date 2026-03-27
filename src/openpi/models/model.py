@@ -97,6 +97,11 @@ class Observation(Generic[ArrayT]):
     # Depth maps (optional, for depth supervision)
     # Use different dimension names (dh, dw) to avoid conflict with image dimensions (h, w)
     depth: at.Float[ArrayT, "*b 1 dh dw"] | None = None
+    # Optional 3D flow supervision aligned with future horizons.
+    # Use independent leading dims here because flow uses future-horizon packing,
+    # which does not have to match the image temporal context dimensions.
+    flow_3d: at.Float[ArrayT, "... fh fw 3"] | None = None
+    flow_valid_mask: at.Bool[ArrayT, "... fh fw"] | None = None
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -115,13 +120,13 @@ class Observation(Generic[ArrayT]):
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
-        
+
         # Determine batch dimensions from images if possible
         # We need this to check against tokenized_prompt and expand if necessary
         # Assuming all images have same batch shape
         batch_dims_from_images = None
         first_img_key = next(iter(data["image"]), None)
-        
+
         # First pass: Process Images to fix dimensions
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
@@ -147,7 +152,7 @@ class Observation(Generic[ArrayT]):
                     # Else assume already [B, H, W, C]
 
                 data["image"][key] = tensor
-                
+
                 # Capture batch shape from first processed image tensor
                 # Excluding H,W,C, so take shape[:-3]
                 if batch_dims_from_images is None:
@@ -184,12 +189,12 @@ class Observation(Generic[ArrayT]):
                         mask = jnp.broadcast_to(mask[:, None], (mask.shape[0], T))
 
             data["image_mask"][key] = mask
-            
+
         # Fix tokenized_prompt batch dimensions if mismatched with images (e.g. strict time expansion)
         # Jaxtyping complains that images have shape [16, 2, H, W, C] (*b = [16, 2])
         # but prompt has shape [16, L] (*b = [16]), missing the time dimension [2].
         # Prompts are static across the time horizon, so we should expand them.
-        
+
         if batch_dims_from_images is not None and len(batch_dims_from_images) > 1:
             # We have a time dimension in images: batch_dims_from_images is likely (B, T)
             # Check prompt
@@ -203,7 +208,7 @@ class Observation(Generic[ArrayT]):
                    T = batch_dims_from_images[1]
                    if prompt.shape[0] == batch_dims_from_images[0] and prompt.ndim == 2:
                        data["tokenized_prompt"] = prompt.unsqueeze(1).expand(-1, T, -1)
-                       
+
             prompt_mask = data.get("tokenized_prompt_mask")
             if prompt_mask is not None and isinstance(prompt_mask, torch.Tensor):
                if prompt_mask.shape[0] == batch_dims_from_images[0] and prompt_mask.ndim == 2:
@@ -216,7 +221,7 @@ class Observation(Generic[ArrayT]):
         # We need to ensure state's temporal dimension matches images' temporal dimension
         # Also convert to float32 if needed (type annotation expects Float, not f64)
         state = data["state"]
-        
+
         # Convert dtype to float32 if needed
         if isinstance(state, torch.Tensor):
             if state.dtype != torch.float32:
@@ -225,7 +230,7 @@ class Observation(Generic[ArrayT]):
             if state.dtype != np.float32:
                 state = state.astype(np.float32)
         # JAX arrays are typically float32 by default
-        
+
         if batch_dims_from_images is not None and len(batch_dims_from_images) > 1:
             # Images have temporal dimension [B, T_img, ...]
             T_img = batch_dims_from_images[1]
@@ -283,6 +288,8 @@ class Observation(Generic[ArrayT]):
             image_masks=data["image_mask"],
             state=data["state"],
             depth=data.get("depth"),  # Optional depth data
+            flow_3d=data.get("flow_3d"),
+            flow_valid_mask=data.get("flow_valid_mask"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -362,6 +369,9 @@ def preprocess_observation(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        depth=observation.depth,
+        flow_3d=observation.flow_3d,
+        flow_valid_mask=observation.flow_valid_mask,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,

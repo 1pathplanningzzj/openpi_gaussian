@@ -101,6 +101,9 @@ class DataConfig:
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
+    # Optional sidecar root for precomputed flow supervision.
+    flow_root: str | None = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -290,6 +293,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+    flow_root: str | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -311,6 +315,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                         "actions": "actions",
                         "prompt": "prompt",
                         "observation/depth": "depth",  # Depth mapping for depth-augmented dataset
+                        "episode_index": "episode_index",
+                        "frame_index": "frame_index",
                     }
                 )
             ]
@@ -322,9 +328,17 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # We defined these transforms in `libero_policy.py`. You can check the detailed comments there for
         # how to modify the transforms to match your dataset. Once you created your own transforms, you can
         # replace the transforms below with your own.
+        effective_flow_root = self.flow_root
+        if effective_flow_root is None and self.base_config is not None:
+            effective_flow_root = self.base_config.flow_root
+
         data_transforms = _transforms.Group(
             inputs=[
                 depth_transform.LoadDepthTransform(use_depth=True, depth_key="observation/depth"),
+                depth_transform.LoadFlowTransform(
+                    flow_root=effective_flow_root,
+                    future_horizon=max(1, int(getattr(model_config, "future_prediction_horizon", 1))),
+                ),
                 libero_policy.LiberoInputs(model_type=model_config.model_type),
             ],
             outputs=[libero_policy.LiberoOutputs()],
@@ -359,6 +373,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            flow_root=effective_flow_root,
         )
 
 
@@ -825,7 +840,9 @@ _CONFIGS = [
             use_velocity_future_gaussians=True,
             render_loss_weight=0.2,
             depth_loss_weight=0.1,
-            delta_depth_loss_weight=0.15,
+            flow_loss_weight=0.05,
+            flow_first_horizon_only=False,
+            flow_horizon_weights=(1.0, 0.7, 0.4, 0.2, 0.1),
             use_lpips=True,  # Enable LPIPS perceptual loss
             lpips_weight=0.1,  # Weight for LPIPS loss
             future_horizon_curriculum_steps=5_000,
@@ -836,7 +853,11 @@ _CONFIGS = [
             # zijian ‘s users data is located at /data/zijianzhang/LIBERA/physical-intelligence/libero
             # If the data is directly at /data/zijianzhang/LIBERA, you might need to adjust the path or repo_id.
             # Using depth-augmented dataset with fixed LeRobot data loading
-            base_config=DataConfig(prompt_from_task=True, dataset_root="/data/zijianzhang/LIBERA/data_with_depth"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dataset_root="/data/zijianzhang/LIBERA/data_with_depth",
+                flow_root="/data/zijianzhang/LIBERA/flow_sidecars_raft",
+            ),
             extra_delta_transform=False,
         ),
         # batch_size=256,

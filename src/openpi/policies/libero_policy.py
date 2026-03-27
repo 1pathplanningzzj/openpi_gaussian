@@ -120,6 +120,11 @@ class LiberoInputs(transforms.DataTransformFn):
             else:
                 logging.info(f"[LiberoInputs] depth type: {type(data['observation/depth'])}")
 
+        if "observation/flow_3d" in data:
+            inputs["flow_3d"] = data["observation/flow_3d"]
+        if "observation/flow_valid_mask" in data:
+            inputs["flow_valid_mask"] = data["observation/flow_valid_mask"]
+
         return inputs
 
 

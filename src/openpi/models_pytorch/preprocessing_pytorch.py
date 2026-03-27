@@ -192,4 +192,6 @@ def preprocess_observation_pytorch(
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
         depth=getattr(observation, 'depth', None),  # Pass through depth if available
+        flow_3d=getattr(observation, 'flow_3d', None),
+        flow_valid_mask=getattr(observation, 'flow_valid_mask', None),
     )
