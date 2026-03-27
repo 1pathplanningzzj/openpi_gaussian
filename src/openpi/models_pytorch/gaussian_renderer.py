@@ -948,6 +948,7 @@ def visualize_future_rollout_comparison(
     base_rendered_obs=None,
     base_label="t/base",
     motion_weight_seq=None,
+    pred_velocity_seq=None,
     context_labels=None,
 ):
     """Visualize context + multi-horizon future rollout in one figure."""
@@ -1006,6 +1007,7 @@ def visualize_future_rollout_comparison(
     show_base = base_target_obs is not None or base_rendered_obs is not None
     show_future_vs_base = base_rendered_obs is not None
     show_motion = motion_weight_seq is not None and len(motion_weight_seq) > 0
+    show_pred_velocity = pred_velocity_seq is not None and len(pred_velocity_seq) > 0
 
     total_future_cols = max(
         horizon,
@@ -1033,6 +1035,11 @@ def visualize_future_rollout_comparison(
     if show_motion:
         motion_row = len(row_titles)
         row_titles.append("Motion Weight")
+
+    pred_velocity_row = None
+    if show_pred_velocity:
+        pred_velocity_row = len(row_titles)
+        row_titles.append("Pred Speed |Δxyz|")
 
     num_rows = len(row_titles)
     fig, axes = plt.subplots(num_rows, num_cols, figsize=(4 * num_cols, 3.6 * num_rows))
@@ -1082,6 +1089,9 @@ def visualize_future_rollout_comparison(
         if motion_row is not None:
             blank_motion = _blank_latent_like(base_gt_img, fallback_size=224)
             axes[motion_row, 0].imshow(blank_motion, cmap="magma", vmin=0.0, vmax=1.0)
+        if pred_velocity_row is not None:
+            blank_velocity = _blank_latent_like(base_gt_img, fallback_size=224)
+            axes[pred_velocity_row, 0].imshow(blank_velocity, cmap="magma", vmin=0.0, vmax=1.0)
 
     for horizon_idx in range(min(horizon, total_future_cols)):
         col = start_col + horizon_idx
@@ -1102,6 +1112,11 @@ def visualize_future_rollout_comparison(
             if gt_key in motion_entry:
                 motion_map = motion_entry[gt_key][idx].detach().cpu().numpy()
                 axes[motion_row, col].imshow(motion_map, cmap="magma")
+        if pred_velocity_row is not None and horizon_idx < len(pred_velocity_seq):
+            pred_velocity_entry = pred_velocity_seq[horizon_idx]
+            if gt_key in pred_velocity_entry:
+                pred_velocity_map = pred_velocity_entry[gt_key][idx].detach().cpu().numpy()
+                axes[pred_velocity_row, col].imshow(pred_velocity_map, cmap="magma", vmin=0.0, vmax=1.0)
 
     fig.suptitle(f"Future Rollout Visualization - Step {step}", fontsize=16)
     save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}.png")

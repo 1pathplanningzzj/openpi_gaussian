@@ -471,7 +471,7 @@ class GaussianAdapter(nn.Module):
                     for param in self.encoder.parameters():
                         param.requires_grad = False
                     self.encoder.eval()
-                    logging.info("VGGT encoder is FROZEN (only aggregator LoRA will be unfrozen if use_lora=True)")
+                    logging.info("VGGT encoder is FROZEN")
 
                 # Unfreeze LoRA parameters in encoder backbone (if use_lora=True)
                 # VGGT pretrained model already has LoRA layers (lora_down, lora_up)
@@ -498,7 +498,8 @@ class GaussianAdapter(nn.Module):
 
                 # Configuration
                 self.gaussian_feat_dim = 2048  # VGGT output dimension
-                self.tokens_per_frame = 256  # 16×16 = 256 tokens per frame (was 100)
+                self.tokens_per_frame = 256  # Keep static/current Gaussian tokens at 16×16
+                self.mta_tokens_per_frame = 1024  # Future MTA slots use 32×32 for finer motion detail
 
                 # Single-frame mode: disable temporal encoding to avoid "single frame through temporal modules"
                 # This ensures a clean ablation: spatial-only feature extraction without temporal machinery
@@ -530,14 +531,14 @@ class GaussianAdapter(nn.Module):
                             ) for _ in range(len(self.layer_indices) - 1)
                         ])
 
-                        # Project fused features back to 2048 for temporal_conv
+                        # Project fused features back to 2048 for downstream spatial pooling
                         self.fused_to_2048 = nn.Linear(512, 2048)
 
                         logging.info(
                             f"Multi-scale feature extraction enabled:\n"
                             f"  - Layers: {self.layer_indices}\n"
                             f"  - Fusion: FPN-style bottom-up\n"
-                            f"  - Projection: 512 → 2048 for temporal conv"
+                            f"  - Projection: 512 → 2048 for spatial pooling"
                         )
                     else:
                         self.layer_indices = [23]  # Only last layer
@@ -545,53 +546,39 @@ class GaussianAdapter(nn.Module):
                         self.fusion_blocks = None
                         self.fused_to_2048 = None
 
-                    # 1. 3D Conv for temporal-spatial feature extraction
-                    # Use self.num_frames (respects single-frame mode)
-                    self.temporal_conv = TemporalConv3DEncoder(
-                        in_channels=2048,
-                        out_channels=512,
-                        num_frames=self.num_frames  # Changed from num_frames to self.num_frames
-                    )
-                    # Output: [B, 512, T, 9, 9] where T=self.num_frames
+                    # Simplified temporal path: remove 3D conv + causal temporal attention.
+                    # Keep per-frame 16x16 spatial pooling so each frame still contributes 256 tokens.
+                    self.tokens_per_frame = 256
 
-                    # 2. Spatial pooling to 16×16 (256 tokens per frame)
-                    self.spatial_pool = nn.AdaptiveAvgPool2d((16, 16))
-
-                    # 3. Causal temporal attention
-                    # Use self.num_frames (respects single-frame mode)
-                    self.temporal_attn = CausalTemporalAttention(
-                        embed_dim=512,
-                        num_heads=8,
-                        num_frames=self.num_frames  # Changed from num_frames to self.num_frames
-                    )
-
-                    # 4. Frame positional encoding (sinusoidal + learnable)
-                    # Use self.num_frames (respects single-frame mode)
+                    # Frame positional encoding (sinusoidal + learnable)
+                    # Match projected token width so per-frame offsets can be added to frame_embs.
                     self.frame_pos_encoding = nn.ModuleList([
-                        SinusoidalPositionalEncoding(self.num_frames, 512)
+                        SinusoidalPositionalEncoding(self.num_frames, action_expert_width)
                         for _ in range(self.num_frames)
                     ])
                     self.frame_embeddings = nn.Parameter(
-                        torch.randn(self.num_frames, 512) * 0.02
+                        torch.randn(self.num_frames, action_expert_width) * 0.02
                     )
-                    self.temporal_offset_proj = nn.Linear(1, 512)
+                    self.temporal_offset_proj = nn.Linear(1, action_expert_width)
 
                     # Dedicated projections for exposing per-layer MTA patch tokens.
-                    self.mta_layer_pool = nn.AdaptiveAvgPool2d((16, 16))
+                    # Main Gaussian embeddings stay at 16×16, while MTA features use a 32×32 pool
+                    # so future motion-query tokens can operate at higher spatial resolution.
+                    self.mta_layer_pool = nn.AdaptiveAvgPool2d((32, 32))
                     self.mta_layer_projs = nn.ModuleList([
                         nn.Linear(512, 512) for _ in self.layer_indices
                     ])
 
-                    # 5. Projection to action_expert_width
-                    self.proj = nn.Linear(512, action_expert_width)
+                    # Projection to action_expert_width
+                    self.proj = nn.Linear(2048, action_expert_width)
 
                     logging.info(
-                        f"Enhanced Temporal Encoding enabled:\n"
-                        f"  - 3D Conv: 2048 → 512 channels\n"
-                        f"  - Spatial resolution: 37×37 → 16×16\n"
+                        f"Simplified temporal encoding enabled:\n"
+                        f"  - Removed 3D Conv and causal temporal attention\n"
+                        f"  - Spatial resolution: 37×37 → 16×16 per frame\n"
                         f"  - Tokens per frame: {self.tokens_per_frame}\n"
                         f"  - Total tokens: {self.num_frames * self.tokens_per_frame}\n"
-                        f"  - Causal temporal attention: {self.num_frames} frames"
+                        f"  - Frame positional encoding: {self.num_frames} frames"
                     )
                 else:
                     # Original implementation (fallback)
@@ -823,7 +810,7 @@ class GaussianAdapter(nn.Module):
     def _extract_layer_mta_features(self, aggregated_tokens_list) -> Optional[Dict[int, torch.Tensor]]:
         """Extract pooled per-layer patch tokens for MTA.
 
-        Returns a dict mapping VGGT layer index -> [B, T, 256, 512].
+        Returns a dict mapping VGGT layer index -> [B, T, 1024, 512].
         """
         if not (hasattr(self, 'use_multi_scale') and self.use_multi_scale and self.layer_projs is not None):
             return None
@@ -847,9 +834,12 @@ class GaussianAdapter(nn.Module):
 
             layer_tokens = self.layer_projs[idx](layer_tokens)  # [B, T, 1369, 512]
             layer_tokens_2d = layer_tokens.permute(0, 1, 3, 2).reshape(bsz * num_frames, 512, 37, 37)
-            layer_tokens_pooled = self.mta_layer_pool(layer_tokens_2d)  # [B*T, 512, 16, 16]
-            layer_tokens_flat = layer_tokens_pooled.reshape(bsz, num_frames, 512, 16, 16)
-            layer_tokens_flat = layer_tokens_flat.permute(0, 1, 3, 4, 2).reshape(bsz, num_frames, 256, 512)
+            layer_tokens_pooled = self.mta_layer_pool(layer_tokens_2d)  # [B*T, 512, 32, 32]
+            mta_grid_size = layer_tokens_pooled.shape[-1]
+            layer_tokens_flat = layer_tokens_pooled.reshape(bsz, num_frames, 512, mta_grid_size, mta_grid_size)
+            layer_tokens_flat = layer_tokens_flat.permute(0, 1, 3, 4, 2).reshape(
+                bsz, num_frames, mta_grid_size * mta_grid_size, 512
+            )
             layer_tokens_flat = self.mta_layer_projs[idx](layer_tokens_flat)
             mta_features[layer_idx] = layer_tokens_flat
 
@@ -871,7 +861,7 @@ class GaussianAdapter(nn.Module):
             g_mask: [B, N] - Mask for tokens
             gaussian_params (optional): Dict with depth, rot, scale, opacity, sh if return_gaussian_params=True
             raw_tokens (optional): [B, S, 1369, D] - Raw patch tokens before pooling if return_raw_tokens=True
-            mta_features (optional): Dict[layer_idx, [B, T, 256, 512]]
+            mta_features (optional): Dict[layer_idx, [B, T, 1024, 512]]
         """
         if not self.use_gaussian or gaussian_inputs is None:
             return (None, None) if not return_gaussian_params else (None, None, None)
@@ -988,44 +978,42 @@ class GaussianAdapter(nn.Module):
         gaussian_embs = None
         tokens_flat = None  # Initialize to avoid UnboundLocalError
 
-        # === Priority 1: Enhanced Temporal Encoding ===
+        # === Priority 1: Simplified per-frame spatial encoding ===
         if hasattr(self, 'use_enhanced_temporal') and self.use_enhanced_temporal:
-            # 1. Reshape to 3D: [B, S, 1369, D] -> [B, D, S, 37, 37]
-            tokens_3d = raw_tokens.permute(0, 3, 1, 2).reshape(B, D, S, 37, 37)
-
-            # 2. 3D Conv (temporal-spatial encoding)
-            tokens_conv = self.temporal_conv(tokens_3d)  # [B, 512, S, 9, 9]
-
-            # 3. Spatial pooling to 16×16
-            B_conv, C_conv, S_conv, H_conv, W_conv = tokens_conv.shape
-            tokens_conv = tokens_conv.permute(0, 2, 1, 3, 4).reshape(B*S, C_conv, H_conv, W_conv)
-            tokens_pooled = self.spatial_pool(tokens_conv)  # [B*S, 512, 16, 16]
-            tokens_pooled = tokens_pooled.reshape(B, S, C_conv, 16, 16)
-
-            # 4. Flatten spatial dimensions: [B, S, 512, 16, 16] -> [B, S, 256, 512]
-            tokens_flat = tokens_pooled.permute(0, 1, 3, 4, 2).reshape(B, S, 256, C_conv)
-
-            # 5. Add frame positional encoding
             frame_tokens_list = []
+            patch_h = int(np.sqrt(N_patches))
+            patch_w = N_patches // patch_h if patch_h > 0 else 1
+            if patch_h * patch_w != N_patches:
+                raise ValueError(f"Expected square patch grid, got N_patches={N_patches}")
+
             for frame_idx in range(S):
-                frame_tokens = tokens_flat[:, frame_idx]  # [B, 256, 512]
+                frame_tokens = raw_tokens[:, frame_idx, :, :]  # [B, 1369, D]
 
-                offset_emb = self._frame_offset_embedding(frame_idx, 512, frame_tokens.device, frame_tokens.dtype)
-                frame_pos = self.frame_pos_encoding[frame_idx](frame_idx)  # [512]
-                frame_pos = frame_pos + self.frame_embeddings[frame_idx] + offset_emb  # [512]
-                frame_pos = frame_pos.unsqueeze(0).unsqueeze(0)  # [1, 1, 512]
+                # [B, 1369, D] -> [B, D, 37, 37]
+                tokens_2d = frame_tokens.permute(0, 2, 1).reshape(B, D, patch_h, patch_w)
 
-                frame_tokens = frame_tokens + frame_pos  # [B, 256, 512]
-                frame_tokens_list.append(frame_tokens)
+                # Pool each frame independently to 16x16 -> 256 tokens/frame
+                tokens_pooled = F.adaptive_avg_pool2d(tokens_2d, (16, 16))  # [B, D, 16, 16]
 
-            # 6. Concatenate frames: [B, S, 256, 512] -> [B, S*256, 512]
-            temporal_tokens = torch.cat(frame_tokens_list, dim=1)  # [B, 768, 512] for S=3
+                # [B, D, 16, 16] -> [B, 256, D]
+                tokens_flat = tokens_pooled.reshape(B, D, 16 * 16).permute(0, 2, 1)
 
-            # 7. Causal temporal attention
-            temporal_tokens = self.temporal_attn(temporal_tokens, tokens_per_frame=256)
+                # Project to action_expert_width
+                frame_embs = self.proj(tokens_flat)  # [B, 256, action_expert_width]
 
-            # 8. Project to action_expert_width
-            gaussian_embs = self.proj(temporal_tokens)  # [B, 768, action_expert_width]
+                # Add frame positional encoding
+                offset_emb = self._frame_offset_embedding(
+                    frame_idx, frame_embs.shape[-1], frame_embs.device, frame_embs.dtype
+                )
+                frame_pos = self.frame_pos_encoding[frame_idx](frame_idx)
+                frame_pos = frame_pos + self.frame_embeddings[frame_idx] + offset_emb
+                frame_pos = frame_pos.unsqueeze(0).unsqueeze(0)  # [1, 1, D]
+
+                frame_embs = frame_embs + frame_pos
+                frame_tokens_list.append(frame_embs)
+
+            # [B, 256, D] * S -> [B, S*256, D]
+            gaussian_embs = torch.cat(frame_tokens_list, dim=1)
 
             if step is not None and step % 100 == 0:
                 logging.info(

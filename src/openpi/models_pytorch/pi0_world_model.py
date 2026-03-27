@@ -256,17 +256,20 @@ class GaussianDecoder(nn.Module):
         self,
         token_dim: int,
         input_num_tokens: int = 256,
+        future_input_num_tokens: int | None = None,
         action_dim: int = 7,
         use_action_conditioning: bool = True,
         predict_depth: bool = True,
         use_incremental_depth: bool = True,
         future_prediction_horizon: int = 1,
         use_velocity_future_gaussians: bool = False,
-        velocity_world_model_scale: float = 0.5,
+        velocity_world_model_scale: float = 2.0,
     ):
         super().__init__()
         self.token_dim = token_dim
         self.input_num_tokens = input_num_tokens
+        self.static_input_num_tokens = input_num_tokens
+        self.future_input_num_tokens = future_input_num_tokens or input_num_tokens
         self.action_dim = action_dim
         self.use_action_conditioning = use_action_conditioning
         self.predict_depth = predict_depth
@@ -288,20 +291,22 @@ class GaussianDecoder(nn.Module):
 
         # Full Gaussian decode is used to build the current/base template.
         # Future horizons reuse that template and only predict gated dynamic xyz updates.
-        grid_size = int(input_num_tokens ** 0.5)  # 256 → 16
+        static_grid_size = int(self.static_input_num_tokens ** 0.5)
+        self.static_grid_size = static_grid_size
+        self.future_grid_size = int(self.future_input_num_tokens ** 0.5)
         self.gaussian_head = IndependentGaussianHead(
-            token_dim=token_dim, grid_size=grid_size,
+            token_dim=token_dim, grid_size=static_grid_size,
             use_image_fusion=True,  # Enable image feature fusion
             img_dim=3,
             predict_depth=predict_depth,
         )
 
-        # Future-query dynamics head: decode 16×16 motion tokens into a denser 64×64
+        # Future-query dynamics head: decode 32×32 motion tokens into a denser 128×128
         # velocity field before projecting to the static Gaussian grid.
         if use_velocity_future_gaussians:
             self.velocity_head = nn.Sequential(
-                _UpsampleBlock(token_dim, 256),   # 16×16 -> 32×32
-                _UpsampleBlock(256, 128),         # 32×32 -> 64×64
+                _UpsampleBlock(token_dim, 256),   # 32×32 -> 64×64
+                _UpsampleBlock(256, 128),         # 64×64 -> 128×128
                 nn.Conv2d(128, 3, 3, padding=1),
             )
             nn.init.xavier_uniform_(self.velocity_head[-1].weight, gain=0.01)
@@ -366,6 +371,7 @@ class GaussianDecoder(nn.Module):
         horizon_idx: int = 0,
         static_reference_params: dict | None = None,
         velocity_time_factor: float = 1.0,
+        motion_gate: torch.Tensor | None = None,
     ):
         """Decode latent tokens → Gaussian parameters."""
         return self._decode_independent(
@@ -374,6 +380,7 @@ class GaussianDecoder(nn.Module):
             step=step, actions=actions, base_depth=base_depth, horizon_idx=horizon_idx,
             static_reference_params=static_reference_params,
             velocity_time_factor=velocity_time_factor,
+            motion_gate=motion_gate,
         )
 
     def decode_gaussian_prefix_template(
@@ -422,15 +429,18 @@ class GaussianDecoder(nn.Module):
         step: int | None,
         horizon_idx: int = 0,
         base_depth: torch.Tensor | None = None,
+        motion_gate: torch.Tensor | None = None,
     ) -> dict:
         """Reuse the base Gaussian template and predict future dynamics via delta xyz only."""
         B, num_tokens, D = z.shape
-        g = int(math.sqrt(num_tokens))
+        g = self.future_grid_size
         if g * g != num_tokens:
-            raise ValueError(f"velocity path expects square token grid, got N={num_tokens}")
+            raise ValueError(
+                f"velocity path expects {self.future_input_num_tokens} future tokens, got N={num_tokens}"
+            )
 
-        motion_feat = z.permute(0, 2, 1).reshape(B, D, g, g)  # [B, D, 16, 16]
-        vel_map = self.velocity_head(motion_feat)  # [B, 3, 64, 64]
+        motion_feat = z.permute(0, 2, 1).reshape(B, D, g, g)  # [B, D, 32, 32]
+        vel_map = self.velocity_head(motion_feat)  # [B, 3, 128, 128]
 
         xyz0 = static_reference_params["xyz"]
         Npts = xyz0.shape[1]
@@ -442,6 +452,34 @@ class GaussianDecoder(nn.Module):
         vel_flat = vel_up.permute(0, 2, 3, 1).reshape(B, Npts, 3)
 
         raw_delta = torch.tanh(vel_flat) * self.velocity_world_model_scale * float(velocity_time_factor)
+        motion_gate_up = None
+        if motion_gate is not None:
+            if motion_gate.ndim == 3:
+                motion_gate = motion_gate.unsqueeze(-1)
+            elif motion_gate.ndim != 4:
+                raise ValueError(f"motion_gate must have shape [B, N, 1] or [B, H, W, 1], got {tuple(motion_gate.shape)}")
+
+            if motion_gate.shape[0] != B:
+                raise ValueError(f"motion_gate batch mismatch: expected {B}, got {motion_gate.shape[0]}")
+
+            if motion_gate.shape[1] == num_tokens:
+                motion_gate_up = motion_gate.reshape(B, g, g, -1).permute(0, 3, 1, 2)
+                motion_gate_up = F.interpolate(motion_gate_up, size=(H, W), mode="bilinear", align_corners=False)
+                motion_gate_up = motion_gate_up.permute(0, 2, 3, 1).reshape(B, Npts, -1)
+            elif motion_gate.shape[1] * motion_gate.shape[2] == Npts:
+                motion_gate_up = motion_gate.reshape(B, motion_gate.shape[1], motion_gate.shape[2], -1)
+                motion_gate_up = motion_gate_up.permute(0, 3, 1, 2)
+                if motion_gate_up.shape[-2:] != (H, W):
+                    motion_gate_up = F.interpolate(motion_gate_up, size=(H, W), mode="bilinear", align_corners=False)
+                motion_gate_up = motion_gate_up.permute(0, 2, 3, 1).reshape(B, Npts, -1)
+            else:
+                raise ValueError(
+                    f"motion_gate token/spatial size mismatch: got {tuple(motion_gate.shape)}, expected token count {num_tokens} or point count {Npts}"
+                )
+
+            motion_gate_up = torch.clamp(motion_gate_up.to(device=raw_delta.device, dtype=raw_delta.dtype), 0.0, 1.0)
+            raw_delta = raw_delta * motion_gate_up
+
         delta = raw_delta
         xyz = xyz0 + delta.to(dtype=xyz0.dtype)
         xyz = torch.clamp(xyz, min=-100.0, max=100.0)
@@ -466,11 +504,14 @@ class GaussianDecoder(nn.Module):
 
             static_scale_mean = static_reference_params["scales"].float().mean().item()
             static_scale_max = static_reference_params["scales"].float().max().item()
+            gate_mean = motion_gate_up.mean().item() if motion_gate_up is not None else 1.0
+            gate_max = motion_gate_up.max().item() if motion_gate_up is not None else 1.0
             logging.info(
                 f"[VelocityDecoder][h={horizon_idx}][t+~{horizon_idx + 1}] delta_xyz: "
                 f"motion_scale={self.velocity_world_model_scale}, "
                 f"time_factor={velocity_time_factor:.4f}, |delta|_mean={delta.abs().mean().item():.6f}, "
-                f"|delta|_max={delta.abs().max().item():.6f}, static_gaussian_scale_mean={static_scale_mean:.6f}, "
+                f"|delta|_max={delta.abs().max().item():.6f}, gate_mean={gate_mean:.6f}, gate_max={gate_max:.6f}, "
+                f"static_gaussian_scale_mean={static_scale_mean:.6f}, "
                 f"static_gaussian_scale_max={static_scale_max:.6f}"
             )
 
@@ -493,6 +534,7 @@ class GaussianDecoder(nn.Module):
         step: int | None,
         horizon_idx: int = 0,
         base_depth: torch.Tensor | None = None,
+        motion_gate: torch.Tensor | None = None,
     ) -> dict:
         """Decode shared motion-query tokens into a constant-velocity dynamic Gaussian update."""
         return self._decode_velocity_from_static(
@@ -502,6 +544,7 @@ class GaussianDecoder(nn.Module):
             step,
             horizon_idx=horizon_idx,
             base_depth=base_depth,
+            motion_gate=motion_gate,
         )
 
     def _decode_independent(
@@ -512,6 +555,7 @@ class GaussianDecoder(nn.Module):
         velocity_time_factor: float = 1.0,
         skip_horizon_embedding: bool = False,
         skip_action_conditioning: bool = False,
+        motion_gate: torch.Tensor | None = None,
     ):
         """Decode VLM tokens into Gaussian parameters.
 
@@ -544,9 +588,12 @@ class GaussianDecoder(nn.Module):
                 step,
                 horizon_idx=horizon_idx,
                 base_depth=base_depth,
+                motion_gate=motion_gate,
             )
 
-        vggt_obs = current_observation if current_observation is not None else future_observation
+        # For future-horizon decoding, prefer the matched future observation so image
+        # fusion is anchored to the target horizon instead of the current frame.
+        vggt_obs = future_observation if future_observation is not None else current_observation
         if vggt_obs is None or gaussian_adapter is None:
             raise ValueError("current_observation and gaussian_adapter are required")
 
@@ -665,7 +712,7 @@ class GaussianDecoder(nn.Module):
         xy_delta_flat = xy_delta_maps.reshape(B, N, 2)
         # Scale lateral movement explicitly
         xy_delta_flat = torch.tanh(xy_delta_flat) * 0.5  # constrain to max 0.5m movement
-        
+
         # Keep Z unchanged here because Z (depth) movement is completely handled and supervised by depth_refine.
         z_zeros = torch.zeros(B, N, 1, device=xyz_base.device, dtype=xyz_base.dtype)
         xyz_delta_flat = torch.cat([xy_delta_flat, z_zeros], dim=-1)

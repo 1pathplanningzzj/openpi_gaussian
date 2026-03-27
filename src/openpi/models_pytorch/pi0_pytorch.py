@@ -244,7 +244,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0325_lpips_future_5_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0326_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -256,7 +256,7 @@ class PI0Pytorch(nn.Module):
         # Option to unfreeze VGGT encoder/decoder for reconstruction loss training
         unfreeze_vggt_encoder = getattr(config, "unfreeze_vggt_encoder", False)
         unfreeze_vggt_decoder_only = getattr(config, "unfreeze_vggt_decoder_only", True)  # Default: train decoder only
-        use_lora = getattr(config, "use_lora", True)  # Default: use LoRA for VGGT encoder
+        use_lora = getattr(config, "use_lora", False)  # Default: keep VGGT fully frozen
         self.gaussian_adapter = GaussianAdapter(
             use_gaussian,
             paligemma_config.width,
@@ -286,10 +286,11 @@ class PI0Pytorch(nn.Module):
         self.lpips_fn = None
         self.lpips_weight = getattr(config, "lpips_weight", 0.1)
         if self.use_world_tokens_in_prefix:
-            # === Priority 1: Aligned Future Query Tokens ===
-            # 256 future query tokens (matches 16×16 decoder grid)
-            self.future_token_count = 256
-            self.future_grid_size = 16  # 16×16 spatial structure
+            # Keep current/static Gaussian template tokens at 16×16, but raise
+            # future motion-query tokens to 32×32 for finer spatial dynamics.
+            self.static_gaussian_token_count = 256
+            self.future_token_count = 1024
+            self.future_grid_size = 32
 
             # World tokens removed — redundant with Gaussian tokens (768)
             self.world_token_count = 0
@@ -301,9 +302,8 @@ class PI0Pytorch(nn.Module):
                 torch.randn(1, self.future_token_count, paligemma_config.width) * 0.02
             )
 
-            # === NEW: Spatial Positional Encoding (16×16 grid) ===
-            # This gives Future tokens explicit spatial structure
-            # matching the decoder's 16×16 input grid
+            # === Future Motion Query Tokens ===
+            # 1024 future query tokens (32×32) for higher-resolution motion rollouts.
             self.future_spatial_pos = nn.Parameter(
                 torch.randn(self.future_grid_size, self.future_grid_size, paligemma_config.width) * 0.02
             )
@@ -335,14 +335,15 @@ class PI0Pytorch(nn.Module):
 
             self.world_model = GaussianDecoder(
                 token_dim=paligemma_config.width,
-                input_num_tokens=256,
+                input_num_tokens=self.static_gaussian_token_count,
+                future_input_num_tokens=self.future_token_count,
                 # Disable action conditioning for future-query decoding.
                 # This removes the action coupling path while keeping future-query tokens enabled.
                 use_action_conditioning=False,
                 use_incremental_depth=getattr(config, "use_incremental_depth", True),
                 future_prediction_horizon=self.future_prediction_horizon,
                 use_velocity_future_gaussians=_vel_g,
-                velocity_world_model_scale=float(getattr(config, "velocity_world_model_scale", 0.5)),
+                velocity_world_model_scale=float(getattr(config, "velocity_world_model_scale", 2.0)),
             )
 
             # Initialize Gaussian Renderer (sh_degree=1 for DC + 1st order SH)
@@ -367,6 +368,7 @@ class PI0Pytorch(nn.Module):
                 except ImportError:
                     logging.warning("lpips package not installed. Install with: pip install lpips")
         else:
+            self.static_gaussian_token_count = 0
             self.future_token_count = 0
             self.future_grid_size = 0
             self.world_token_count = 0
@@ -782,6 +784,12 @@ class PI0Pytorch(nn.Module):
             preprocessed_observation.raw_temporal_images = raw_temporal_images
             preprocessed_observation.raw_temporal_labels = raw_temporal_labels
 
+        future_motion_prior = self._build_temporal_motion_prior_maps(preprocessed_observation)
+        if future_motion_prior:
+            preprocessed_observation.future_motion_prior = future_motion_prior
+            if future_observation is not None:
+                future_observation.future_motion_prior = future_motion_prior
+
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),
@@ -988,6 +996,112 @@ class PI0Pytorch(nn.Module):
                 img_tensor = img_tensor.permute(0, 3, 1, 2)
             return (img_tensor + 1.0) / 2.0
         return None
+
+    def _extract_temporal_view_images(self, observation, view_name: str) -> torch.Tensor | None:
+        """Extract a normalized temporal image sequence [B,T,3,H,W] for a named view."""
+        if observation is None or not hasattr(observation, "images"):
+            return None
+
+        for key, value in observation.images.items():
+            key_lower = key.lower()
+            mapped_view = None
+            if key == "image" or "agent" in key_lower or "high" in key_lower or "cam_high" in key_lower or "exterior" in key_lower or "base" in key_lower:
+                mapped_view = "agent"
+            elif "left_wrist" in key_lower or "wrist_left" in key_lower:
+                mapped_view = "wrist"
+            elif "right_wrist" in key_lower or "wrist_right" in key_lower:
+                if value.min() == value.max() == -1.0:
+                    continue
+                mapped_view = "wrist"
+            elif "wrist" in key_lower or "bravo" in key_lower:
+                mapped_view = "wrist"
+
+            if mapped_view != view_name:
+                continue
+
+            img_tensor = value
+            if img_tensor.ndim == 4:
+                img_tensor = img_tensor[:, None]
+            if img_tensor.ndim != 5:
+                return None
+            if img_tensor.shape[2] != 3 and img_tensor.shape[-1] == 3:
+                img_tensor = img_tensor.permute(0, 1, 4, 2, 3)
+            return (img_tensor + 1.0) / 2.0
+        return None
+
+    def _build_temporal_motion_prior_maps(self, observation) -> dict[str, torch.Tensor]:
+        """Build soft motion priors from past/current context only, avoiding future-target leakage."""
+        motion_prior_maps: dict[str, torch.Tensor] = {}
+        if observation is None:
+            return motion_prior_maps
+
+        depth_sequence = getattr(observation, "depth", None)
+        if depth_sequence is not None and depth_sequence.ndim == 4:
+            depth_sequence = depth_sequence[:, None]
+
+        for view_name in ("agent", "wrist"):
+            image_sequence = self._extract_temporal_view_images(observation, view_name)
+            if image_sequence is None or image_sequence.ndim != 5 or image_sequence.shape[1] < 2:
+                continue
+
+            current_image = image_sequence[:, -1]
+            current_depth = depth_sequence[:, -1] if view_name == "agent" and depth_sequence is not None and depth_sequence.ndim == 5 else None
+            aggregated_prior = None
+            for frame_idx in range(image_sequence.shape[1] - 1):
+                prior_map = self._build_future_motion_weight_map(
+                    image_sequence[:, frame_idx],
+                    current_image,
+                    depth_sequence[:, frame_idx] if current_depth is not None else None,
+                    current_depth,
+                )
+                aggregated_prior = prior_map if aggregated_prior is None else torch.maximum(aggregated_prior, prior_map)
+
+            if aggregated_prior is None:
+                continue
+
+            denom = max(1e-6, self.future_motion_loss_max_weight - self.future_motion_loss_min_weight)
+            normalized_prior = (aggregated_prior - self.future_motion_loss_min_weight) / denom
+            motion_prior_maps[f"{view_name}_image"] = torch.clamp(normalized_prior, 0.0, 1.0)
+
+        return motion_prior_maps
+
+    def _build_future_motion_token_gate(self, observation, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
+        """Downsample the soft motion prior to the 32×32 future-token grid."""
+        if not self.use_world_tokens_in_prefix or self.future_token_count <= 0:
+            return None
+
+        motion_prior_maps = getattr(observation, "future_motion_prior", None)
+        if not motion_prior_maps:
+            return None
+
+        prior_map = motion_prior_maps.get("agent_image")
+        if prior_map is None:
+            prior_map = next(iter(motion_prior_maps.values()), None)
+        if prior_map is None:
+            return None
+
+        if prior_map.ndim == 3:
+            prior_map = prior_map.unsqueeze(1)
+        elif prior_map.ndim != 4:
+            return None
+
+        prior_map = prior_map.to(device=device, dtype=torch.float32)
+        prior_tokens = F.interpolate(
+            prior_map,
+            size=(self.future_grid_size, self.future_grid_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        prior_tokens = prior_tokens.flatten(2).transpose(1, 2)
+        gate = 0.5 + 0.5 * torch.clamp(prior_tokens, 0.0, 1.0)
+        return gate.to(dtype=dtype)
+
+    def _build_future_motion_delta_gate(self, observation, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
+        """Build a soft 32×32 gate for future delta_xyz updates from the motion prior."""
+        gate = self._build_future_motion_token_gate(observation, device=device, dtype=torch.float32)
+        if gate is None:
+            return None
+        return gate.to(dtype=dtype)
 
     def _build_future_motion_weight_map(
         self,
@@ -1369,6 +1483,11 @@ class PI0Pytorch(nn.Module):
                 horizon_idx=horizon_idx,
                 static_reference_params=static_gaussian_params,
                 velocity_time_factor=velocity_time_factor,
+                motion_gate=self._build_future_motion_delta_gate(
+                    preprocessed_observation,
+                    device=device,
+                    dtype=z_next.dtype,
+                ),
             )
 
             return self._compute_gaussian_supervision_loss(
@@ -1396,7 +1515,7 @@ class PI0Pytorch(nn.Module):
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, gaussian_inputs=None,
-        return_segment_lengths=False
+        return_segment_lengths=False, motion_prior_observation=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -1484,16 +1603,22 @@ class PI0Pytorch(nn.Module):
         else:
             gaussian_embs, g_mask = gaussian_result
 
+        future_motion_gate = self._build_future_motion_token_gate(
+            motion_prior_observation,
+            device=lang_emb.device,
+            dtype=self.future_query_tokens.dtype if self.future_query_tokens is not None else lang_emb.dtype,
+        )
+
         gaussian_embs_for_prefix = gaussian_embs
         g_mask_for_prefix = g_mask
         if (
             gaussian_embs is not None
             and self.use_world_tokens_in_prefix
-            and self.future_token_count > 0
-            and gaussian_embs.shape[1] >= self.future_token_count
+            and self.static_gaussian_token_count > 0
+            and gaussian_embs.shape[1] >= self.static_gaussian_token_count
         ):
-            gaussian_embs_for_prefix = gaussian_embs[:, -self.future_token_count :, :]
-            g_mask_for_prefix = g_mask[:, -self.future_token_count :]
+            gaussian_embs_for_prefix = gaussian_embs[:, -self.static_gaussian_token_count :, :]
+            g_mask_for_prefix = g_mask[:, -self.static_gaussian_token_count :]
 
         if gaussian_embs_for_prefix is not None:
              embs.append(gaussian_embs_for_prefix)
@@ -1571,7 +1696,16 @@ class PI0Pytorch(nn.Module):
             device = pad_masks[0].device if pad_masks else next(self.parameters()).device
             future_dtype = self.future_query_tokens.dtype
 
-            delta_q = self.future_query_tokens.expand(B, -1, -1)  # [B, 256, D]
+            delta_q = self.future_query_tokens.expand(B, -1, -1)  # [B, 1024, D]
+            segment_lengths['debug_delta_q_shape'] = tuple(delta_q.shape)
+            if mta_features is not None:
+                segment_lengths['debug_mta_shapes'] = {
+                    layer_idx: tuple(layer_feat.shape)
+                    for layer_idx, layer_feat in mta_features.items()
+                    if layer_feat is not None
+                }
+            else:
+                segment_lengths['debug_mta_shapes'] = {}
             if (
                 mta_features is not None
                 and self.future_query_to_mta is not None
@@ -1604,7 +1738,7 @@ class PI0Pytorch(nn.Module):
                         f"MTA feature frame count mismatch (expected {expected_frames}, got {', '.join(frame_mismatches)})"
                     )
 
-                motion_tokens = self.future_query_to_mta(delta_q)  # [B, 256, 512]
+                motion_tokens = self.future_query_to_mta(delta_q)  # [B, 1024, 512]
                 motion_tokens = motion_tokens.unsqueeze(1).expand(-1, expected_frames, -1, -1)
                 motion_tokens = self.future_mta_encoder(motion_tokens, layer_features)
                 ta_current = motion_tokens[:, expected_frames - 1]
@@ -1618,6 +1752,8 @@ class PI0Pytorch(nn.Module):
                 spatial_pos = spatial_pos + sinusoidal_pos
 
             future_tokens = future_tokens + spatial_pos.to(future_tokens.dtype)
+            if future_motion_gate is not None and future_motion_gate.shape[:2] == future_tokens.shape[:2]:
+                future_tokens = future_tokens * future_motion_gate
             future_mask = torch.ones(B, self.future_token_count, dtype=torch.bool, device=device)
 
             embs.append(future_tokens)
@@ -1882,6 +2018,31 @@ class PI0Pytorch(nn.Module):
         
         return total_loss
 
+    def _build_future_velocity_heatmap(
+        self,
+        raw_delta_xyz: torch.Tensor | None,
+        target_hw: tuple[int, int],
+    ) -> torch.Tensor | None:
+        """Convert predicted xyz deltas into an image-space speed heatmap."""
+        if raw_delta_xyz is None or raw_delta_xyz.ndim != 3:
+            return None
+
+        bsize, num_points, coord_dim = raw_delta_xyz.shape
+        if coord_dim != 3:
+            return None
+
+        grid_size = int(math.isqrt(num_points))
+        if grid_size * grid_size != num_points:
+            return None
+
+        speed_map = raw_delta_xyz.float().norm(dim=-1).reshape(bsize, 1, grid_size, grid_size)
+        if speed_map.shape[-2:] != target_hw:
+            speed_map = F.interpolate(speed_map, size=target_hw, mode="bilinear", align_corners=False)
+
+        max_speed = speed_map.amax(dim=(-2, -1), keepdim=True)
+        speed_map = speed_map / (max_speed + 1e-6)
+        return speed_map.squeeze(1)
+
     def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names, time_suffix="", temporal_frames=None, temporal_labels=None, future_label="future"):
         """Helper to visualize Rendered vs GT images. Delegated to GaussianRenderer."""
         # Cleanly moved to gaussian_renderer.py
@@ -1959,6 +2120,7 @@ class PI0Pytorch(nn.Module):
         target_obs_seq = []
         rendered_obs_seq = []
         motion_weight_seq = []
+        pred_velocity_seq = []
         render_views = None
         base_target_obs = None
         base_rendered_obs = None
@@ -2056,6 +2218,11 @@ class PI0Pytorch(nn.Module):
                     horizon_idx=horizon_idx,
                     static_reference_params=reused_template,
                     velocity_time_factor=vtf,
+                    motion_gate=self._build_future_motion_delta_gate(
+                        preprocessed_observation,
+                        device=z_future_pred_tokens.device,
+                        dtype=z_future_pred_tokens.dtype,
+                    ),
                 )
                 if getattr(self, "use_velocity_future_gaussians", False) and horizon_idx == 0 and viz_static_template is None:
                     viz_static_template = {
@@ -2092,6 +2259,18 @@ class PI0Pytorch(nn.Module):
                     )[:1].float()
                 motion_weight_seq.append(motion_weight_entry)
 
+                pred_velocity_entry = {}
+                raw_delta_xyz = gaussian_params.get("raw_delta_xyz")
+                if raw_delta_xyz is not None:
+                    for render_view in render_views:
+                        view_key = f"{render_view}_image"
+                        target_hw = target_obs[view_key].shape[-2:]
+                        pred_velocity_map = self._build_future_velocity_heatmap(raw_delta_xyz, target_hw)
+                        if pred_velocity_map is not None:
+                            pred_velocity_entry[view_key] = pred_velocity_map[:1].float()
+                pred_velocity_seq.append(pred_velocity_entry)
+
+
             base_target_obs_raw, base_cam_params_dict, base_valid_views = _build_target_obs_and_cameras(current_target)
             if base_target_obs_raw:
                 base_target_obs = {key: value[:1].float() for key, value in base_target_obs_raw.items()}
@@ -2114,6 +2293,7 @@ class PI0Pytorch(nn.Module):
             base_rendered_obs=base_rendered_obs,
             base_label="t/base",
             motion_weight_seq=motion_weight_seq,
+            pred_velocity_seq=pred_velocity_seq,
             context_labels=getattr(preprocessed_observation, "raw_temporal_labels", self._temporal_context_labels()),
         )
         self._log_future_rollout_pixel_lpips(step, rendered_obs_seq)
@@ -2152,14 +2332,28 @@ class PI0Pytorch(nn.Module):
         # Get prefix embeddings with segment lengths for extracting future tokens
         prefix_result = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, gaussian_inputs=gaussian_inputs,
-            return_segment_lengths=self.use_world_tokens_in_prefix
+            return_segment_lengths=self.use_world_tokens_in_prefix,
+            motion_prior_observation=preprocessed_observation,
         )
         if self.use_world_tokens_in_prefix:
             prefix_embs, prefix_pad_masks, prefix_att_masks, segment_lengths = prefix_result
         else:
             prefix_embs, prefix_pad_masks, prefix_att_masks = prefix_result
             segment_lengths = {}
-        
+
+        if step is not None and step % 400 == 0 and self.use_world_tokens_in_prefix:
+            delta_q_shape = segment_lengths.get("debug_delta_q_shape")
+            debug_mta_shapes = segment_lengths.get("debug_mta_shapes", {})
+            mta_shape_str = (
+                ", ".join(f"layer{layer_idx}={shape}" for layer_idx, shape in sorted(debug_mta_shapes.items()))
+                if debug_mta_shapes
+                else "None"
+            )
+            logging.info(
+                f"Step {step}: Future Token Input Shapes | "
+                f"delta_q.shape={delta_q_shape}, mta_features={mta_shape_str}"
+            )
+
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -2226,6 +2420,14 @@ class PI0Pytorch(nn.Module):
             future_end = future_start + segment_lengths['future']
             z_t1_pred_tokens = prefix_out[:, future_start:future_end, :]  # [B, future_token_count, D]
             z_future_pred_tokens = z_t1_pred_tokens
+
+            if step is not None and step % 400 == 0:
+                logging.info(
+                    f"Step {step}: Future Token Shapes | "
+                    f"z_t1_pred_tokens.shape={tuple(z_t1_pred_tokens.shape)}, "
+                    f"future_start={future_start}, future_end={future_end}, "
+                    f"segment_lengths={segment_lengths}"
+                )
 
             if step is not None and step % 400 == 0:
                 logging.info(
@@ -2381,7 +2583,8 @@ class PI0Pytorch(nn.Module):
         # Get prefix embeddings (with segment lengths if using world tokens)
         prefix_result = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, gaussian_inputs=gaussian_inputs,
-            return_segment_lengths=self.use_world_tokens_in_prefix
+            return_segment_lengths=self.use_world_tokens_in_prefix,
+            motion_prior_observation=preprocessed_observation,
         )
         if self.use_world_tokens_in_prefix:
             prefix_embs, prefix_pad_masks, prefix_att_masks, segment_lengths = prefix_result

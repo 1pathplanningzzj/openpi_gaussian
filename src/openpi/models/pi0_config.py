@@ -69,7 +69,7 @@ class Pi0Config(_model.BaseModelConfig):
     # xyz_h = xyz_0 + v(z_h) * velocity_world_model_scale * (offset[h]/offset[0]).
     use_velocity_future_gaussians: bool = False
     # Scale for camera-space displacement from predicted velocity (meters-scale heuristic).
-    velocity_world_model_scale: float = 0.5
+    velocity_world_model_scale: float = 2.0
     # LPIPS perceptual loss options
     use_lpips: bool = False  # Whether to use LPIPS perceptual loss for rendering
     lpips_weight: float = 0.1  # Weight for LPIPS perceptual loss
