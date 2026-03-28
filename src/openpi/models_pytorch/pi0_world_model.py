@@ -99,7 +99,12 @@ class SharedGaussianBackbone(nn.Module):
 
 
 class StaticGaussianHead(nn.Module):
-    """Decode shared features into static Gaussian parameters and absolute depth."""
+    """Decode shared features into static Gaussian parameters and absolute depth.
+
+    Geometry maps F_g from ``shared_features``; optional RGB is added only before the
+    Gaussian-parameter head. Depth is refined from F_g alone so appearance does not
+    leak into the depth branch.
+    """
 
     def __init__(self, use_image_fusion: bool = True, img_dim: int = 3, predict_depth: bool = True):
         super().__init__()
@@ -145,15 +150,16 @@ class StaticGaussianHead(nn.Module):
         )
 
     def forward(self, shared_features: torch.Tensor, images: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
-        fused = shared_features
+        f_g = shared_features
+        g = f_g
         if self.use_image_fusion and images is not None:
-            if images.shape[2:] != fused.shape[2:]:
-                images = F.interpolate(images, size=fused.shape[2:], mode="bilinear", align_corners=True)
-            fused = fused + self.img_merger(images)
+            if images.shape[2:] != f_g.shape[2:]:
+                images = F.interpolate(images, size=f_g.shape[2:], mode="bilinear", align_corners=True)
+            g = f_g + self.img_merger(images)
 
-        result = {"gaussian_params": self.head(fused)}
+        result = {"gaussian_params": self.head(g)}
         if self.predict_depth:
-            result["depth"] = self.depth_refine(fused)
+            result["depth"] = self.depth_refine(f_g)
         return result
 
 
