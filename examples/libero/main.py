@@ -53,7 +53,7 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data_317/gaussian_vla_exp316_15000_libero_10_test_1/videos"  # Path to save videos
+    video_out_path: str = "data_329/gaussian_vla_exp329_15000_libero_10_test_1/videos"  # Path to save videos
     # Gaussian_vla_exp315_12000_libero_10 这个实际上是goal
     save_videos: bool = False  # Whether to save rollout videos
     seed: int = 10  # Random Seed (for reproducibility)
