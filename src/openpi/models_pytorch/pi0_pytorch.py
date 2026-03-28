@@ -456,6 +456,103 @@ class PI0Pytorch(nn.Module):
                 param.requires_grad = True
             logging.info("Unfroze Gaussian Adapter")
 
+    def _set_module_requires_grad(self, module: nn.Module | None, enabled: bool) -> bool:
+        """Enable or disable gradients for a module if it exists."""
+        if module is None:
+            return False
+        for param in module.parameters():
+            param.requires_grad = enabled
+        return True
+
+    def freeze_static_head(self):
+        """Freeze the world-model static head."""
+        if self.world_model is None:
+            return
+        if self._set_module_requires_grad(getattr(self.world_model, "static_head", None), False):
+            logging.info("Froze world-model static_head")
+
+    def unfreeze_static_head(self):
+        """Unfreeze the world-model static head."""
+        if self.world_model is None:
+            return
+        if self._set_module_requires_grad(getattr(self.world_model, "static_head", None), True):
+            logging.info("Unfroze world-model static_head")
+
+    def freeze_velocity_head(self):
+        """Freeze the world-model velocity head."""
+        if self.world_model is None:
+            return
+        if self._set_module_requires_grad(getattr(self.world_model, "velocity_head", None), False):
+            logging.info("Froze world-model velocity_head")
+
+    def unfreeze_velocity_head(self):
+        """Unfreeze the world-model velocity head."""
+        if self.world_model is None:
+            return
+        if self._set_module_requires_grad(getattr(self.world_model, "velocity_head", None), True):
+            logging.info("Unfroze world-model velocity_head")
+
+    def freeze_shared_backbone(self):
+        """Freeze the world-model shared backbone."""
+        if self.world_model is None:
+            return
+        if self._set_module_requires_grad(getattr(self.world_model, "shared_backbone", None), False):
+            logging.info("Froze world-model shared_backbone")
+
+    def unfreeze_shared_backbone(self):
+        """Unfreeze the world-model shared backbone."""
+        if self.world_model is None:
+            return
+        if self._set_module_requires_grad(getattr(self.world_model, "shared_backbone", None), True):
+            logging.info("Unfroze world-model shared_backbone")
+
+    def apply_world_model_stage(
+        self,
+        stage: int,
+        render_weight: float,
+        *,
+        freeze_velocity_head: bool = True,
+        freeze_static_head: bool = True,
+    ):
+        """Apply staged trainability for action/world-model branches."""
+        if stage == 1:
+            self.freeze_action_expert()
+            self.unfreeze_shared_backbone()
+            self.unfreeze_static_head()
+            if freeze_velocity_head:
+                self.freeze_velocity_head()
+            else:
+                self.unfreeze_velocity_head()
+        elif stage == 2:
+            self.freeze_action_expert()
+            self.unfreeze_shared_backbone()
+            if freeze_static_head:
+                self.freeze_static_head()
+            else:
+                self.unfreeze_static_head()
+            self.unfreeze_velocity_head()
+        elif stage == 3:
+            self.unfreeze_action_expert()
+            self.unfreeze_shared_backbone()
+            self.unfreeze_static_head()
+            self.unfreeze_velocity_head()
+        else:
+            raise ValueError(f"Unsupported stage: {stage}")
+
+        self.set_render_loss_weight(render_weight)
+
+    def get_stage_trainability_summary(self) -> dict[str, bool]:
+        """Return whether key training groups currently require gradients."""
+        def _module_trainable(module: nn.Module | None) -> bool:
+            return bool(module is not None and any(param.requires_grad for param in module.parameters()))
+
+        return {
+            "action_expert": _module_trainable(self.paligemma_with_expert.gemma_expert),
+            "shared_backbone": _module_trainable(getattr(self.world_model, "shared_backbone", None)),
+            "static_head": _module_trainable(getattr(self.world_model, "static_head", None)),
+            "velocity_head": _module_trainable(getattr(self.world_model, "velocity_head", None)),
+        }
+
     def _get_action_mlp_modules(self):
         """Get the time/state MLP modules based on pi05 mode."""
         if self.pi05:
@@ -1184,6 +1281,8 @@ class PI0Pytorch(nn.Module):
         visualize: bool = True,
         horizon_idx: int = 0,
         return_gaussian_params: bool = False,
+        enable_depth_supervision: bool = True,
+        enable_render_supervision: bool = True,
     ):
         """Compute depth / render supervision for already-decoded Gaussian parameters."""
         device = next(
@@ -1219,7 +1318,7 @@ class PI0Pytorch(nn.Module):
                 f"depth_value={target_observation.depth is not None if hasattr(target_observation, 'depth') else 'N/A'}"
             )
 
-        if depth_map is not None and hasattr(target_observation, "depth") and target_observation.depth is not None:
+        if enable_depth_supervision and depth_map is not None and hasattr(target_observation, "depth") and target_observation.depth is not None:
             gt_depth = target_observation.depth
             if depth_map.shape != gt_depth.shape:
                 depth_map = F.interpolate(
@@ -1278,7 +1377,7 @@ class PI0Pytorch(nn.Module):
                     cam_params_dict[view_name] = self._get_camera_params_for_view(view_name, device, img_tensor.shape[0])
                     valid_views.append(view_name)
 
-        if valid_views:
+        if enable_render_supervision and valid_views:
             render_views = ["agent"] if "agent" in valid_views else valid_views
             motion_weight_maps = {}
             for render_view in render_views:
@@ -1445,6 +1544,8 @@ class PI0Pytorch(nn.Module):
                 visualize=visualize,
                 horizon_idx=0,
                 return_gaussian_params=return_gaussian_params,
+                enable_depth_supervision=True,
+                enable_render_supervision=True,
             )
         except Exception as error:
             import traceback
@@ -1497,11 +1598,7 @@ class PI0Pytorch(nn.Module):
                 horizon_idx=horizon_idx,
                 static_reference_params=static_gaussian_params,
                 velocity_time_factor=velocity_time_factor,
-                motion_gate=self._build_future_motion_delta_gate(
-                    preprocessed_observation,
-                    device=device,
-                    dtype=z_next.dtype,
-                ),
+                motion_gate=None,
                 shared_state=decoder_state,
             )
 
@@ -1514,6 +1611,8 @@ class PI0Pytorch(nn.Module):
                 visualize=visualize,
                 horizon_idx=horizon_idx,
                 return_gaussian_params=return_gaussian_params,
+                enable_depth_supervision=(horizon_idx == 0),
+                enable_render_supervision=(horizon_idx == 0),
             )
         except Exception as error:
             import traceback
@@ -1771,8 +1870,6 @@ class PI0Pytorch(nn.Module):
                 spatial_pos = spatial_pos + sinusoidal_pos
 
             future_tokens = future_tokens + spatial_pos.to(future_tokens.dtype)
-            if future_motion_gate is not None and future_motion_gate.shape[:2] == future_tokens.shape[:2]:
-                future_tokens = future_tokens * future_motion_gate
             future_mask = torch.ones(B, self.future_token_count, dtype=torch.bool, device=device)
 
             embs.append(future_tokens)
@@ -2334,11 +2431,7 @@ class PI0Pytorch(nn.Module):
                     horizon_idx=horizon_idx,
                     static_reference_params=reused_template,
                     velocity_time_factor=vtf,
-                    motion_gate=self._build_future_motion_delta_gate(
-                        preprocessed_observation,
-                        device=z_future_pred_tokens.device,
-                        dtype=z_future_pred_tokens.dtype,
-                    ),
+                    motion_gate=None,
                 )
                 if getattr(self, "use_velocity_future_gaussians", False) and horizon_idx == 0 and viz_static_template is None:
                     viz_static_template = {

@@ -352,6 +352,118 @@ def compute_lora_grad_stats(model: torch.nn.Module) -> dict[str, float | int]:
     }
 
 
+
+
+def _collect_param_groups(raw_model: torch.nn.Module):
+    grouped_params = {
+        "default": [],
+        "wm_shared_backbone": [],
+        "wm_static_head": [],
+        "wm_velocity_head": [],
+    }
+
+    for name, param in raw_model.named_parameters():
+        if name.startswith("world_model.shared_backbone."):
+            grouped_params["wm_shared_backbone"].append(param)
+        elif name.startswith("world_model.static_head."):
+            grouped_params["wm_static_head"].append(param)
+        elif name.startswith("world_model.velocity_head."):
+            grouped_params["wm_velocity_head"].append(param)
+        else:
+            grouped_params["default"].append(param)
+
+    return grouped_params
+
+
+def _create_optimizer(raw_model: torch.nn.Module, config: _config.TrainConfig, peak_lr: float):
+    grouped_params = _collect_param_groups(raw_model)
+    param_groups = []
+    for group_name in ["default", "wm_shared_backbone", "wm_static_head", "wm_velocity_head"]:
+        params = grouped_params[group_name]
+        if not params:
+            continue
+        param_groups.append({
+            "name": group_name,
+            "params": params,
+            "lr": peak_lr,
+            "lr_scale": 1.0,
+        })
+
+    optim = torch.optim.AdamW(
+        param_groups,
+        lr=peak_lr,
+        betas=(config.optimizer.b1, config.optimizer.b2),
+        eps=config.optimizer.eps,
+        weight_decay=config.optimizer.weight_decay,
+    )
+    return optim
+
+
+def _set_optimizer_lr_scales(optimizer: torch.optim.Optimizer, lr_scales: dict[str, float]):
+    for pg in optimizer.param_groups:
+        pg["lr_scale"] = float(lr_scales.get(pg.get("name", "default"), 1.0))
+
+
+def _optimizer_group_lr_summary(optimizer: torch.optim.Optimizer) -> dict[str, float]:
+    return {pg.get("name", f"group_{idx}"): float(pg["lr"]) for idx, pg in enumerate(optimizer.param_groups)}
+
+
+def _stage_lr_scales(config: _config.TrainConfig, stage: int) -> dict[str, float]:
+    if stage == 1:
+        return {
+            "default": 1.0,
+            "wm_shared_backbone": 1.0,
+            "wm_static_head": 1.0,
+            "wm_velocity_head": 0.0,
+        }
+    if stage == 2:
+        return {
+            "default": 1.0,
+            "wm_shared_backbone": float(getattr(config, "stage2_shared_backbone_lr_scale", 1.0)),
+            "wm_static_head": 0.0,
+            "wm_velocity_head": 1.0,
+        }
+    if stage == 3:
+        return {
+            "default": 1.0,
+            "wm_shared_backbone": 1.0,
+            "wm_static_head": 1.0,
+            "wm_velocity_head": 1.0,
+        }
+    raise ValueError(f"Unsupported stage: {stage}")
+
+
+def _apply_stage_state(
+    raw_model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    config: _config.TrainConfig,
+    stage: int,
+    render_weight: float,
+    *,
+    is_main: bool,
+    label: str,
+):
+    raw_model.apply_world_model_stage(
+        stage,
+        render_weight,
+        freeze_velocity_head=bool(getattr(config, "stage1_freeze_velocity_head", True)),
+        freeze_static_head=bool(getattr(config, "stage2_freeze_static_head", True)),
+    )
+    _set_optimizer_lr_scales(optimizer, _stage_lr_scales(config, stage))
+    raw_model._stage_applied = stage
+
+    if is_main:
+        trainability = raw_model.get_stage_trainability_summary() if hasattr(raw_model, "get_stage_trainability_summary") else {}
+        lr_scales = {pg.get("name", f"group_{idx}"): float(pg.get("lr_scale", 1.0)) for idx, pg in enumerate(optimizer.param_groups)}
+        logging.info(
+            "%s | render_weight=%.4f | lr_scales=%s | trainable=%s",
+            label,
+            render_weight,
+            lr_scales,
+            trainability,
+        )
+
+
 def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
@@ -527,14 +639,11 @@ def train_loop(config: _config.TrainConfig):
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
-    # Create optimizer with config parameters
-    optim = torch.optim.AdamW(
-        model.parameters(),
-        lr=peak_lr,
-        betas=(config.optimizer.b1, config.optimizer.b2),
-        eps=config.optimizer.eps,
-        weight_decay=config.optimizer.weight_decay,
-    )
+    # Get the underlying model (unwrap DDP if needed)
+    raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+    # Create optimizer with fixed parameter groups so stage-specific LR scaling remains stable across resumes
+    optim = _create_optimizer(raw_model, config, peak_lr)
 
     # Load checkpoint if resuming
     global_step = 0
@@ -592,24 +701,82 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"=== Staged Training Enabled ===")
         if use_three_stage:
             logging.info(
-                f"Stage 1 (Depth only): steps 0-{stage1_steps}, render_weight={stage1_render_weight}, action=off"
+                f"Stage 1 (Static-focused): steps 0-{stage1_steps}, render_weight={stage1_render_weight}, action=off"
             )
             logging.info(
-                f"Stage 2 (Depth+Render): steps {stage1_steps}-{stage2_steps}, render_weight={stage2_render_weight}, action=off"
+                f"Stage 2 (Velocity-focused): steps {stage1_steps}-{stage2_steps}, render_weight={stage2_render_weight}, action=off"
             )
             logging.info(
                 f"Stage 3 (Joint training): steps {stage2_steps}-{config.num_train_steps}, render_weight={stage3_render_weight}, action=on"
             )
         else:
             logging.info(
-                f"Stage 1 (Render+Depth only): steps 0-{stage1_steps}, render_weight={stage1_render_weight}"
+                f"Stage 1 (Legacy early stage): steps 0-{stage1_steps}, render_weight={stage1_render_weight}, action=off"
             )
             logging.info(
-                f"Stage 2 (Joint training): steps {stage1_steps}-{config.num_train_steps}, render_weight={stage2_render_weight}"
+                f"Stage 2 (Legacy joint stage): steps {stage1_steps}-{config.num_train_steps}, render_weight={stage2_render_weight}, action=on"
             )
 
-    # Get the underlying model (unwrap DDP if needed)
-    raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    def _apply_stage_for_step(step: int):
+        if not staged_training_enabled:
+            return
+        if use_three_stage and step < stage1_steps:
+            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
+                _apply_stage_state(
+                    raw_model,
+                    optim,
+                    config,
+                    1,
+                    stage1_render_weight,
+                    is_main=is_main,
+                    label="=== Stage 1 Active: Static-focused world-model training (action=off) ===",
+                )
+        elif use_three_stage and step < stage2_steps:
+            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 2:
+                _apply_stage_state(
+                    raw_model,
+                    optim,
+                    config,
+                    2,
+                    stage2_render_weight,
+                    is_main=is_main,
+                    label="=== Stage 2 Active: Velocity-focused world-model training (action=off) ===",
+                )
+        elif use_three_stage:
+            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 3:
+                _apply_stage_state(
+                    raw_model,
+                    optim,
+                    config,
+                    3,
+                    stage3_render_weight,
+                    is_main=is_main,
+                    label="=== Stage 3 Active: Joint training (action=on) ===",
+                )
+        elif step < stage1_steps:
+            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
+                _apply_stage_state(
+                    raw_model,
+                    optim,
+                    config,
+                    1,
+                    stage1_render_weight,
+                    is_main=is_main,
+                    label="=== Stage 1 Active: Legacy early stage (action=off) ===",
+                )
+        else:
+            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 3:
+                _apply_stage_state(
+                    raw_model,
+                    optim,
+                    config,
+                    3,
+                    stage2_render_weight,
+                    is_main=is_main,
+                    label="=== Stage 2 Started: Legacy joint stage (action=on) ===",
+                )
+
+    _apply_stage_for_step(global_step)
 
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
@@ -622,65 +789,15 @@ def train_loop(config: _config.TrainConfig):
                 break
 
             # Staged training: apply correct stage based on current global_step (checked every step)
-            if staged_training_enabled:
-                if use_three_stage and global_step < stage1_steps:
-                    if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
-                        if hasattr(raw_model, 'freeze_action_expert'):
-                            raw_model.freeze_action_expert()
-                            raw_model.set_render_loss_weight(stage1_render_weight)
-                            raw_model._stage_applied = 1
-                            if is_main:
-                                logging.info(
-                                    f"=== Stage 1 Active: Depth Only (render_weight={stage1_render_weight}, action=off) ==="
-                                )
-                elif use_three_stage and global_step < stage2_steps:
-                    if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 2:
-                        if hasattr(raw_model, 'freeze_action_expert'):
-                            raw_model.freeze_action_expert()
-                            raw_model.set_render_loss_weight(stage2_render_weight)
-                            raw_model._stage_applied = 2
-                            if is_main:
-                                logging.info(
-                                    f"=== Stage 2 Active: Depth+Render (render_weight={stage2_render_weight}, action=off) ==="
-                                )
-                elif use_three_stage:
-                    if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 3:
-                        if hasattr(raw_model, 'unfreeze_action_expert'):
-                            raw_model.unfreeze_action_expert()
-                            raw_model.set_render_loss_weight(stage3_render_weight)
-                            raw_model._stage_applied = 3
-                            if is_main:
-                                logging.info(
-                                    f"=== Stage 3 Active: Joint Training (render_weight={stage3_render_weight}, action=on) ==="
-                                )
-                elif global_step < stage1_steps:
-                    # Legacy two-stage schedule.
-                    if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
-                        if hasattr(raw_model, 'freeze_action_expert'):
-                            raw_model.freeze_action_expert()
-                            raw_model.set_render_loss_weight(stage1_render_weight)
-                            raw_model._stage_applied = 1
-                            if is_main:
-                                logging.info(
-                                    f"=== Stage 1 Active: Render+Depth Only (render_weight={stage1_render_weight}) ==="
-                                )
-                else:
-                    if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 2:
-                        if hasattr(raw_model, 'unfreeze_action_expert'):
-                            raw_model.unfreeze_action_expert()
-                            raw_model.set_render_loss_weight(stage2_render_weight)
-                            raw_model._stage_applied = 2
-                            if is_main:
-                                logging.info(
-                                    f"=== Stage 2 Started: Joint Training (render_weight={stage2_render_weight}) ==="
-                                )
+            _apply_stage_for_step(global_step)
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
             # Update LR
+            base_lr = lr_schedule(global_step)
             for pg in optim.param_groups:
-                pg["lr"] = lr_schedule(global_step)
+                pg["lr"] = base_lr * float(pg.get("lr_scale", 1.0))
 
             # Forward pass
             losses = model(observation, actions, step=global_step)

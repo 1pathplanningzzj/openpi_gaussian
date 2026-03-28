@@ -199,38 +199,12 @@ class LoadFlowTransform:
         flow_targets = np.zeros((self.future_horizon, height, width, 3), dtype=np.float32)
         mask_targets = np.zeros((self.future_horizon, height, width), dtype=np.bool_)
 
-        grid_x, grid_y = np.meshgrid(
-            np.arange(width, dtype=np.float32),
-            np.arange(height, dtype=np.float32),
-            indexing="xy",
-        )
-        cumulative_flow_2d = np.zeros((height, width, 2), dtype=np.float32)
-        cumulative_flow_3d = np.zeros((height, width, 3), dtype=np.float32)
-        cumulative_mask = np.ones((height, width), dtype=np.bool_)
         max_pairs = flow_3d.shape[0]
-
-        for horizon_idx in range(self.future_horizon):
-            pair_index = frame_index + horizon_idx
-            if pair_index >= max_pairs:
-                break
-
-            if horizon_idx == 0:
-                step_flow_2d = flow_2d[pair_index]
-                step_flow_3d = flow_3d[pair_index]
-                step_mask = valid_mask[pair_index]
-            else:
-                sample_x = grid_x + cumulative_flow_2d[..., 0]
-                sample_y = grid_y + cumulative_flow_2d[..., 1]
-                step_flow_2d = self._bilinear_sample_field(flow_2d[pair_index], sample_x, sample_y)
-                step_flow_3d = self._bilinear_sample_field(flow_3d[pair_index], sample_x, sample_y)
-                step_mask = self._sample_mask(valid_mask[pair_index], sample_x, sample_y)
-
-            cumulative_mask &= step_mask
-            cumulative_flow_2d = cumulative_flow_2d + np.where(step_mask[..., None], step_flow_2d, 0.0)
-            cumulative_flow_3d = cumulative_flow_3d + np.where(step_mask[..., None], step_flow_3d, 0.0)
-
-            flow_targets[horizon_idx] = np.where(cumulative_mask[..., None], cumulative_flow_3d, 0.0)
-            mask_targets[horizon_idx] = cumulative_mask
+        if frame_index < max_pairs:
+            step_flow_3d = flow_3d[frame_index]
+            step_mask = valid_mask[frame_index]
+            flow_targets[0] = np.where(step_mask[..., None], step_flow_3d, 0.0)
+            mask_targets[0] = step_mask
 
         return flow_targets, mask_targets
 
