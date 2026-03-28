@@ -244,7 +244,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0327_lpips_future_5_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0328_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -1375,6 +1375,30 @@ class PI0Pytorch(nn.Module):
             return total_loss, gaussian_params
         return total_loss
 
+    def _build_world_decoder_state(
+        self,
+        z_tokens: torch.Tensor,
+        *,
+        step: int | None = None,
+    ) -> dict | None:
+        if self.world_model is None or z_tokens is None:
+            return None
+        decoder_state = self.world_model.prepare_decoder_state(
+            z_tokens.float(),
+            horizon_idx=0,
+            skip_horizon_embedding=True,
+            skip_action_conditioning=True,
+        )
+        if step is not None and step % 400 == 0:
+            shared_features = decoder_state.get("shared_features")
+            if torch.is_tensor(shared_features):
+                logging.info(
+                    f"Step {step}: Shared Decoder State | "
+                    f"shared_features.shape={tuple(shared_features.shape)}, "
+                    f"canonical_tokens={tuple(decoder_state['tokens'].shape)}"
+                )
+        return decoder_state
+
     def _compute_current_frame_recon_loss(
         self,
         z_current: torch.Tensor,
@@ -1385,6 +1409,7 @@ class PI0Pytorch(nn.Module):
         visualize: bool = False,
         static_gaussian_params: dict | None = None,
         return_gaussian_params: bool = False,
+        decoder_state: dict | None = None,
     ):
         """Decode the current frame static template and compute reconstruction supervision."""
         device = z_current.device
@@ -1408,6 +1433,7 @@ class PI0Pytorch(nn.Module):
                     camera_params=camera_params_for_decode,
                     base_depth=base_depth,
                     step=step,
+                    shared_state=decoder_state,
                 )
 
             return self._compute_gaussian_supervision_loss(
@@ -1445,6 +1471,7 @@ class PI0Pytorch(nn.Module):
         static_gaussian_params: dict | None = None,
         velocity_time_factor: float = 1.0,
         return_gaussian_params: bool = False,
+        decoder_state: dict | None = None,
     ):
         """Decode one future horizon and compute depth/render supervision."""
         device = z_next.device
@@ -1475,6 +1502,7 @@ class PI0Pytorch(nn.Module):
                     device=device,
                     dtype=z_next.dtype,
                 ),
+                shared_state=decoder_state,
             )
 
             return self._compute_gaussian_supervision_loss(
@@ -1498,7 +1526,6 @@ class PI0Pytorch(nn.Module):
         if return_gaussian_params:
             return total_loss, gaussian_params
         return total_loss
-
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, gaussian_inputs=None,
@@ -1596,16 +1623,21 @@ class PI0Pytorch(nn.Module):
             dtype=self.future_query_tokens.dtype if self.future_query_tokens is not None else lang_emb.dtype,
         )
 
-        gaussian_embs_for_prefix = gaussian_embs
-        g_mask_for_prefix = g_mask
+        gaussian_embs_for_prefix = None
+        g_mask_for_prefix = None
         if (
             gaussian_embs is not None
             and self.use_world_tokens_in_prefix
             and self.static_gaussian_token_count > 0
             and gaussian_embs.shape[1] >= self.static_gaussian_token_count
         ):
-            gaussian_embs_for_prefix = gaussian_embs[:, -self.static_gaussian_token_count :, :]
-            g_mask_for_prefix = g_mask[:, -self.static_gaussian_token_count :]
+            # Keep current-frame Gaussian tokens out of the VLM prefix; current-frame supervision
+            # now decodes from the interaction-refined future token segment instead.
+            gaussian_embs_for_prefix = None
+            g_mask_for_prefix = None
+        else:
+            gaussian_embs_for_prefix = gaussian_embs
+            g_mask_for_prefix = g_mask
 
         if gaussian_embs_for_prefix is not None:
              embs.append(gaussian_embs_for_prefix)
@@ -2488,9 +2520,6 @@ class PI0Pytorch(nn.Module):
         z_future_pred_tokens = None
         per_step_delta = None
         if self.use_world_tokens_in_prefix and 'future' in segment_lengths:
-            # Calculate the start position of future tokens in prefix_output
-            # Order: gaussian (if exists) -> images -> language -> future
-            # (world tokens removed — no longer in prefix)
             future_start = 0
             if 'gaussian' in segment_lengths:
                 future_start += segment_lengths['gaussian']
@@ -2502,7 +2531,7 @@ class PI0Pytorch(nn.Module):
                 future_start += segment_lengths['world']
 
             future_end = future_start + segment_lengths['future']
-            z_t1_pred_tokens = prefix_out[:, future_start:future_end, :]  # [B, future_token_count, D]
+            z_t1_pred_tokens = prefix_out[:, future_start:future_end, :]
             z_future_pred_tokens = z_t1_pred_tokens
 
             if step is not None and step % 400 == 0:
@@ -2520,7 +2549,7 @@ class PI0Pytorch(nn.Module):
                     f"rms={z_t1_pred_tokens.float().pow(2).mean().sqrt().item():.6f}, "
                     "mode=direct motion-aware velocity token"
                 )
-        # --- World Model Render Loss (render-only, no forward loss) ---
+
         if self.use_world_tokens_in_prefix and z_future_pred_tokens is not None and future_observation is not None:
             available_future_steps = self._get_temporal_observation_length(future_observation)
             rollout_horizon = min(self.future_prediction_horizon, available_future_steps or 1)
@@ -2528,28 +2557,31 @@ class PI0Pytorch(nn.Module):
             horizon_loss_weights = self._get_future_horizon_loss_weights(
                 step, rollout_horizon, loss.device, torch.float32
             )
+            decoder_state = self._build_world_decoder_state(z_future_pred_tokens, step=step)
 
             current_template_loss = torch.zeros((), dtype=torch.float32, device=loss.device)
             static_template: dict | None = None
-            g_len = segment_lengths.get("gaussian", 0)
-            z_gaussian_vlm = prefix_out[:, :g_len, :] if g_len > 0 else None
             current_target = self._slice_temporal_observation(preprocessed_observation, self.temporal_context_count - 1)
             if current_target is None:
                 current_target = preprocessed_observation
 
-            if z_gaussian_vlm is not None:
+            if z_future_pred_tokens is not None:
                 try:
                     current_template_loss, static_template_raw = self._compute_current_frame_recon_loss(
-                        z_gaussian_vlm,
+                        z_future_pred_tokens,
                         current_target,
                         step=step,
                         time_suffix="_t_current_static",
                         visualize=False,
                         return_gaussian_params=True,
+                        decoder_state=decoder_state,
                     )
-                    static_template = {
-                        k: v.detach() if torch.is_tensor(v) else v for k, v in static_template_raw.items()
-                    }
+                    if static_template_raw and static_template_raw.get("xyz") is not None:
+                        static_template = {
+                            k: v.detach() if torch.is_tensor(v) else v for k, v in static_template_raw.items()
+                        }
+                    else:
+                        static_template = None
                     if torch.isfinite(current_template_loss):
                         loss = loss + self.current_frame_recon_loss_weight * current_template_loss.to(loss.dtype)
                     if step is not None and step % 400 == 0:
@@ -2565,12 +2597,7 @@ class PI0Pytorch(nn.Module):
                 delta_reg_weights = self._get_future_horizon_loss_weights(
                     step, rollout_horizon, z_future_pred_tokens.device, torch.float32
                 )
-                per_horizon_delta = []
-                for horizon_idx in range(rollout_horizon):
-                    o0 = self.future_prediction_offsets[0]
-                    oh = self.future_prediction_offsets[horizon_idx]
-                    time_factor = float(oh) / float(o0) if o0 else 1.0
-                    per_horizon_delta.append(z_future_pred_tokens.float() * time_factor)
+                per_horizon_delta = [z_future_pred_tokens.float() for _ in range(rollout_horizon)]
                 per_step_delta = torch.stack(per_horizon_delta, dim=1)
                 raw_delta_reg = (
                     per_step_delta.pow(2).mean(dim=(0, 2, 3)) * delta_reg_weights
@@ -2585,48 +2612,36 @@ class PI0Pytorch(nn.Module):
                     per_step_delta,
                     delta_reg_weights,
                 )
-                if step is not None and step % 400 == 0:
-                    logging.info(
-                        f"Step {step}: Future Motion Delta Reg = {delta_reg.item():.6f}, "
-                        f"raw={raw_delta_reg.item():.6f}, weight={self.future_delta_reg_weight}, "
-                        "mode=direct motion-aware velocity token"
-                    )
-
-            for horizon_idx in range(rollout_horizon):
-                future_target = (
-                    self._slice_temporal_observation(future_observation, horizon_idx)
-                    if available_future_steps > 0
-                    else future_observation
-                )
-                reused_template = None
-                vtf = 1.0
-                if self.use_velocity_future_gaussians and static_template is not None:
-                    reused_template = static_template
-                    o0 = self.future_prediction_offsets[0]
-                    oh = self.future_prediction_offsets[horizon_idx]
-                    vtf = float(oh) / float(o0) if o0 else 1.0
-
-                if self.use_velocity_future_gaussians and reused_template is None:
-                    logging.warning(
-                        "Step %s: Missing static template for future horizon t+%s, falling back to independent decode.",
-                        step,
-                        self.future_prediction_offsets[horizon_idx],
-                    )
-
-                horizon_loss = self._compute_world_model_frame_loss(
-                    z_future_pred_tokens,
-                    future_target,
-                    preprocessed_observation,
-                    step=step,
-                    time_suffix=f"_tplus{self.future_prediction_offsets[horizon_idx]}_pred_vlm",
-                    visualize=False,
-                    horizon_idx=horizon_idx,
-                    static_gaussian_params=reused_template,
-                    velocity_time_factor=vtf,
-                )
-                world_model_loss = world_model_loss + horizon_loss_weights[horizon_idx] * horizon_loss
 
             if rollout_horizon > 0:
+                if self.use_velocity_future_gaussians and static_template is None:
+                    logging.warning("Skipping future velocity rollout because static template decode failed.")
+                    return loss
+                reused_template = static_template if self.use_velocity_future_gaussians else None
+                for horizon_idx in range(rollout_horizon):
+                    future_target = (
+                        self._slice_temporal_observation(future_observation, horizon_idx)
+                        if available_future_steps > 0
+                        else future_observation
+                    )
+                    offset0 = self.future_prediction_offsets[0] if self.future_prediction_offsets else 1
+                    offseth = self.future_prediction_offsets[horizon_idx] if horizon_idx < len(self.future_prediction_offsets) else (horizon_idx + 1)
+                    velocity_time_factor = float(offseth) / float(offset0) if offset0 else 1.0
+                    horizon_suffix = f"_tplus{offseth}_pred_vlm"
+                    horizon_loss = self._compute_world_model_frame_loss(
+                        z_future_pred_tokens,
+                        future_target,
+                        preprocessed_observation,
+                        step=step,
+                        time_suffix=horizon_suffix,
+                        visualize=False,
+                        horizon_idx=horizon_idx,
+                        static_gaussian_params=reused_template,
+                        velocity_time_factor=velocity_time_factor,
+                        decoder_state=decoder_state,
+                    )
+                    world_model_loss = world_model_loss + horizon_loss_weights[horizon_idx] * horizon_loss
+
                 loss = loss + (world_model_loss / horizon_loss_weights.sum().clamp_min(1e-6)).to(loss.dtype)
 
                 import torch.distributed as dist

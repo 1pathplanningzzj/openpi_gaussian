@@ -62,14 +62,16 @@ class Pi0Config(_model.BaseModelConfig):
     delta_depth_loss_weight: float = 0.0
     # If True, only supervise delta depth for t->t+1. Default False supervises t->t+h for all horizons.
     delta_depth_first_horizon_only: bool = False
-    # Make world-model depth prediction residual wrt current depth.
-    use_incremental_depth: bool = True
-    # If True, horizon 0 uses full Gaussian decode; horizons h>1 reuse detached static
-    # (rot/scale/opacity/SH + template xyz) and only predict per-token velocity v so that
-    # xyz_h = xyz_0 + v(z_h) * velocity_world_model_scale * (offset[h]/offset[0]).
+    # Make world-model depth prediction absolute rather than residual wrt current depth.
+    use_incremental_depth: bool = False
+    # If True, the world model uses one shared future-token decoder backbone, then:
+    # - decodes a current/base Gaussian template via a static head
+    # - predicts horizon-conditioned raw_delta_xyz via a velocity head
+    # Future rollouts reuse the same shared future-token features and detached static template,
+    # scaling motion by velocity_world_model_scale * (offset[h]/offset[0]).
     use_velocity_future_gaussians: bool = False
     # Scale for camera-space displacement from predicted velocity (meters-scale heuristic).
-    velocity_world_model_scale: float = 2.0
+    velocity_world_model_scale: float = 1.0
     # Optional masked 3D flow supervision on raw_delta_xyz.
     flow_loss_weight: float = 0.0
     flow_first_horizon_only: bool = True

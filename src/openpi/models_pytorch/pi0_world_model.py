@@ -71,185 +71,127 @@ class _FeatureFusionBlock(nn.Module):
         return x
 
 
-class IndependentGaussianHead(nn.Module):
-    """
-    Decodes VLM future tokens [B, 256, D] directly to dense Gaussian parameter maps.
+class SharedGaussianBackbone(nn.Module):
+    """Shared token-to-feature backbone for both static and velocity decoding."""
 
-    Architecture: DPT-style multi-scale feature fusion + image feature fusion.
-    - Multi-scale features: 16×16 → 32×32 → 64×64 → 128×128 → 256×256
-    - Image feature fusion: Residual connection with input image features
-    - Output: rot(4) + scale(3) + opacity(1) + SH(9) = 17 channels
-    - SH(9): DC(3) + 1st order(6) for view-dependent appearance
-
-    Reference: AD-FFgsStudio architecture (without depth prediction)
-    """
-
-    def __init__(self, token_dim: int = 2048, grid_size: int = 16,
-                 use_image_fusion: bool = True, img_dim: int = 3,
-                 predict_depth: bool = True):
+    def __init__(self, token_dim: int = 2048):
         super().__init__()
-        self.grid_size = grid_size
+        self.layer1 = _UpsampleBlock(token_dim, 512)   # 32×32 -> 64×64
+        self.layer2 = _UpsampleBlock(512, 256)         # 64×64 -> 128×128
+        self.layer3 = _UpsampleBlock(256, 128)         # 128×128 -> 256×256
+
+        self.fusion1 = _FeatureFusionBlock(128, has_residual=False)
+        self.fusion2 = _FeatureFusionBlock(128, has_residual=True)
+        self.fusion3 = _FeatureFusionBlock(128, has_residual=True)
+
+        self.proj_feat2 = nn.Conv2d(256, 128, 1)
+        self.proj_feat1 = nn.Conv2d(512, 128, 1)
+
+    def forward(self, token_grid: torch.Tensor) -> torch.Tensor:
+        feat1 = self.layer1(token_grid)
+        feat2 = self.layer2(feat1)
+        feat3 = self.layer3(feat2)
+
+        fused = self.fusion1(feat3)
+        fused = self.fusion2(fused, residual=self.proj_feat2(feat2))
+        fused = self.fusion3(fused, residual=self.proj_feat1(feat1))
+        return fused
+
+
+class StaticGaussianHead(nn.Module):
+    """Decode shared features into static Gaussian parameters and absolute depth."""
+
+    def __init__(self, use_image_fusion: bool = True, img_dim: int = 3, predict_depth: bool = True):
+        super().__init__()
         self.use_image_fusion = use_image_fusion
         self.predict_depth = predict_depth
 
-        # Output channels: rot(4) + scale(3) + opacity(1) + SH(9) + xy_delta(2)
-        # SH(9) = DC(3) + 1st order(6) for basic view-dependent effects
-        # xy_delta(2) allows explicit lateral motion avoiding conflict with existing depth prediction.
         out_ch = 4 + 3 + 1 + 9 + 2
 
-        # Multi-scale feature extraction (DPT-style)
-        # Layer 1: 16×16 → 32×32
-        self.layer1 = _UpsampleBlock(token_dim, 512)
-
-        # Layer 2: 32×32 → 64×64
-        self.layer2 = _UpsampleBlock(512, 256)
-
-        # Layer 3: 64×64 → 128×128
-        self.layer3 = _UpsampleBlock(256, 128)
-
-        # Layer 4: 128×128 → 256×256 (NEW: higher resolution)
-        self.layer4 = _UpsampleBlock(128, 128)
-
-        # DPT-style feature fusion blocks (4 layers now)
-        # All fusion blocks expect 128 channels for both input and residual
-        self.fusion1 = _FeatureFusionBlock(128, has_residual=False)  # Final layer
-        self.fusion2 = _FeatureFusionBlock(128, has_residual=True)   # Fuse layer3 (128 ch)
-        self.fusion3 = _FeatureFusionBlock(128, has_residual=True)   # Fuse layer2 (256 ch)
-        self.fusion4 = _FeatureFusionBlock(128, has_residual=True)   # Fuse layer1 (512 ch)
-
-        # Projection layers to unify channel dimensions to 128
-        # Required because layer2 has 256 channels and layer1 has 512 channels
-        self.proj_feat2 = nn.Conv2d(256, 128, 1)  # Project layer2: 256 → 128
-        self.proj_feat1 = nn.Conv2d(512, 128, 1)  # Project layer1: 512 → 128
-
-        # Image feature fusion (if enabled)
         if use_image_fusion:
             self.img_merger = nn.Sequential(
                 nn.Conv2d(img_dim, 128, 7, padding=3),
                 nn.GELU(),
             )
 
-        # Final projection to output channels
         self.head = nn.Conv2d(128, out_ch, 3, padding=1)
 
-        # Independent depth prediction branch (方案 A - 借鉴 VGGT DPT)
         if predict_depth:
-            # Lightweight refinement network for depth prediction
             self.depth_refine = nn.Sequential(
-                # First refinement block
                 nn.Conv2d(128, 64, 3, padding=1),
                 nn.GroupNorm(min(32, 64), 64),
                 nn.GELU(),
-                # Second refinement block with residual
                 nn.Conv2d(64, 64, 3, padding=1),
                 nn.GroupNorm(min(32, 64), 64),
                 nn.GELU(),
-                # Final projection to depth
                 nn.Conv2d(64, 1, 3, padding=1),
             )
-            # Initialize depth refinement layers
             for m in self.depth_refine.modules():
                 if isinstance(m, nn.Conv2d):
                     nn.init.xavier_uniform_(m.weight, gain=0.01)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
-        # Initialize output with small random values for better gradient flow
-        # Using Xavier/Glorot initialization scaled down for stability
         nn.init.xavier_uniform_(self.head.weight, gain=0.01)
         nn.init.zeros_(self.head.bias)
 
-        # SH mask for attenuating higher-order coefficients (following AD-FFgsStudio)
-        # DC (degree 0): weight = 1.0
-        # 1st order (degree 1): weight = 0.1 * 0.25 = 0.025
         self.register_buffer(
             "sh_mask",
-            torch.tensor([1.0, 1.0, 1.0,  # DC (3 coefficients)
-                         0.025, 0.025, 0.025, 0.025, 0.025, 0.025],  # 1st order (6 coefficients)
-                        dtype=torch.float32),
+            torch.tensor(
+                [1.0, 1.0, 1.0, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025],
+                dtype=torch.float32,
+            ),
             persistent=False,
         )
 
-    def forward(self, tokens: torch.Tensor, images: torch.Tensor = None):
-        """
-        Args:
-            tokens: [B, 256, D] VLM future tokens
-            images: [B, 3, H, W] Optional input images for feature fusion
-        Returns:
-            dict with:
-                - 'gaussian_params': [B, 17, 256, 256] - rot(4) + scale(3) + opacity(1) + SH(9)
-                - 'depth': [B, 1, 256, 256] - predicted depth (if predict_depth=True)
-        """
-        B, N, D = tokens.shape
-        g = self.grid_size
-        x = tokens.permute(0, 2, 1).reshape(B, D, g, g)  # [B, D, 16, 16]
-
-        # Multi-scale feature extraction (4 layers)
-        feat1 = self.layer1(x)      # [B, 512, 32, 32]
-        feat2 = self.layer2(feat1)  # [B, 256, 64, 64]
-        feat3 = self.layer3(feat2)  # [B, 128, 128, 128]
-        feat4 = self.layer4(feat3)  # [B, 128, 256, 256]
-
-        # DPT-style feature fusion (bottom-up, 4 layers)
-        # Start from deepest layer and fuse with shallower layers
-        fused = self.fusion1(feat4)                              # [B, 128, 256, 256]
-        fused = self.fusion2(fused, residual=feat3)              # [B, 128, 256, 256] feat3: 128 ch
-        fused = self.fusion3(fused, residual=self.proj_feat2(feat2))  # [B, 128, 256, 256] feat2: 256→128
-        fused = self.fusion4(fused, residual=self.proj_feat1(feat1))  # [B, 128, 256, 256] feat1: 512→128
-
-        # Image feature fusion (residual connection)
+    def forward(self, shared_features: torch.Tensor, images: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+        fused = shared_features
         if self.use_image_fusion and images is not None:
-            # Ensure images are at correct resolution (256×256)
             if images.shape[2:] != fused.shape[2:]:
-                images = F.interpolate(images, size=fused.shape[2:], mode='bilinear', align_corners=True)
-            img_feat = self.img_merger(images)  # [B, 128, 256, 256]
-            fused = fused + img_feat  # Residual connection
+                images = F.interpolate(images, size=fused.shape[2:], mode="bilinear", align_corners=True)
+            fused = fused + self.img_merger(images)
 
-        # Final projection to Gaussian parameters
-        gaussian_params = self.head(fused)  # [B, 17, 256, 256]
-
-        # Independent depth prediction with refinement (方案 A - 借鉴 VGGT DPT)
-        result = {'gaussian_params': gaussian_params}
+        result = {"gaussian_params": self.head(fused)}
         if self.predict_depth:
-            depth_raw = self.depth_refine(fused)  # [B, 1, 256, 256]
-            result['depth'] = depth_raw
-
+            result["depth"] = self.depth_refine(fused)
         return result
+
+
+class VelocityGaussianHead(nn.Module):
+    """Decode shared features into horizon-conditioned xyz velocity maps."""
+
+    def __init__(self, future_prediction_horizon: int):
+        super().__init__()
+        self.horizon_proj = nn.Embedding(max(1, int(future_prediction_horizon)), 128)
+        self.net = nn.Sequential(
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.GroupNorm(min(32, 128), 128),
+            nn.GELU(),
+            nn.Conv2d(128, 3, 3, padding=1),
+        )
+        nn.init.xavier_uniform_(self.net[-1].weight, gain=0.01)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, shared_features: torch.Tensor, horizon_idx: int) -> torch.Tensor:
+        horizon_idx = max(0, min(int(horizon_idx), self.horizon_proj.num_embeddings - 1))
+        horizon_ids = torch.full(
+            (shared_features.shape[0],), horizon_idx, device=shared_features.device, dtype=torch.long
+        )
+        horizon_bias = self.horizon_proj(horizon_ids).view(shared_features.shape[0], -1, 1, 1)
+        return self.net(shared_features + horizon_bias)
 
 
 class GaussianDecoder(nn.Module):
     """
-    Lightweight decoder that converts VLM-predicted latent tokens to 3D Gaussian parameters.
-    Uses independent ConvNet decoder with no VGGT DPT dependency.
+    Decoder that converts shared future-token features into 3D Gaussian parameters.
 
-    Pipeline:
-    --------
-    VLM Token [B,256,2048]
-        ↓
-    IndependentGaussianHead (ConvNet)
-        ├─ 16×16 → 32×32 → 64×64 → 128×128 (multi-scale)
-        ├─ DPT feature fusion
-        └─ Image feature fusion (current frame)
-        ↓
-    Raw Maps [B,12,128,128]
-        ├─ rot(4) + scale(3) + opacity(1) + RGB(3) + depth_delta(1) = 12 channels
-        ↓
-    Transformations:
-        ├─ rot(4) → normalize → rotations [B,N,4] (quaternions)
-        ├─ scale(3) → softplus → scales [B,N,3]
-        ├─ opacity(1) → sigmoid → opacity [B,N,1]
-        ├─ RGB(3) → tanh*2.0 → sh [B,N,3] (SH DC coefficients)
-        └─ depth_delta(1) + base_depth → final_depth
-        ↓
-    3D Unprojection (depth2pc)
-        final_depth + camera_intrinsics → xyz [B,N,3]
-        ↓
-    Gaussian Point Cloud [B,N=16384,*]
-        ├─ xyz [B,N,3]        - 3D positions
-        ├─ scales [B,N,3]     - Gaussian scales
-        ├─ rotations [B,N,4]  - Rotation quaternions
-        ├─ opacity [B,N,1]    - Alpha values
-        └─ sh [B,N,3]         - Spherical harmonics (DC only)
+    The shared token block is normalized onto the canonical future-token grid once,
+    passed through one shared spatial backbone, then split into two heads:
+    - static head: predicts current/base Gaussian parameters + absolute depth
+    - velocity head: predicts horizon-conditioned raw_delta_xyz rollout updates
+
+    Future rollouts reuse the detached static template for scale / opacity / SH /
+    rotation while applying horizon-scaled xyz motion from the velocity head.
     """
 
     def __init__(
@@ -289,34 +231,189 @@ class GaussianDecoder(nn.Module):
                 nn.Linear(128, token_dim),  # 输出维度应该匹配 token_dim (2048)
             )
 
-        # Full Gaussian decode is used to build the current/base template.
-        # Future horizons reuse that template and only predict gated dynamic xyz updates.
-        static_grid_size = int(self.static_input_num_tokens ** 0.5)
-        self.static_grid_size = static_grid_size
+        self.static_grid_size = int(self.static_input_num_tokens ** 0.5)
         self.future_grid_size = int(self.future_input_num_tokens ** 0.5)
-        self.gaussian_head = IndependentGaussianHead(
-            token_dim=token_dim, grid_size=static_grid_size,
-            use_image_fusion=True,  # Enable image feature fusion
+
+        # One shared decoder backbone consumes the canonical 32×32 future-token grid.
+        # Static/base reconstruction and future velocity rollout both branch from this shared feature map.
+        self.canonical_grid_size = self.future_grid_size
+        self.shared_backbone = SharedGaussianBackbone(token_dim=token_dim)
+        self.static_head = StaticGaussianHead(
+            use_image_fusion=True,
             img_dim=3,
             predict_depth=predict_depth,
         )
 
-        # Future-query dynamics head: decode 32×32 motion tokens into a denser 128×128
-        # velocity field before projecting to the static Gaussian grid.
         if use_velocity_future_gaussians:
-            self.velocity_head = nn.Sequential(
-                _UpsampleBlock(token_dim, 256),   # 32×32 -> 64×64
-                _UpsampleBlock(256, 128),         # 64×64 -> 128×128
-                nn.Conv2d(128, 3, 3, padding=1),
-            )
-            nn.init.xavier_uniform_(self.velocity_head[-1].weight, gain=0.01)
-            nn.init.zeros_(self.velocity_head[-1].bias)
+            self.velocity_head = VelocityGaussianHead(self.future_prediction_horizon)
         else:
             self.velocity_head = None
 
-    # ------------------------------------------------------------------
-    # depth2pc — real-camera unprojection  (adapted from AD-FFgsStudio)
-    # ------------------------------------------------------------------
+    def _normalize_tokens_to_canonical_grid(self, z: torch.Tensor) -> torch.Tensor:
+        """Normalize 256/768/1024-token inputs onto the canonical future-token grid."""
+        if z.ndim != 3:
+            raise ValueError(f"Expected token tensor [B, N, D], got {tuple(z.shape)}")
+
+        if z.shape[1] == self.static_input_num_tokens * max(1, self.future_prediction_horizon):
+            z = z[:, -self.static_input_num_tokens :, :]
+        elif z.shape[1] == self.static_input_num_tokens * 3:
+            z = z[:, -self.static_input_num_tokens :, :]
+
+        src_tokens = z.shape[1]
+        src_grid = int(math.isqrt(src_tokens))
+        if src_grid * src_grid != src_tokens:
+            raise ValueError(f"Cannot reshape token count {src_tokens} into a square grid")
+
+        if src_grid == self.canonical_grid_size:
+            return z
+
+        token_grid = z.transpose(1, 2).reshape(z.shape[0], z.shape[2], src_grid, src_grid)
+        token_grid = F.interpolate(
+            token_grid,
+            size=(self.canonical_grid_size, self.canonical_grid_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return token_grid.reshape(z.shape[0], z.shape[2], -1).transpose(1, 2)
+
+    def _prepare_shared_token_features(
+        self,
+        z: torch.Tensor,
+        *,
+        horizon_idx: int = 0,
+        actions=None,
+        camera_params=None,
+        skip_horizon_embedding: bool = False,
+        skip_action_conditioning: bool = False,
+    ) -> dict[str, torch.Tensor | int]:
+        """Normalize token count and run the shared decoder backbone once."""
+        # Horizon-specific rollout variation now lives in VelocityGaussianHead.
+        # The shared backbone stays horizon-agnostic so one decoder state can be reused.
+        horizon_idx = max(0, min(int(horizon_idx), self.future_prediction_horizon - 1))
+
+        if not skip_action_conditioning and self.use_action_conditioning and actions is not None:
+            action_cam = self._transform_action_to_camera(actions, camera_params)
+            action_cam_7d = action_cam[:, :7]
+            action_embed = self.action_proj(action_cam_7d)
+            z = z + action_embed.unsqueeze(1)
+
+        z_canonical = self._normalize_tokens_to_canonical_grid(z)
+        token_grid = z_canonical.transpose(1, 2).reshape(
+            z_canonical.shape[0], z_canonical.shape[2], self.canonical_grid_size, self.canonical_grid_size
+        )
+        shared_features = self.shared_backbone(token_grid)
+        return {
+            "tokens": z_canonical,
+            "token_grid": token_grid,
+            "shared_features": shared_features,
+            "horizon_idx": horizon_idx,
+        }
+
+    def prepare_decoder_state(
+        self,
+        z: torch.Tensor,
+        *,
+        actions=None,
+        camera_params=None,
+        horizon_idx: int = 0,
+        skip_horizon_embedding: bool = False,
+        skip_action_conditioning: bool = False,
+    ) -> dict[str, torch.Tensor | int]:
+        return self._prepare_shared_token_features(
+            z,
+            horizon_idx=horizon_idx,
+            actions=actions,
+            camera_params=camera_params,
+            skip_horizon_embedding=skip_horizon_embedding,
+            skip_action_conditioning=skip_action_conditioning,
+        )
+
+    def _decode_static_from_shared(
+        self,
+        shared_state: dict[str, torch.Tensor | int],
+        *,
+        gaussian_adapter=None,
+        camera_params=None,
+        current_observation=None,
+        future_observation=None,
+        base_depth: torch.Tensor | None = None,
+    ) -> dict:
+        shared_features = shared_state["shared_features"]
+        assert isinstance(shared_features, torch.Tensor)
+
+        current_frame_img = None
+        if future_observation is None and current_observation is not None and gaussian_adapter is not None:
+            vggt_inputs = gaussian_adapter.prepare_inputs(
+                current_observation, shared_features.device, shared_features.shape[0], is_training=False
+            )
+            if vggt_inputs is not None:
+                current_frame_img = vggt_inputs[:, -1]
+
+        decoder_output = self.static_head(shared_features, images=current_frame_img)
+        raw = decoder_output["gaussian_params"]
+        rot_raw, scale_raw, opa_raw, sh_raw, xy_delta_raw = raw.split([4, 3, 1, 9, 2], dim=1)
+
+        depth_delta_map = None
+        if self.predict_depth and "depth" in decoder_output:
+            depth_raw = decoder_output["depth"]
+            final_depth = 8.0 * torch.sigmoid(depth_raw.squeeze(1))
+        elif base_depth is not None:
+            final_depth = base_depth.squeeze(1) if base_depth.ndim == 4 else base_depth
+        else:
+            raise ValueError("Decoder requires predicted depth or base_depth")
+
+        H_dec, W_dec = final_depth.shape[-2:]
+        B = final_depth.shape[0]
+
+        rot_maps = rot_raw.permute(0, 2, 3, 1)
+        rot_maps = rot_maps / (rot_maps.norm(dim=-1, keepdim=True) + 1e-8)
+
+        scale_maps = F.softplus(scale_raw.permute(0, 2, 3, 1), beta=1) * 0.01
+        opacity_maps = torch.sigmoid(opa_raw.permute(0, 2, 3, 1))
+
+        sh_maps = sh_raw.permute(0, 2, 3, 1)
+        sh_mask = self.static_head.sh_mask.view(1, 1, 1, 9)
+        sh_maps = sh_maps * sh_mask
+
+        if camera_params is not None and "fx" in camera_params:
+            xyz_base = self.depth2pc(
+                final_depth,
+                fx=camera_params["fx"], fy=camera_params["fy"],
+                cx=camera_params["cx"], cy=camera_params["cy"],
+                downsample_factor=1,
+            )
+        else:
+            xyz_base = self.depth2pc(
+                final_depth,
+                fx=221.7025, fy=221.7025,
+                cx=128.0, cy=128.0,
+                downsample_factor=1,
+            )
+
+        xy_delta_maps = xy_delta_raw.permute(0, 2, 3, 1)
+        N = H_dec * W_dec
+        xy_delta_flat = torch.tanh(xy_delta_maps.reshape(B, N, 2)) * 0.5
+        z_zeros = torch.zeros(B, N, 1, device=xyz_base.device, dtype=xyz_base.dtype)
+        xyz = xyz_base + torch.cat([xy_delta_flat, z_zeros], dim=-1)
+
+        rot_flat = rot_maps.reshape(B, N, 4)
+        scale_flat = torch.clamp(scale_maps.reshape(B, N, 3), min=1e-7, max=10.0)
+        opacity_flat = opacity_maps.reshape(B, N, 1)
+        sh_flat = sh_maps.reshape(B, N, 9)
+
+        xyz = torch.clamp(xyz, min=-100.0, max=100.0)
+        xyz = torch.where(torch.isnan(xyz) | torch.isinf(xyz), torch.zeros_like(xyz), xyz)
+
+        return {
+            "xyz": xyz,
+            "scales": scale_flat,
+            "opacity": opacity_flat,
+            "sh": sh_flat,
+            "rotations": rot_flat,
+            "depth_map": final_depth.unsqueeze(1),
+            "depth_delta_map": None if depth_delta_map is None else depth_delta_map.unsqueeze(1),
+        }
+
     @staticmethod
     def depth2pc(
         depth: torch.Tensor,
@@ -336,23 +433,20 @@ class GaussianDecoder(nn.Module):
         B, H, W = depth.shape
         device, dtype = depth.device, depth.dtype
 
-        # Scale intrinsics if downsampled
         fx_s = fx / downsample_factor
         fy_s = fy / downsample_factor
         cx_s = cx / downsample_factor
         cy_s = cy / downsample_factor
 
-        # Pixel grid with half-pixel offset (matching AD-FFgsStudio convention)
-        u = torch.arange(0.5, W + 0.5, device=device, dtype=dtype)  # [W]
-        v = torch.arange(0.5, H + 0.5, device=device, dtype=dtype)  # [H]
-        v_grid, u_grid = torch.meshgrid(v, u, indexing="ij")  # [H, W] each
+        u = torch.arange(0.5, W + 0.5, device=device, dtype=dtype)
+        v = torch.arange(0.5, H + 0.5, device=device, dtype=dtype)
+        v_grid, u_grid = torch.meshgrid(v, u, indexing="ij")
 
-        # Camera-space coordinates: x = (u - cx) * depth / fx
-        x = ((u_grid[None] - cx_s) * depth) / fx_s  # [B, H, W]
-        y = ((v_grid[None] - cy_s) * depth) / fy_s  # [B, H, W]
-        z = depth  # [B, H, W]
+        x = ((u_grid[None] - cx_s) * depth) / fx_s
+        y = ((v_grid[None] - cy_s) * depth) / fy_s
+        z = depth
 
-        xyz = torch.stack([x, y, z], dim=-1)  # [B, H, W, 3]
+        xyz = torch.stack([x, y, z], dim=-1)
         return xyz.reshape(B, H * W, 3)
 
     # ------------------------------------------------------------------
@@ -372,6 +466,7 @@ class GaussianDecoder(nn.Module):
         static_reference_params: dict | None = None,
         velocity_time_factor: float = 1.0,
         motion_gate: torch.Tensor | None = None,
+        shared_state: dict[str, torch.Tensor | int] | None = None,
     ):
         """Decode latent tokens → Gaussian parameters."""
         return self._decode_independent(
@@ -381,6 +476,7 @@ class GaussianDecoder(nn.Module):
             static_reference_params=static_reference_params,
             velocity_time_factor=velocity_time_factor,
             motion_gate=motion_gate,
+            shared_state=shared_state,
         )
 
     def decode_gaussian_prefix_template(
@@ -391,17 +487,9 @@ class GaussianDecoder(nn.Module):
         camera_params=None,
         base_depth: torch.Tensor | None = None,
         step=None,
+        shared_state: dict[str, torch.Tensor | int] | None = None,
     ):
-        """Decode the current/base Gaussian template from prefix Gaussian tokens.
-
-        Used by the future dynamics branch: current Gaussian tokens produce one static
-        template, and future latents only predict delta xyz / velocity on top of it.
-        z: [B, 256, D] or [B, 768, D]; if 768, uses last 256 (t frame) for decode.
-        """
-        if z.shape[1] == 768:
-            z = z[:, -256:, :]
-        elif z.shape[1] != 256:
-            raise ValueError(f"decode_gaussian_prefix_template expects 256 or 768 tokens, got {z.shape[1]}")
+        """Decode the current/base Gaussian template from shared future-token features."""
         return self._decode_independent(
             z,
             gaussian_adapter=gaussian_adapter,
@@ -416,14 +504,12 @@ class GaussianDecoder(nn.Module):
             velocity_time_factor=1.0,
             skip_horizon_embedding=True,
             skip_action_conditioning=True,
+            shared_state=shared_state,
         )
 
-    # ------------------------------------------------------------------
-    # Independent ConvNet decoder (RGB output)
-    # ------------------------------------------------------------------
     def _decode_velocity_from_static(
         self,
-        z: torch.Tensor,
+        shared_state: dict[str, torch.Tensor | int],
         static_reference_params: dict,
         velocity_time_factor: float,
         step: int | None,
@@ -432,15 +518,14 @@ class GaussianDecoder(nn.Module):
         motion_gate: torch.Tensor | None = None,
     ) -> dict:
         """Reuse the base Gaussian template and predict future dynamics via delta xyz only."""
-        B, num_tokens, D = z.shape
-        g = self.future_grid_size
-        if g * g != num_tokens:
-            raise ValueError(
-                f"velocity path expects {self.future_input_num_tokens} future tokens, got N={num_tokens}"
-            )
+        shared_features = shared_state["shared_features"]
+        assert isinstance(shared_features, torch.Tensor)
 
-        motion_feat = z.permute(0, 2, 1).reshape(B, D, g, g)  # [B, D, 32, 32]
-        vel_map = self.velocity_head(motion_feat)  # [B, 3, 128, 128]
+        if self.velocity_head is None:
+            raise ValueError("Velocity head is not initialized")
+
+        B = shared_features.shape[0]
+        vel_map = self.velocity_head(shared_features, horizon_idx=horizon_idx)
 
         xyz0 = static_reference_params["xyz"]
         Npts = xyz0.shape[1]
@@ -462,26 +547,25 @@ class GaussianDecoder(nn.Module):
             if motion_gate.shape[0] != B:
                 raise ValueError(f"motion_gate batch mismatch: expected {B}, got {motion_gate.shape[0]}")
 
-            if motion_gate.shape[1] == num_tokens:
-                motion_gate_up = motion_gate.reshape(B, g, g, -1).permute(0, 3, 1, 2)
-                motion_gate_up = F.interpolate(motion_gate_up, size=(H, W), mode="bilinear", align_corners=False)
-                motion_gate_up = motion_gate_up.permute(0, 2, 3, 1).reshape(B, Npts, -1)
-            elif motion_gate.shape[1] * motion_gate.shape[2] == Npts:
-                motion_gate_up = motion_gate.reshape(B, motion_gate.shape[1], motion_gate.shape[2], -1)
-                motion_gate_up = motion_gate_up.permute(0, 3, 1, 2)
+            if motion_gate.shape[1] * motion_gate.shape[2] == Npts and motion_gate.ndim == 4:
+                motion_gate_up = motion_gate.permute(0, 3, 1, 2)
                 if motion_gate_up.shape[-2:] != (H, W):
                     motion_gate_up = F.interpolate(motion_gate_up, size=(H, W), mode="bilinear", align_corners=False)
                 motion_gate_up = motion_gate_up.permute(0, 2, 3, 1).reshape(B, Npts, -1)
             else:
-                raise ValueError(
-                    f"motion_gate token/spatial size mismatch: got {tuple(motion_gate.shape)}, expected token count {num_tokens} or point count {Npts}"
-                )
+                token_count = self.canonical_grid_size * self.canonical_grid_size
+                if motion_gate.shape[1] != token_count:
+                    raise ValueError(
+                        f"motion_gate token/spatial size mismatch: got {tuple(motion_gate.shape)}, expected token count {token_count} or point count {Npts}"
+                    )
+                motion_gate_up = motion_gate.reshape(B, self.canonical_grid_size, self.canonical_grid_size, -1).permute(0, 3, 1, 2)
+                motion_gate_up = F.interpolate(motion_gate_up, size=(H, W), mode="bilinear", align_corners=False)
+                motion_gate_up = motion_gate_up.permute(0, 2, 3, 1).reshape(B, Npts, -1)
 
             motion_gate_up = torch.clamp(motion_gate_up.to(device=raw_delta.device, dtype=raw_delta.dtype), 0.0, 1.0)
             raw_delta = raw_delta * motion_gate_up
 
-        delta = raw_delta
-        xyz = xyz0 + delta.to(dtype=xyz0.dtype)
+        xyz = xyz0 + raw_delta.to(dtype=xyz0.dtype)
         xyz = torch.clamp(xyz, min=-100.0, max=100.0)
         xyz = torch.where(torch.isnan(xyz) | torch.isinf(xyz), torch.zeros_like(xyz), xyz)
 
@@ -489,10 +573,7 @@ class GaussianDecoder(nn.Module):
         depth_map = z_cam.unsqueeze(1).clamp(min=0.0, max=8.0)
         depth_delta_map = None
         if base_depth is not None:
-            if base_depth.ndim == 4:
-                base_depth_map = base_depth.squeeze(1)
-            else:
-                base_depth_map = base_depth
+            base_depth_map = base_depth.squeeze(1) if base_depth.ndim == 4 else base_depth
             if base_depth_map.shape[-2:] != depth_map.shape[-2:]:
                 base_depth_map = F.interpolate(
                     base_depth_map.unsqueeze(1), size=depth_map.shape[-2:], mode="bilinear", align_corners=False
@@ -509,8 +590,8 @@ class GaussianDecoder(nn.Module):
             logging.info(
                 f"[VelocityDecoder][h={horizon_idx}][t+~{horizon_idx + 1}] delta_xyz: "
                 f"motion_scale={self.velocity_world_model_scale}, "
-                f"time_factor={velocity_time_factor:.4f}, |delta|_mean={delta.abs().mean().item():.6f}, "
-                f"|delta|_max={delta.abs().max().item():.6f}, gate_mean={gate_mean:.6f}, gate_max={gate_max:.6f}, "
+                f"time_factor={velocity_time_factor:.4f}, |delta|_mean={raw_delta.abs().mean().item():.6f}, "
+                f"|delta|_max={raw_delta.abs().max().item():.6f}, gate_mean={gate_mean:.6f}, gate_max={gate_max:.6f}, "
                 f"static_gaussian_scale_mean={static_scale_mean:.6f}, "
                 f"static_gaussian_scale_max={static_scale_max:.6f}"
             )
@@ -528,7 +609,7 @@ class GaussianDecoder(nn.Module):
 
     def decode_dynamic_gaussians_from_static(
         self,
-        z: torch.Tensor,
+        shared_state: dict[str, torch.Tensor | int],
         static_reference_params: dict,
         velocity_time_factor: float,
         step: int | None,
@@ -536,9 +617,9 @@ class GaussianDecoder(nn.Module):
         base_depth: torch.Tensor | None = None,
         motion_gate: torch.Tensor | None = None,
     ) -> dict:
-        """Decode shared motion-query tokens into a constant-velocity dynamic Gaussian update."""
+        """Decode shared motion-query features into a constant-velocity dynamic Gaussian update."""
         return self._decode_velocity_from_static(
-            z,
+            shared_state,
             static_reference_params,
             velocity_time_factor,
             step,
@@ -556,25 +637,18 @@ class GaussianDecoder(nn.Module):
         skip_horizon_embedding: bool = False,
         skip_action_conditioning: bool = False,
         motion_gate: torch.Tensor | None = None,
+        shared_state: dict[str, torch.Tensor | int] | None = None,
     ):
-        """Decode VLM tokens into Gaussian parameters.
-
-        Current/base template decode uses the full ConvNet head.
-        Future decode reuses a provided static template and predicts only delta xyz.
-        """
-        if not skip_horizon_embedding:
-            horizon_idx = max(0, min(int(horizon_idx), self.future_prediction_horizon - 1))
-            horizon_ids = torch.full((z.shape[0],), horizon_idx, device=z.device, dtype=torch.long)
-            z = z + self.horizon_embed(horizon_ids).unsqueeze(1).to(dtype=z.dtype)
-
-        if not skip_action_conditioning and self.use_action_conditioning and actions is not None:
-            # Transform actions to camera frame
-            action_cam = self._transform_action_to_camera(actions, camera_params)
-            # Extract only first 7 meaningful dimensions for projection
-            action_cam_7d = action_cam[:, :7]  # [B, 7]
-            # Embed and add to tokens
-            action_embed = self.action_proj(action_cam_7d)  # [B, token_dim]
-            z = z + action_embed.unsqueeze(1)  # [B, 256, D] + [B, 1, D] → [B, 256, D]
+        """Decode VLM tokens into Gaussian parameters using the shared backbone state."""
+        if shared_state is None:
+            shared_state = self._prepare_shared_token_features(
+                z,
+                horizon_idx=horizon_idx,
+                actions=actions,
+                camera_params=camera_params,
+                skip_horizon_embedding=skip_horizon_embedding,
+                skip_action_conditioning=skip_action_conditioning,
+            )
 
         if (
             self.use_velocity_future_gaussians
@@ -582,7 +656,7 @@ class GaussianDecoder(nn.Module):
             and self.velocity_head is not None
         ):
             return self.decode_dynamic_gaussians_from_static(
-                z,
+                shared_state,
                 static_reference_params,
                 velocity_time_factor,
                 step,
@@ -591,159 +665,29 @@ class GaussianDecoder(nn.Module):
                 motion_gate=motion_gate,
             )
 
-        # For future-horizon decoding, prefer the matched future observation so image
-        # fusion is anchored to the target horizon instead of the current frame.
-        vggt_obs = future_observation if future_observation is not None else current_observation
-        if vggt_obs is None or gaussian_adapter is None:
-            raise ValueError("current_observation and gaussian_adapter are required")
-
-        # Prepare VGGT inputs for image feature fusion
-        vggt_inputs = gaussian_adapter.prepare_inputs(
-            vggt_obs, z.device, z.shape[0], is_training=False
+        gaussian_params = self._decode_static_from_shared(
+            shared_state,
+            gaussian_adapter=gaussian_adapter,
+            camera_params=camera_params,
+            current_observation=current_observation,
+            future_observation=future_observation,
+            base_depth=base_depth,
         )
-        if vggt_inputs is None:
-            raise ValueError("Failed to prepare VGGT inputs")
-
-        # Extract current frame image for residual feature fusion
-        B_vggt, S_vggt = vggt_inputs.shape[:2]
-        frame_idx = S_vggt - 1
-        current_frame_img = vggt_inputs[:, frame_idx]  # [B, 3, H_vggt, W_vggt]
-
-        # Decode VLM tokens → Gaussian params + depth (with current frame residual)
-        decoder_output = self.gaussian_head(z, images=current_frame_img)
-        raw = decoder_output['gaussian_params']  # [B, 19, 256, 256]
-        rot_raw, scale_raw, opa_raw, sh_raw, xy_delta_raw = raw.split([4, 3, 1, 9, 2], dim=1)
-
-        # Get depth: use predicted incremental depth if available, otherwise fallback to VGGT
-        depth_delta_map = None
-        if self.predict_depth and 'depth' in decoder_output:
-            depth_raw = decoder_output['depth']  # [B, 1, 256, 256]
-
-            if base_depth is not None and self.use_incremental_depth:
-                if base_depth.ndim == 4:
-                    base_depth_map = base_depth.squeeze(1)
-                else:
-                    base_depth_map = base_depth
-                if base_depth_map.shape[-2:] != depth_raw.shape[-2:]:
-                    base_depth_map = F.interpolate(
-                        base_depth_map.unsqueeze(1), size=depth_raw.shape[-2:], mode="bilinear", align_corners=False
-                    ).squeeze(1)
-                depth_delta_map = torch.tanh(depth_raw.squeeze(1))
-                final_depth = torch.clamp(base_depth_map + depth_delta_map, min=0.0, max=8.0)  # [B, 256, 256]
-                H_dec, W_dec = final_depth.shape[1], final_depth.shape[2]
-            else:
-                # Absolute-depth fallback path
-                min_depth = 0.0
-                max_depth = 8.0
-                final_depth = min_depth + (max_depth - min_depth) * torch.sigmoid(depth_raw.squeeze(1))  # [B, 256, 256]
-                H_dec, W_dec = final_depth.shape[1], final_depth.shape[2]
-        else:
-            # Fallback: use VGGT depth from current frame (old behavior)
-            with torch.no_grad():
-                aggregated_tokens_list, patch_start_idx = gaussian_adapter.encoder.aggregator(
-                    vggt_inputs.to(torch.bfloat16)
-                )
-            for i in range(len(aggregated_tokens_list)):
-                if aggregated_tokens_list[i].ndim == 3:
-                    _bs, _p, _c = aggregated_tokens_list[i].shape
-                    aggregated_tokens_list[i] = aggregated_tokens_list[i].view(B_vggt, S_vggt, _p, _c)
-
-            depth_maps, depth_conf = gaussian_adapter.encoder.depth_head(
-                aggregated_tokens_list, images=vggt_inputs, patch_start_idx=patch_start_idx
-            )
-            depth_maps = torch.sigmoid(torch.log(depth_maps + 1e-6))
-            min_depth = gaussian_adapter.encoder.min_depth
-            max_depth = gaussian_adapter.encoder.max_depth
-            depth_maps = min_depth + (max_depth - min_depth) * depth_maps
-            final_depth = depth_maps[:, frame_idx, :, :, 0]  # [B, H_vggt, W_vggt]
-            H_dec, W_dec = raw.shape[2], raw.shape[3]
-            final_depth = F.interpolate(
-                final_depth.unsqueeze(1), size=(H_dec, W_dec), mode="bilinear", align_corners=False
-            ).squeeze(1)  # [B, 256, 256]
-
-        # 6. Activations
-        B = z.shape[0]
-
-        # Rotation: normalize quaternions
-        rot_maps = rot_raw.permute(0, 2, 3, 1)  # [B, H, W, 4]
-        rot_maps = rot_maps / (rot_maps.norm(dim=-1, keepdim=True) + 1e-8)
-
-        # Scale: softplus for positive values (following AD-FFgsStudio)
-        # Changed from 0.001 to 0.01 to improve rendering quality (larger Gaussians)
-        scale_maps = F.softplus(scale_raw.permute(0, 2, 3, 1), beta=1) * 0.01  # [B, H, W, 3]
-
-        # Opacity: sigmoid to [0, 1]
-        opacity_maps = torch.sigmoid(opa_raw.permute(0, 2, 3, 1))  # [B, H, W, 1]
-
-        # Spherical Harmonics: 9 coefficients (DC + 1st order)
-        # Reshape to [B, H, W, 9] and apply SH mask (following AD-FFgsStudio)
-        sh_maps = sh_raw.permute(0, 2, 3, 1)  # [B, H, W, 9]
-        sh_mask = self.gaussian_head.sh_mask.view(1, 1, 1, 9)  # [1, 1, 1, 9]
-        sh_maps = sh_maps * sh_mask  # Attenuate higher-order coefficients
-
-        # Reshape to [B, H, W, 3, 3] for rendering (3 colors × 3 SH basis per color)
-        # Note: For 1st order SH, we have DC(3) + 1st(6) = 9 total
-        # Renderer expects [B, H, W, K, 3] where K = (sh_degree+1)^2 / 3
-        # For degree 1: K = 4 (DC + 3 for 1st order), but we have 9 coefficients
-        # We'll keep it as [B, H, W, 9] and reshape in rendering if needed
-
-        # 7. Depth → xyz
-        # LIBERO original camera: 256×256, fx=fy=221.7025, cx=cy=128.0
-        # No scaling needed since decoder outputs 256×256
-        if camera_params is not None and "fx" in camera_params:
-            xyz_base = self.depth2pc(
-                final_depth,
-                fx=camera_params["fx"], fy=camera_params["fy"],
-                cx=camera_params["cx"], cy=camera_params["cy"],
-                downsample_factor=1,
-            )
-        else:
-            # LIBERO intrinsics for 256×256 resolution
-            xyz_base = self.depth2pc(
-                final_depth,
-                fx=221.7025, fy=221.7025,
-                cx=128.0, cy=128.0,
-                downsample_factor=1,
-            )
-
-        # Add explicit spatial delta prediction to Break 2D ray lock
-        xy_delta_maps = xy_delta_raw.permute(0, 2, 3, 1)  # [B, H, W, 2]
-        N = H_dec * W_dec  # 256 * 256 = 65536
-        xy_delta_flat = xy_delta_maps.reshape(B, N, 2)
-        # Scale lateral movement explicitly
-        xy_delta_flat = torch.tanh(xy_delta_flat) * 0.5  # constrain to max 0.5m movement
-
-        # Keep Z unchanged here because Z (depth) movement is completely handled and supervised by depth_refine.
-        z_zeros = torch.zeros(B, N, 1, device=xyz_base.device, dtype=xyz_base.dtype)
-        xyz_delta_flat = torch.cat([xy_delta_flat, z_zeros], dim=-1)
-        xyz = xyz_base + xyz_delta_flat
-
-        # 8. Flatten and sanitize
-        rot_flat = rot_maps.reshape(B, N, 4)
-        scale_flat = scale_maps.reshape(B, N, 3)
-        opacity_flat = opacity_maps.reshape(B, N, 1)
-        sh_flat = sh_maps.reshape(B, N, 9)  # [B, N, 9] — DC + 1st order SH
-
-        scale_flat = torch.clamp(scale_flat, min=1e-7, max=10.0)
-        xyz = torch.clamp(xyz, min=-100.0, max=100.0)
-        xyz = torch.where(torch.isnan(xyz) | torch.isinf(xyz), torch.zeros_like(xyz), xyz)
 
         if step is not None and step % 100 == 0:
             import logging
-            logging.info(f"[IndependentDecoder] Step {step}: "
-                         f"depth=[{final_depth.min():.3f}, {final_depth.max():.3f}], "
-                         f"scales=[{scale_flat.min():.3f}, {scale_flat.max():.3f}], "
-                         f"sh=[{sh_flat.min():.3f}, {sh_flat.max():.3f}], N={N}")
 
-        return {
-            "xyz": xyz,
-            "scales": scale_flat,
-            "opacity": opacity_flat,
-            "sh": sh_flat,  # [B, N, 9] for 1st order SH
-            "rotations": rot_flat,
-            "depth_map": final_depth.unsqueeze(1),  # [B, 1, H, W] for edge-aware smoothness
-            "depth_delta_map": None if depth_delta_map is None else depth_delta_map.unsqueeze(1),
-        }
+            depth_map = gaussian_params["depth_map"]
+            scale_flat = gaussian_params["scales"]
+            sh_flat = gaussian_params["sh"]
+            logging.info(
+                f"[IndependentDecoder] Step {step}: "
+                f"depth=[{depth_map.min():.3f}, {depth_map.max():.3f}], "
+                f"scales=[{scale_flat.min():.3f}, {scale_flat.max():.3f}], "
+                f"sh=[{sh_flat.min():.3f}, {sh_flat.max():.3f}], N={scale_flat.shape[1]}"
+            )
+
+        return gaussian_params
 
     def _transform_action_to_camera(self, actions, camera_params):
         """
