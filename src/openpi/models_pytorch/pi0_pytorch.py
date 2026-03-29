@@ -257,16 +257,19 @@ class PI0Pytorch(nn.Module):
         unfreeze_vggt_encoder = getattr(config, "unfreeze_vggt_encoder", False)
         unfreeze_vggt_decoder_only = getattr(config, "unfreeze_vggt_decoder_only", True)  # Default: train decoder only
         use_lora = getattr(config, "use_lora", False)  # Default: keep VGGT fully frozen
+        # Match training frame count at inference so MTA layers stay [B,T,...] with T==temporal_context_count.
+        _infer_frames = 1 if use_single_frame_mode else self.temporal_context_count
         self.gaussian_adapter = GaussianAdapter(
             use_gaussian,
             paligemma_config.width,
             use_lgpd=False,
             num_frames=self.temporal_context_count,
+            inference_num_frames=_infer_frames,
             use_single_frame_mode=use_single_frame_mode,
             temporal_context_offsets=tuple(self.temporal_context_offsets),
             unfreeze_encoder=unfreeze_vggt_encoder,
             unfreeze_decoder_only=unfreeze_vggt_decoder_only,
-            use_lora=use_lora
+            use_lora=use_lora,
         )
         
         # Current frame reconstruction loss weight
@@ -1661,8 +1664,9 @@ class PI0Pytorch(nn.Module):
         if lang_emb.ndim == 4:  # [B, T, SeqLen, D] - has temporal dimension
             B, T, S, D = lang_emb.shape
             # Flatten temporal and sequence dimensions: [B, T, SeqLen, D] -> [B, T*SeqLen, D]
-            lang_emb = lang_emb.view(B, T * S, D)  # [B, T*SeqLen, D]
-            lang_masks = lang_masks.view(B, T * S)  # [B, T*SeqLen]
+            # Use reshape (not view): lang_masks may be non-contiguous after expand/slice.
+            lang_emb = lang_emb.reshape(B, T * S, D)  # [B, T*SeqLen, D]
+            lang_masks = lang_masks.reshape(B, T * S)  # [B, T*SeqLen]
             # For text embedding pooling, use original shape
             lang_emb_for_pooling = lang_emb_original
             lang_masks_for_pooling = lang_masks_original
@@ -1680,14 +1684,14 @@ class PI0Pytorch(nn.Module):
             if lang_emb_for_pooling.ndim == 4:  # [B, T, SeqLen, D] - has temporal dimension
                 # Flatten temporal and sequence dimensions for pooling
                 B, T, S, D = lang_emb_for_pooling.shape
-                lang_emb_flat = lang_emb_for_pooling.view(B * T, S, D)  # [B*T, S, D]
-                lang_masks_flat = lang_masks_for_pooling.view(B * T, S)  # [B*T, S]
+                lang_emb_flat = lang_emb_for_pooling.reshape(B * T, S, D)  # [B*T, S, D]
+                lang_masks_flat = lang_masks_for_pooling.reshape(B * T, S)  # [B*T, S]
                 mask_float = lang_masks_flat.unsqueeze(-1).float()  # [B*T, S, 1]
                 sum_emb = (lang_emb_flat * mask_float).sum(dim=1)  # [B*T, D]
                 sum_mask = mask_float.sum(dim=1).clamp(min=1e-6)  # [B*T, 1]
                 text_embedding_flat = sum_emb / sum_mask  # [B*T, D]
                 # Reshape back to [B, T, D] and take mean over time dimension
-                text_embedding = text_embedding_flat.view(B, T, D).mean(dim=1)  # [B, D]
+                text_embedding = text_embedding_flat.reshape(B, T, D).mean(dim=1)  # [B, D]
             else:  # [B, SeqLen, D] - no temporal dimension
                 # Masked Mean Pooling
                 mask_float = lang_masks_for_pooling.unsqueeze(-1).float()  # [B, S, 1]
@@ -1754,7 +1758,7 @@ class PI0Pytorch(nn.Module):
             if has_temporal:
                 B, T = img.shape[0], img.shape[1]
                 # Flatten temporal dimension: [B, T, H, W, C] -> [B*T, H, W, C]
-                img_flat = img.view(B * T, *img.shape[2:])  # [B*T, H, W, C]
+                img_flat = img.reshape(B * T, *img.shape[2:])  # [B*T, H, W, C]
                 # Encode all frames at once
                 def image_embed_func(img_flat):
                     return self.paligemma_with_expert.embed_image(img_flat)
@@ -1763,9 +1767,9 @@ class PI0Pytorch(nn.Module):
                 # img_emb_flat: [B*T, N, D] where N is number of image tokens
                 num_img_embs = img_emb_flat.shape[1]
                 # Reshape back: [B*T, N, D] -> [B, T, N, D]
-                img_emb = img_emb_flat.view(B, T, num_img_embs, img_emb_flat.shape[-1])
+                img_emb = img_emb_flat.reshape(B, T, num_img_embs, img_emb_flat.shape[-1])
                 # Flatten time and token dimensions: [B, T, N, D] -> [B, T*N, D]
-                img_emb = img_emb.view(B, T * num_img_embs, img_emb_flat.shape[-1])
+                img_emb = img_emb.reshape(B, T * num_img_embs, img_emb_flat.shape[-1])
 
                 # Handle mask: [B, T] -> expand to [B, T*N]
                 img_mask_expanded = img_mask.unsqueeze(-1).expand(-1, -1, num_img_embs)  # [B, T, N]

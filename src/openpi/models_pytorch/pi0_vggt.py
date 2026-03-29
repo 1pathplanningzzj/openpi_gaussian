@@ -406,7 +406,7 @@ class GaussianAdapter(nn.Module):
     """
     Adapter for integrating VGGT (Transformer-based 3DGS) features into OpenPI models.
     """
-    def __init__(self, use_gaussian: bool, action_expert_width: int, use_lgpd: bool = True,
+    def __init__(self, use_gaussian: bool, action_expert_width: int, use_lgpd: bool = False,
                  num_frames: int = 3, inference_num_frames: int = 1,
                  use_single_frame_mode: bool = False,
                  temporal_context_offsets: tuple[int, ...] | None = None,
@@ -725,9 +725,22 @@ class GaussianAdapter(nn.Module):
                 img = img[:, :target_num_frames]
             else:
                 if not is_training:
-                    logging.debug(f"Inference: Using {T} available frames (requested {target_num_frames})")
-                    img = img
-                    target_num_frames = T
+                    if T > 0 and target_num_frames > T:
+                        logging.warning(
+                            f"Inference: padding VGGT agent view from T={T} to T={target_num_frames} "
+                            f"by repeating frames (MTA expects same temporal length as training)."
+                        )
+                        pad_n = target_num_frames - T
+                        repeat_idx = max(0, T - 1)
+                        img = torch.cat(
+                            [img, img[:, repeat_idx : repeat_idx + 1].repeat(1, pad_n, 1, 1, 1)],
+                            dim=1,
+                        )
+                    else:
+                        logging.debug(
+                            f"Inference: Using {T} available frames (requested {target_num_frames})"
+                        )
+                        target_num_frames = T
                 else:
                     if T == 0:
                         logging.error("No temporal frames available for GaussianAdapter.prepare_inputs")
@@ -746,10 +759,15 @@ class GaussianAdapter(nn.Module):
             
             # Single frame handling
             if not is_training:
-                # Inference mode: use single frame directly (default: 1 frame)
-                logging.debug(f"Inference: Using single frame (requested {target_num_frames} frames)")
                 img = img.unsqueeze(1)  # [B, 1, C, H, W]
-                target_num_frames = 1  # Update target to match available
+                if target_num_frames > 1:
+                    logging.warning(
+                        f"Inference: agent view is single-frame but model expects T={target_num_frames}; "
+                        f"repeating the current frame for VGGT/MTA (prefer feeding a true multi-frame stack)."
+                    )
+                    img = img.repeat(1, target_num_frames, 1, 1, 1)
+                else:
+                    logging.debug("Inference: Using single frame for VGGT")
             else:
                 # Training mode
                 if target_num_frames == 1:
@@ -1125,15 +1143,7 @@ class GaussianAdapter(nn.Module):
         # Visualize VGGT frames and LGPD gate together
         # Only visualize if LGPD is enabled and gate is available, or if we just want VGGT visualization
         # Only visualize on rank 0 to avoid NCCL timeout in distributed training
-        if visualize_gate:
-            try:
-                import torch.distributed as dist
-                is_main_process = not dist.is_initialized() or dist.get_rank() == 0
-                if is_main_process:
-                    # If LGPD is disabled, lgpd_gate will be None, but visualization function can handle it
-                    visualize_vggt_and_lgpd(gaussian_inputs, gaussian_params_dict, lgpd_gate, step)
-            except Exception as e:
-                logging.warning(f"Failed to visualize VGGT and LGPD at step {step}: {e}")
+        # LGPD / VGGT visualization disabled to simplify training and avoid potential DDP timeouts.
         
         # Prepare return values
         if return_gaussian_params and return_raw_tokens and return_mta_features:

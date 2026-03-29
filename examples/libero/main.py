@@ -55,9 +55,35 @@ class Args:
     #################################################################################################################
     video_out_path: str = "data_329/gaussian_vla_exp329_15000_libero_10_test_1/videos"  # Path to save videos
     # Gaussian_vla_exp315_12000_libero_10 这个实际上是goal
-    save_videos: bool = False  # Whether to save rollout videos
+    save_videos: bool = True  # Whether to save rollout videos
     seed: int = 10  # Random Seed (for reproducibility)
     debug_log_path: str | None = None  # Path to save debug logs (None = disabled)
+    # Match training `temporal_context_offsets=(-10, -5, 0)`: steps before current at control (env) rate (~10Hz).
+    # History shorter than max offset pads with the current frame (same as server-side repeat, but real frames when available).
+    agent_temporal_step_offsets: tuple[int, int, int] = (10, 5, 0)
+
+
+def _stack_agent_temporal_frames(
+    past_frames: collections.deque,
+    current_frame: np.ndarray,
+    step_offsets: tuple[int, ...],
+) -> np.ndarray:
+    """Build (T, H, W, C) uint8 stack: one slot per offset in order (oldest context first).
+
+    `step_offsets` are non-negative integers = control steps before the current frame
+    (10, 5, 0 corresponds to training t-10, t-5, t). If a requested index is before the
+    start of `past_frames + [current]`, use the newest available frame (typically current).
+    """
+    seq = list(past_frames) + [current_frame]
+    l = len(seq)
+    out: list[np.ndarray] = []
+    for off in step_offsets:
+        i = l - 1 - off
+        if i < 0:
+            out.append(seq[-1])
+        else:
+            out.append(seq[i])
+    return np.stack(out, axis=0)
 
 
 def _configure_logging(video_out_path: str) -> None:
@@ -150,6 +176,8 @@ def eval_libero(args: Args) -> None:
             # Reset environment
             env.reset()
             action_plan = collections.deque()
+            hist_len = max(args.agent_temporal_step_offsets)
+            agent_img_history: collections.deque = collections.deque(maxlen=hist_len)
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
@@ -161,6 +189,10 @@ def eval_libero(args: Args) -> None:
             done = False
 
             logging.info(f"Starting episode {task_episodes + 1}...")
+            logging.info(
+                f"Simulator warmup: {args.num_steps_wait} env steps for objects to settle "
+                "(dummy actions only; no policy calls yet)."
+            )
             while t < max_steps + args.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -169,6 +201,9 @@ def eval_libero(args: Args) -> None:
                         obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                         t += 1
                         continue
+
+                    if t == args.num_steps_wait:
+                        logging.info(f"Warmup finished at env timestep {t}. Starting policy-controlled rollout.")
 
                     # Get preprocessed image
                     # IMPORTANT: rotate 180 degrees to match train preprocessing
@@ -181,6 +216,10 @@ def eval_libero(args: Args) -> None:
                         image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
                     )
 
+                    agent_img_stack = _stack_agent_temporal_frames(
+                        agent_img_history, img, args.agent_temporal_step_offsets
+                    )
+
                     # Save preprocessed image for replay video
                     if args.save_videos:
                         replay_images.append(img)
@@ -189,7 +228,7 @@ def eval_libero(args: Args) -> None:
                         # Finished executing previous action chunk -- compute new chunk
                         # Prepare observations dict
                         element = {
-                            "observation/image": img,
+                            "observation/image": agent_img_stack,
                             "observation/wrist_image": wrist_img,
                             "observation/state": np.concatenate(
                                 (
@@ -202,8 +241,17 @@ def eval_libero(args: Args) -> None:
                         }
 
                         # Query model to get action
+                        logging.info(
+                            f"Querying policy server for a new action chunk (env timestep {t}). "
+                            "First call can take a long time; if this line stays for many minutes, "
+                            "check the policy server process and GPU in another terminal."
+                        )
                         infer_result = client.infer(element)
                         action_chunk = infer_result["actions"]
+                        logging.info(
+                            f"Received action chunk of length {len(action_chunk)} "
+                            f"(using {args.replan_steps} steps per replan)."
+                        )
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
@@ -215,8 +263,10 @@ def eval_libero(args: Args) -> None:
                                 "timestep": t,
                                 "state": element["observation/state"].copy(),
                                 "image": img.copy(),
+                                "agent_image_stack": agent_img_stack.copy(),
                                 "wrist_image": wrist_img.copy(),
                                 "image_hash": hashlib.md5(img.tobytes()).hexdigest(),
+                                "agent_image_stack_hash": hashlib.md5(agent_img_stack.tobytes()).hexdigest(),
                                 "wrist_image_hash": hashlib.md5(wrist_img.tobytes()).hexdigest(),
                                 "prompt": element["prompt"],
                                 "action_chunk": [a.tolist() if hasattr(a, 'tolist') else a for a in action_chunk],
@@ -226,6 +276,7 @@ def eval_libero(args: Args) -> None:
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
+                    agent_img_history.append(img)
                     if done:
                         task_successes += 1
                         total_successes += 1

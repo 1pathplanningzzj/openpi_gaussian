@@ -82,6 +82,10 @@ class LiberoInputs(transforms.DataTransformFn):
         base_image = _parse_image(data["observation/image"])
         wrist_image = _parse_image(data["observation/wrist_image"])
 
+        # Match temporal agent view (T, H, W, C) with a single wrist frame at current time.
+        if base_image.ndim == 4 and wrist_image.ndim == 3:
+            wrist_image = np.stack([wrist_image] * base_image.shape[0], axis=0)
+
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
             "state": data["observation/state"],
