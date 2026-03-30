@@ -625,12 +625,13 @@ class GaussianAdapter(nn.Module):
                     # Single-frame mode: this is expected, no warning needed
                     img = img.unsqueeze(1)  # [B, 1, C, H, W]
                 else:
-                    # Multi-frame mode but got single frame: this is unexpected, warn user
-                    logging.warning(
+                    # Multi-frame mode but got single frame: this can happen near episode boundaries
+                    # (e.g., not enough history frames). Repeat the frame without spamming warnings.
+                    logging.debug(
                         f"Single frame input detected during training. "
                         f"Image shape: {img.shape}, Expected 5D [B, T, H, W, C] with T>={target_num_frames}. "
                         f"Repeating frame {target_num_frames} times for VGGT. "
-                        f"Check data_loader delta_timestamps configuration."
+                        f"Check data_loader delta_timestamps configuration if this is frequent."
                     )
                     img = img.unsqueeze(1).repeat(1, target_num_frames, 1, 1, 1)  # [B, target_num_frames, C, H, W]
         else:

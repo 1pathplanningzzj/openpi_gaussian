@@ -234,6 +234,7 @@ class GaussianDecoder(nn.Module):
         future_prediction_horizon: int = 1,
         use_velocity_future_gaussians: bool = False,
         velocity_world_model_scale: float = 2.0,
+        use_action_conditioning: bool = False,
     ):
         super().__init__()
         self.token_dim = token_dim
@@ -245,6 +246,7 @@ class GaussianDecoder(nn.Module):
         self.future_prediction_horizon = max(1, int(future_prediction_horizon))
         self.use_velocity_future_gaussians = use_velocity_future_gaussians
         self.velocity_world_model_scale = float(velocity_world_model_scale)
+        self.use_action_conditioning = use_action_conditioning
 
         # Horizon embedding helps the decoder distinguish t+1 vs t+H.
         self.horizon_embed = nn.Embedding(self.future_prediction_horizon, token_dim)
@@ -717,24 +719,3 @@ class GaussianDecoder(nn.Module):
             )
 
         return gaussian_params
-
-
-    @staticmethod
-    def _quat_to_rotation_matrix(quat):
-        """
-        Convert quaternion to rotation matrix.
-
-        Args:
-            quat: [4] - (w, x, y, z)
-        Returns:
-            R: [3, 3] rotation matrix
-        """
-        w, x, y, z = quat[0], quat[1], quat[2], quat[3]
-
-        R = torch.stack([
-            torch.stack([1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z, 2*x*z + 2*w*y]),
-            torch.stack([2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x]),
-            torch.stack([2*x*z - 2*w*y, 2*y*z + 2*w*x, 1 - 2*x*x - 2*y*y]),
-        ])
-
-        return R

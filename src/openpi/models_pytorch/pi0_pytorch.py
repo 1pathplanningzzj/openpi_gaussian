@@ -244,7 +244,7 @@ class PI0Pytorch(nn.Module):
         # Visualization save directory for rendering comparisons
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0328_lpips_future_5_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0330_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -517,26 +517,23 @@ class PI0Pytorch(nn.Module):
     ):
         """Apply staged trainability for action/world-model branches."""
         if stage == 1:
+            # Stage 1: only train static head (geometry + depth), freeze dynamics and action.
             self.freeze_action_expert()
             self.unfreeze_shared_backbone()
             self.unfreeze_static_head()
-            if freeze_velocity_head:
-                self.freeze_velocity_head()
-            else:
-                self.unfreeze_velocity_head()
+            self.freeze_velocity_head()
         elif stage == 2:
+            # Stage 2: only train dynamics heads (velocity + residual), freeze static and action.
             self.freeze_action_expert()
             self.unfreeze_shared_backbone()
-            if freeze_static_head:
-                self.freeze_static_head()
-            else:
-                self.unfreeze_static_head()
+            self.freeze_static_head()
             self.unfreeze_velocity_head()
         elif stage == 3:
+            # Stage 3: freeze world model, only train action expert.
+            self.freeze_shared_backbone()
+            self.freeze_static_head()
+            self.freeze_velocity_head()
             self.unfreeze_action_expert()
-            self.unfreeze_shared_backbone()
-            self.unfreeze_static_head()
-            self.unfreeze_velocity_head()
         else:
             raise ValueError(f"Unsupported stage: {stage}")
 
@@ -919,19 +916,37 @@ class PI0Pytorch(nn.Module):
     def _get_future_horizon_loss_weights(
         self, step: int | None, horizon: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
-        """Anneal future-rollout horizon weights from near-heavy to uniform."""
+        """Anneal future-rollout horizon weights from near-heavy to uniform.
+
+        Stage 1 (step < stage1_steps): only supervise t+1 (first horizon),
+        later horizons get zero weight. From Stage 2 onward, use curriculum.
+        """
         if horizon <= 0:
             return torch.zeros(0, device=device, dtype=dtype)
 
+        # If there's only one horizon, always use weight 1.0
+        if horizon == 1:
+            return torch.ones(1, device=device, dtype=dtype)
+
+        # Optional stage-1 gating: only supervise t+1 before stage1_steps
+        stage1_steps = getattr(self.config, "stage1_steps", 0)
+        if step is not None and stage1_steps > 0 and step < stage1_steps:
+            weights = torch.zeros(horizon, device=device, dtype=torch.float32)
+            weights[0] = 1.0  # t+1
+            return weights.to(dtype=dtype)
+
+        # Default curriculum over horizons
         uniform = torch.ones(horizon, device=device, dtype=torch.float32)
-        if step is None or horizon == 1 or self.future_horizon_curriculum_steps <= 0:
+        if step is None or self.future_horizon_curriculum_steps <= 0:
             return uniform.to(dtype=dtype)
 
         tail_weight = min(max(self.future_horizon_early_min_weight, 1e-3), 1.0)
         early = torch.linspace(1.0, tail_weight, horizon, device=device, dtype=torch.float32)
         early = early / early.mean().clamp_min(1e-6)
 
-        progress = min(max(step, 0), self.future_horizon_curriculum_steps) / float(self.future_horizon_curriculum_steps)
+        progress = min(max(step or 0, 0), self.future_horizon_curriculum_steps) / float(
+            self.future_horizon_curriculum_steps
+        )
         weights = (1.0 - progress) * early + progress * uniform
         return weights.to(dtype=dtype)
 
@@ -1610,8 +1625,8 @@ class PI0Pytorch(nn.Module):
                 visualize=visualize,
                 horizon_idx=horizon_idx,
                 return_gaussian_params=return_gaussian_params,
-                enable_depth_supervision=(horizon_idx == 0),
-                enable_render_supervision=(horizon_idx == 0),
+                enable_depth_supervision=True,
+                enable_render_supervision=True,
             )
         except Exception as error:
             import traceback
@@ -2124,7 +2139,7 @@ class PI0Pytorch(nn.Module):
         """Extract one horizon of optional flow supervision."""
         flow_3d = getattr(observation, "flow_3d", None)
         flow_valid_mask = getattr(observation, "flow_valid_mask", None)
-
+        
         def _slice_flow(value):
             if value is None:
                 return None

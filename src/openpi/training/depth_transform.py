@@ -1,8 +1,11 @@
 """
 Transform to load depth data from parquet files with depth annotations.
 """
+import io
 from pathlib import Path
 import numpy as np
+import pandas as pd
+from PIL import Image
 import torch
 
 
@@ -105,10 +108,17 @@ class LoadDepthTransform:
 class LoadFlowTransform:
     """Load precomputed pseudo scene flow sidecars for LIBERO episodes."""
 
-    def __init__(self, flow_root: str | None, future_horizon: int = 1):
+    def __init__(
+        self,
+        flow_root: str | None,
+        future_horizon: int = 1,
+        rgb_diff_threshold: float | None = None,
+    ):
         self.flow_root = Path(flow_root) if flow_root else None
         self.future_horizon = max(1, int(future_horizon))
+        self.rgb_diff_threshold = None if rgb_diff_threshold is None else float(rgb_diff_threshold)
         self._episode_cache: dict[Path, dict[str, np.ndarray]] = {}
+        self._image_cache: dict[Path, list[np.ndarray]] = {}
 
     def _coerce_scalar_int(self, value) -> int:
         if isinstance(value, torch.Tensor):
@@ -142,12 +152,30 @@ class LoadFlowTransform:
                 "flow_2d": data["flow_2d"].astype(np.float32, copy=False),
                 "flow_3d": data["flow_3d"].astype(np.float32, copy=False),
                 "valid_mask": data["valid_mask"].astype(np.bool_, copy=False),
+                "source_parquet": str(data["source_parquet"].item()),
             }
 
         self._episode_cache[sidecar_path] = cached
         if len(self._episode_cache) > 8:
             oldest_key = next(iter(self._episode_cache))
             self._episode_cache.pop(oldest_key, None)
+        return cached
+
+    def _load_episode_images(self, parquet_path: str) -> list[np.ndarray]:
+        parquet = Path(parquet_path)
+        cached = self._image_cache.get(parquet)
+        if cached is not None:
+            return cached
+
+        df = pd.read_parquet(parquet, columns=["image"])
+        cached = [
+            np.array(Image.open(io.BytesIO(row["image"]["bytes"])).convert("RGB"), dtype=np.float32) / 255.0
+            for _, row in df.iterrows()
+        ]
+        self._image_cache[parquet] = cached
+        if len(self._image_cache) > 4:
+            oldest_key = next(iter(self._image_cache))
+            self._image_cache.pop(oldest_key, None)
         return cached
 
     def _bilinear_sample_field(self, field: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
@@ -208,6 +236,29 @@ class LoadFlowTransform:
 
         return flow_targets, mask_targets
 
+    def _apply_rgb_diff_mask(
+        self,
+        flow_targets: np.ndarray,
+        mask_targets: np.ndarray,
+        *,
+        source_parquet: str,
+        frame_index: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self.rgb_diff_threshold is None:
+            return flow_targets, mask_targets
+
+        images = self._load_episode_images(source_parquet)
+        if frame_index < 0 or frame_index + 1 >= len(images):
+            return flow_targets, mask_targets
+
+        img_t = images[frame_index]
+        img_tp1 = images[frame_index + 1]
+        rgb_diff = np.abs(img_tp1 - img_t).mean(axis=-1)
+        rgb_keep = rgb_diff >= self.rgb_diff_threshold
+        keep_mask = mask_targets & rgb_keep[None, ...]
+        flow_targets = np.where(keep_mask[..., None], flow_targets, 0.0).astype(np.float32, copy=False)
+        return flow_targets, keep_mask
+
     def __call__(self, sample: dict) -> dict:
         if self.flow_root is None:
             return sample
@@ -229,6 +280,12 @@ class LoadFlowTransform:
             return sample
 
         flow_targets, mask_targets = self._compose_anchor_flow_targets(flow_2d, flow_3d, valid_mask, frame_index)
+        flow_targets, mask_targets = self._apply_rgb_diff_mask(
+            flow_targets,
+            mask_targets,
+            source_parquet=episode_data["source_parquet"],
+            frame_index=frame_index,
+        )
 
         sample["observation/flow_3d"] = flow_targets
         sample["observation/flow_valid_mask"] = mask_targets
