@@ -265,139 +265,8 @@ except ImportError:
     VGGT3DGSModel = None
     logging.warning("VGGT3DGSModel not available. Gaussian features will be disabled.")
 
-try:
-    from openpi.models_pytorch.lgpd_module import LanguageGatedPhysicalDistillation
-except ImportError:
-    LanguageGatedPhysicalDistillation = None
-    logging.warning("LanguageGatedPhysicalDistillation not available. LGPD will be disabled.")
 
 
-def visualize_vggt_and_lgpd(
-    gaussian_inputs: torch.Tensor,
-    gaussian_params: Optional[Dict[str, torch.Tensor]],
-    lgpd_gate: Optional[torch.Tensor],
-    step: int,
-    save_dir: str = "./visualizations/vggt_lgpd"
-):
-    """
-    Visualize VGGT frames and LGPD gate together.
-    
-    Args:
-        gaussian_inputs: [B, S, 3, H, W] - Input frames to VGGT
-        gaussian_params: Dict with depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps
-        lgpd_gate: [B, N, 1] - LGPD gate values (optional)
-        step: Current training step
-        save_dir: Directory to save visualizations
-    """
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Take first batch item
-    if gaussian_inputs.ndim == 5:
-        frames = gaussian_inputs[0].cpu().numpy()  # [S, 3, H, W]
-    else:
-        frames = gaussian_inputs.cpu().numpy()  # [S, 3, H, W]
-    
-    S = frames.shape[0]  # Number of frames (should be 3)
-    H, W = frames.shape[2], frames.shape[3]
-    
-    # Convert from CHW to HWC and normalize
-    frames_hwc = []
-    for s in range(S):
-        frame = frames[s].transpose(1, 2, 0)  # [H, W, 3]
-        # Normalize to [0, 1] if needed
-        if frame.max() > 1.0:
-            frame = frame / 255.0
-        frame = np.clip(frame, 0, 1)
-        frames_hwc.append(frame)
-    
-    # Determine layout: if LGPD gate is available, add extra column
-    num_cols = 5 if lgpd_gate is not None else 4
-    fig, axes = plt.subplots(S, num_cols, figsize=(4 * num_cols, 4 * S))
-    if S == 1:
-        axes = axes[None, :]  # Ensure 2D array
-    
-    for s in range(S):
-        col_idx = 0
-        
-        # Column 0: Input RGB frame
-        axes[s, col_idx].imshow(frames_hwc[s])
-        axes[s, col_idx].set_title(f"Frame {s+1}: Input RGB")
-        axes[s, col_idx].axis('off')
-        col_idx += 1
-        
-        # Column 1: Depth map
-        if gaussian_params is not None and "depth_maps" in gaussian_params:
-            depth = gaussian_params["depth_maps"][0, s].cpu().numpy()  # [H, W, 1]
-            if depth.ndim == 3:
-                depth = depth.squeeze(-1)  # [H, W]
-            im1 = axes[s, col_idx].imshow(depth, cmap='viridis')
-            axes[s, col_idx].set_title(f"Frame {s+1}: Depth")
-            axes[s, col_idx].axis('off')
-            plt.colorbar(im1, ax=axes[s, col_idx], fraction=0.046)
-        else:
-            axes[s, col_idx].text(0.5, 0.5, "No depth data", ha='center', va='center')
-            axes[s, col_idx].axis('off')
-        col_idx += 1
-        
-        # Column 2: Scale map
-        if gaussian_params is not None and "scale_maps" in gaussian_params:
-            scale = gaussian_params["scale_maps"][0, s].cpu().numpy()  # [H, W, 3]
-            # Normalize scale values for visualization
-            scale_norm = (scale - scale.min()) / (scale.max() - scale.min() + 1e-8)
-            scale_norm = np.clip(scale_norm, 0, 1)
-            axes[s, col_idx].imshow(scale_norm)
-            axes[s, col_idx].set_title(f"Frame {s+1}: Scale")
-            axes[s, col_idx].axis('off')
-        else:
-            axes[s, col_idx].text(0.5, 0.5, "No scale data", ha='center', va='center')
-            axes[s, col_idx].axis('off')
-        col_idx += 1
-        
-        # Column 3: Opacity map
-        if gaussian_params is not None and "opacity_maps" in gaussian_params:
-            opacity = gaussian_params["opacity_maps"][0, s].cpu().numpy()  # [H, W, 1]
-            if opacity.ndim == 3:
-                opacity = opacity.squeeze(-1)  # [H, W]
-            im3 = axes[s, col_idx].imshow(opacity, cmap='gray')
-            axes[s, col_idx].set_title(f"Frame {s+1}: Opacity")
-            axes[s, col_idx].axis('off')
-            plt.colorbar(im3, ax=axes[s, col_idx], fraction=0.046)
-        else:
-            axes[s, col_idx].text(0.5, 0.5, "No opacity data", ha='center', va='center')
-            axes[s, col_idx].axis('off')
-        # Column 4: LGPD Gate (only for first frame, as gate is per-token not per-frame)
-        # Only access this column if num_cols >= 5 (i.e., lgpd_gate is not None)
-        if num_cols >= 5:
-            col_idx += 1
-            if lgpd_gate is not None and s == 0:
-                gate_np = lgpd_gate[0].detach().cpu().squeeze(-1).numpy()  # [N]
-                # Reshape gate to 2D: assume tokens are in 10x10 grid (from pooling)
-                N = gate_np.shape[0]
-                gate_h = int(np.sqrt(N))
-                if gate_h * gate_h == N:
-                    gate_map = gate_np.reshape(gate_h, gate_h)
-                    im4 = axes[s, col_idx].imshow(gate_map, cmap='jet', vmin=0, vmax=1)
-                    axes[s, col_idx].set_title("LGPD Gate (10x10 tokens)")
-                    axes[s, col_idx].axis('off')
-                    plt.colorbar(im4, ax=axes[s, col_idx], fraction=0.046)
-                else:
-                    axes[s, col_idx].text(0.5, 0.5, f"Gate shape: {N}", ha='center', va='center')
-                    axes[s, col_idx].axis('off')
-            elif lgpd_gate is not None:
-                axes[s, col_idx].axis('off')
-            else:  # lgpd_gate is None but num_cols >= 5 (shouldn't happen, but handle gracefully)
-                if s == 0:
-                    axes[s, col_idx].text(0.5, 0.5, "No LGPD gate", ha='center', va='center')
-                axes[s, col_idx].axis('off')
-    
-    plt.suptitle(f"VGGT + LGPD Visualization - Step {step}", fontsize=16)
-    plt.tight_layout()
-    
-    save_path = os.path.join(save_dir, f"vggt_lgpd_step_{step:06d}.png")
-    plt.savefig(save_path, dpi=100, bbox_inches='tight')
-    plt.close(fig)
-    
-    logging.info(f"Saved VGGT + LGPD visualization to {save_path}")
 
 
 
@@ -414,23 +283,13 @@ class GaussianAdapter(nn.Module):
                  use_lora: bool = True, lora_rank: int = 8, lora_alpha: float = 32.0,
                  lora_targets=("qkv", "proj")):
         """
-        Args:
-            use_gaussian: Whether to use Gaussian features
-            action_expert_width: Width of action expert
-            use_lgpd: Whether to use Language-Gated Physical Distillation
-            num_frames: Number of consecutive frames to use from agent view during training (default: 3)
-            inference_num_frames: Number of frames to use during inference (default: 1, single frame).
-            use_single_frame_mode: If True, override num_frames to 1 for both training and inference.
-            temporal_context_offsets: Relative history offsets corresponding to packed context slots.
-            unfreeze_encoder: If True, unfreeze VGGT encoder to allow end-to-end training.
-            unfreeze_decoder_only: If True, only unfreeze decoder while keeping encoder frozen.
+        Adapter for integrating VGGT (Transformer-based 3DGS) features into OpenPI models.
+        LGPD support has been removed; this adapter only handles Gaussian and MTA features.
         """
         super().__init__()
         self.use_gaussian = use_gaussian
         self.encoder = None
         self.proj = None
-        self.lgpd = None  # Language-Gated Physical Distillation
-        self.use_lgpd = use_lgpd
         self.temporal_context_offsets = tuple(temporal_context_offsets or tuple(range(-(num_frames - 1), 1)))
 
         # Single-frame mode: override num_frames to 1 for both training and inference
@@ -608,14 +467,6 @@ class GaussianAdapter(nn.Module):
                             torch.randn(self.num_frames, action_expert_width) * 0.02
                         )
                         self.temporal_offset_proj = nn.Linear(1, action_expert_width)
-                    if self.use_lgpd:
-                        logging.info("Initializing LGPD Module...")
-                        self.lgpd = LanguageGatedPhysicalDistillation(
-                            token_dim=action_expert_width,
-                            text_dim=action_expert_width,  # Assuming pooled text emb has same dim as visual proj
-                            num_context_tokens=16,
-                            background_weight=0.1
-                        )
 
             except Exception as e:
                 logging.error(f"Failed to initialize VGGT components: {e}")
@@ -1130,20 +981,7 @@ class GaussianAdapter(nn.Module):
         # Multi-frame mode without frame pos encoding: 100 tokens
         g_mask = torch.ones(B, gaussian_embs.shape[1], dtype=torch.bool, device=gaussian_embs.device)
         
-        # Apply LGPD if enabled and text embedding is provided
-        lgpd_gate = None
-        if self.use_lgpd and self.lgpd is not None and text_embedding is not None:
-            # text_embedding: [B, D] - LGPD module expects [B, D] and will handle unsqueeze internally
-            # Return gate for visualization if needed
-            if visualize_gate:
-                gaussian_embs, lgpd_gate = self.lgpd(gaussian_embs, text_embedding, return_gate=True)
-            else:
-                gaussian_embs = self.lgpd(gaussian_embs, text_embedding)
-        
-        # Visualize VGGT frames and LGPD gate together
-        # Only visualize if LGPD is enabled and gate is available, or if we just want VGGT visualization
-        # Only visualize on rank 0 to avoid NCCL timeout in distributed training
-        # LGPD / VGGT visualization disabled to simplify training and avoid potential DDP timeouts.
+        # LGPD is disabled in this configuration; pass through tokens unchanged.
         
         # Prepare return values
         if return_gaussian_params and return_raw_tokens and return_mta_features:

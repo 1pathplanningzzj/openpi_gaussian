@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 
@@ -56,7 +58,7 @@ class Args:
     video_out_path: str = "data_329/gaussian_vla_exp329_15000_libero_10_test_1/videos"  # Path to save videos
     # Gaussian_vla_exp315_12000_libero_10 这个实际上是goal
     save_videos: bool = True  # Whether to save rollout videos
-    seed: int = 10  # Random Seed (for reproducibility)
+    seed: int = 7  # Random Seed (for reproducibility)
     debug_log_path: str | None = None  # Path to save debug logs (None = disabled)
     # Match training `temporal_context_offsets=(-10, -5, 0)`: steps before current at control (env) rate (~10Hz).
     # History shorter than max offset pads with the current frame (same as server-side repeat, but real frames when available).
@@ -241,14 +243,14 @@ def eval_libero(args: Args) -> None:
                         }
 
                         # Query model to get action
-                        logging.info(
+                        logging.debug(
                             f"Querying policy server for a new action chunk (env timestep {t}). "
                             "First call can take a long time; if this line stays for many minutes, "
                             "check the policy server process and GPU in another terminal."
                         )
                         infer_result = client.infer(element)
                         action_chunk = infer_result["actions"]
-                        logging.info(
+                        logging.debug(
                             f"Received action chunk of length {len(action_chunk)} "
                             f"(using {args.replan_steps} steps per replan)."
                         )

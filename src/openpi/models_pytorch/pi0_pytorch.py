@@ -262,7 +262,8 @@ class PI0Pytorch(nn.Module):
         self.gaussian_adapter = GaussianAdapter(
             use_gaussian,
             paligemma_config.width,
-            use_lgpd=False,
+            # LGPD support has been removed; GaussianAdapter only handles
+            # Gaussian + MTA features now.
             num_frames=self.temporal_context_count,
             inference_num_frames=_infer_frames,
             use_single_frame_mode=use_single_frame_mode,
@@ -340,9 +341,6 @@ class PI0Pytorch(nn.Module):
                 token_dim=paligemma_config.width,
                 input_num_tokens=self.static_gaussian_token_count,
                 future_input_num_tokens=self.future_token_count,
-                # Disable action conditioning for future-query decoding.
-                # This removes the action coupling path while keeping future-query tokens enabled.
-                use_action_conditioning=False,
                 use_incremental_depth=getattr(config, "use_incremental_depth", True),
                 future_prediction_horizon=self.future_prediction_horizon,
                 use_velocity_future_gaussians=_vel_g,
@@ -1488,8 +1486,6 @@ class PI0Pytorch(nn.Module):
         decoder_state = self.world_model.prepare_decoder_state(
             z_tokens.float(),
             horizon_idx=0,
-            skip_horizon_embedding=True,
-            skip_action_conditioning=True,
         )
         if step is not None and step % 400 == 0:
             shared_features = decoder_state.get("shared_features")
@@ -1675,31 +1671,9 @@ class PI0Pytorch(nn.Module):
             lang_masks_for_pooling = lang_masks
         
         # --- 3D Gaussian Encoder ---
-        # Delegated to Adapter
-        # Pass Pooled Text Embedding for LGPD
-        # lang_emb: [B, SeqLen, D] or [B, T, SeqLen, D] -> [B, D] or [B, T, D] via Mean/Max Pooling
-        # Need to consider masks? lang_masks [B, SeqLen] or [B, T, SeqLen] (1=valid, 0=pad)
-        if self.gaussian_adapter.use_lgpd:
-            # Handle temporal dimension if present
-            if lang_emb_for_pooling.ndim == 4:  # [B, T, SeqLen, D] - has temporal dimension
-                # Flatten temporal and sequence dimensions for pooling
-                B, T, S, D = lang_emb_for_pooling.shape
-                lang_emb_flat = lang_emb_for_pooling.reshape(B * T, S, D)  # [B*T, S, D]
-                lang_masks_flat = lang_masks_for_pooling.reshape(B * T, S)  # [B*T, S]
-                mask_float = lang_masks_flat.unsqueeze(-1).float()  # [B*T, S, 1]
-                sum_emb = (lang_emb_flat * mask_float).sum(dim=1)  # [B*T, D]
-                sum_mask = mask_float.sum(dim=1).clamp(min=1e-6)  # [B*T, 1]
-                text_embedding_flat = sum_emb / sum_mask  # [B*T, D]
-                # Reshape back to [B, T, D] and take mean over time dimension
-                text_embedding = text_embedding_flat.reshape(B, T, D).mean(dim=1)  # [B, D]
-            else:  # [B, SeqLen, D] - no temporal dimension
-                # Masked Mean Pooling
-                mask_float = lang_masks_for_pooling.unsqueeze(-1).float()  # [B, S, 1]
-                sum_emb = (lang_emb_for_pooling * mask_float).sum(dim=1)  # [B, D]
-                sum_mask = mask_float.sum(dim=1).clamp(min=1e-6)  # [B, 1]
-                text_embedding = sum_emb / sum_mask  # [B, D]
-        else:
-            text_embedding = None
+        # Delegated to Adapter. LGPD is disabled in this configuration so we do not
+        # compute a separate pooled text_embedding for the Gaussian adapter.
+        text_embedding = None
 
         # --- Get World Tokens from GaussianAdapter (NEW) ---
         world_tokens = None

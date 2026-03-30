@@ -111,7 +111,7 @@ class StaticGaussianHead(nn.Module):
         self.use_image_fusion = use_image_fusion
         self.predict_depth = predict_depth
 
-        out_ch = 4 + 3 + 1 + 9 + 2
+        out_ch = 4 + 3 + 1 + 9  # rot(4) + scale(3) + opacity(1) + SH(9)
 
         if use_image_fusion:
             self.img_merger = nn.Sequential(
@@ -205,8 +205,6 @@ class GaussianDecoder(nn.Module):
         token_dim: int,
         input_num_tokens: int = 256,
         future_input_num_tokens: int | None = None,
-        action_dim: int = 7,
-        use_action_conditioning: bool = True,
         predict_depth: bool = True,
         use_incremental_depth: bool = True,
         future_prediction_horizon: int = 1,
@@ -218,8 +216,6 @@ class GaussianDecoder(nn.Module):
         self.input_num_tokens = input_num_tokens
         self.static_input_num_tokens = input_num_tokens
         self.future_input_num_tokens = future_input_num_tokens or input_num_tokens
-        self.action_dim = action_dim
-        self.use_action_conditioning = use_action_conditioning
         self.predict_depth = predict_depth
         self.use_incremental_depth = use_incremental_depth
         self.future_prediction_horizon = max(1, int(future_prediction_horizon))
@@ -228,14 +224,6 @@ class GaussianDecoder(nn.Module):
 
         # Horizon embedding helps the decoder distinguish t+1 vs t+H.
         self.horizon_embed = nn.Embedding(self.future_prediction_horizon, token_dim)
-
-        # Action embedding projection
-        if use_action_conditioning:
-            self.action_proj = nn.Sequential(
-                nn.Linear(action_dim, 128),
-                nn.GELU(),
-                nn.Linear(128, token_dim),  # 输出维度应该匹配 token_dim (2048)
-            )
 
         self.static_grid_size = int(self.static_input_num_tokens ** 0.5)
         self.future_grid_size = int(self.future_input_num_tokens ** 0.5)
@@ -287,21 +275,13 @@ class GaussianDecoder(nn.Module):
         z: torch.Tensor,
         *,
         horizon_idx: int = 0,
-        actions=None,
-        camera_params=None,
-        skip_horizon_embedding: bool = False,
-        skip_action_conditioning: bool = False,
     ) -> dict[str, torch.Tensor | int]:
-        """Normalize token count and run the shared decoder backbone once."""
-        # Horizon-specific rollout variation now lives in VelocityGaussianHead.
-        # The shared backbone stays horizon-agnostic so one decoder state can be reused.
-        horizon_idx = max(0, min(int(horizon_idx), self.future_prediction_horizon - 1))
+        """Normalize token count and run the shared decoder backbone once.
 
-        if not skip_action_conditioning and self.use_action_conditioning and actions is not None:
-            action_cam = self._transform_action_to_camera(actions, camera_params)
-            action_cam_7d = action_cam[:, :7]
-            action_embed = self.action_proj(action_cam_7d)
-            z = z + action_embed.unsqueeze(1)
+        Horizon-specific rollout variation now lives in VelocityGaussianHead.
+        The shared backbone stays horizon-agnostic so one decoder state can be reused.
+        """
+        horizon_idx = max(0, min(int(horizon_idx), self.future_prediction_horizon - 1))
 
         z_canonical = self._normalize_tokens_to_canonical_grid(z)
         token_grid = z_canonical.transpose(1, 2).reshape(
@@ -319,19 +299,11 @@ class GaussianDecoder(nn.Module):
         self,
         z: torch.Tensor,
         *,
-        actions=None,
-        camera_params=None,
         horizon_idx: int = 0,
-        skip_horizon_embedding: bool = False,
-        skip_action_conditioning: bool = False,
     ) -> dict[str, torch.Tensor | int]:
         return self._prepare_shared_token_features(
             z,
             horizon_idx=horizon_idx,
-            actions=actions,
-            camera_params=camera_params,
-            skip_horizon_embedding=skip_horizon_embedding,
-            skip_action_conditioning=skip_action_conditioning,
         )
 
     def _decode_static_from_shared(
@@ -357,7 +329,7 @@ class GaussianDecoder(nn.Module):
 
         decoder_output = self.static_head(shared_features, images=current_frame_img)
         raw = decoder_output["gaussian_params"]
-        rot_raw, scale_raw, opa_raw, sh_raw, xy_delta_raw = raw.split([4, 3, 1, 9, 2], dim=1)
+        rot_raw, scale_raw, opa_raw, sh_raw = raw.split([4, 3, 1, 9], dim=1)
 
         depth_delta_map = None
         if self.predict_depth and "depth" in decoder_output:
@@ -396,11 +368,8 @@ class GaussianDecoder(nn.Module):
                 downsample_factor=1,
             )
 
-        xy_delta_maps = xy_delta_raw.permute(0, 2, 3, 1)
         N = H_dec * W_dec
-        xy_delta_flat = torch.tanh(xy_delta_maps.reshape(B, N, 2)) * 0.5
-        z_zeros = torch.zeros(B, N, 1, device=xyz_base.device, dtype=xyz_base.dtype)
-        xyz = xyz_base + torch.cat([xy_delta_flat, z_zeros], dim=-1)
+        xyz = xyz_base
 
         rot_flat = rot_maps.reshape(B, N, 4)
         scale_flat = torch.clamp(scale_maps.reshape(B, N, 3), min=1e-7, max=10.0)
@@ -466,7 +435,6 @@ class GaussianDecoder(nn.Module):
         camera_params=None,
         step=None,
         current_observation=None,
-        actions=None,
         base_depth: torch.Tensor | None = None,
         horizon_idx: int = 0,
         static_reference_params: dict | None = None,
@@ -476,9 +444,14 @@ class GaussianDecoder(nn.Module):
     ):
         """Decode latent tokens → Gaussian parameters."""
         return self._decode_independent(
-            z, gaussian_adapter=gaussian_adapter, camera_params=camera_params,
-            current_observation=current_observation, future_observation=future_observation,
-            step=step, actions=actions, base_depth=base_depth, horizon_idx=horizon_idx,
+            z,
+            gaussian_adapter=gaussian_adapter,
+            camera_params=camera_params,
+            current_observation=current_observation,
+            future_observation=future_observation,
+            step=step,
+            base_depth=base_depth,
+            horizon_idx=horizon_idx,
             static_reference_params=static_reference_params,
             velocity_time_factor=velocity_time_factor,
             motion_gate=motion_gate,
@@ -503,13 +476,11 @@ class GaussianDecoder(nn.Module):
             current_observation=current_observation,
             future_observation=None,
             step=step,
-            actions=None,
             base_depth=base_depth,
             horizon_idx=0,
             static_reference_params=None,
             velocity_time_factor=1.0,
             skip_horizon_embedding=True,
-            skip_action_conditioning=True,
             shared_state=shared_state,
         )
 
@@ -635,13 +606,18 @@ class GaussianDecoder(nn.Module):
         )
 
     def _decode_independent(
-        self, z, gaussian_adapter=None, camera_params=None,
-        current_observation=None, future_observation=None, step=None, actions=None,
-        base_depth: torch.Tensor | None = None, horizon_idx: int = 0,
+        self,
+        z,
+        gaussian_adapter=None,
+        camera_params=None,
+        current_observation=None,
+        future_observation=None,
+        step=None,
+        base_depth: torch.Tensor | None = None,
+        horizon_idx: int = 0,
         static_reference_params: dict | None = None,
         velocity_time_factor: float = 1.0,
         skip_horizon_embedding: bool = False,
-        skip_action_conditioning: bool = False,
         motion_gate: torch.Tensor | None = None,
         shared_state: dict[str, torch.Tensor | int] | None = None,
     ):
@@ -650,10 +626,6 @@ class GaussianDecoder(nn.Module):
             shared_state = self._prepare_shared_token_features(
                 z,
                 horizon_idx=horizon_idx,
-                actions=actions,
-                camera_params=camera_params,
-                skip_horizon_embedding=skip_horizon_embedding,
-                skip_action_conditioning=skip_action_conditioning,
             )
 
         if (
@@ -695,57 +667,6 @@ class GaussianDecoder(nn.Module):
 
         return gaussian_params
 
-    def _transform_action_to_camera(self, actions, camera_params):
-        """
-        quit ** 0313
-        Transform actions from world frame to camera frame.
-
-        Args:
-            actions: [B, action_dim] - padded actions (may be 32-dim, but only first 7 are used)
-                     (delta_x, delta_y, delta_z, quat_w, quat_x, quat_y, quat_z, ...)
-            camera_params: dict with camera_pos and camera_quat
-        Returns:
-            action_cam: [B, action_dim] - actions in camera frame with X-axis flipped
-        """
-        if camera_params is None or "camera_pos" not in camera_params:
-            # No transformation, return as-is
-            return actions
-
-        B = actions.shape[0]
-        device = actions.device
-        action_dim = actions.shape[1]
-
-        # Extract camera pose
-        cam_pos = torch.tensor(camera_params["camera_pos"], device=device, dtype=torch.float32)
-        cam_quat = torch.tensor(camera_params["camera_quat"], device=device, dtype=torch.float32)
-
-        # Build camera rotation matrix from quaternion
-        cam_rot = self._quat_to_rotation_matrix(cam_quat)  # [3, 3]
-
-        # Handle temporal dimension: actions could be [B, T, D] or [B, D]
-        if actions.ndim == 3:
-            # actions is [B, T, D], take the first timestep
-            actions = actions[:, 0, :]  # [B, D]
-
-        # Extract position and rotation from actions (only first 7 dims are meaningful)
-        eef_pos = actions[:, :3]  # [B, 3] - delta position in world frame
-        eef_quat = actions[:, 3:7]  # [B, 4] - quaternion (w, x, y, z)
-
-        # Transform position to camera frame
-        eef_pos_cam = torch.matmul(eef_pos, cam_rot.T)  # [B, 3]
-
-        # CRITICAL: Flip X-axis to match image coordinate convention
-        eef_pos_cam[:, 0] = -eef_pos_cam[:, 0]
-
-        # For rotation, we keep it as-is (quaternion transformation is complex)
-        # In practice, position is more important for action conditioning
-
-        # Reconstruct action with transformed position
-        action_cam = actions.clone()
-        action_cam[:, :3] = eef_pos_cam
-        # Keep quaternion and padding unchanged
-
-        return action_cam
 
     @staticmethod
     def _quat_to_rotation_matrix(quat):
