@@ -187,6 +187,30 @@ class VelocityGaussianHead(nn.Module):
         return self.net(shared_features + horizon_bias)
 
 
+class StaticResidualHead(nn.Module):
+    """Decode shared features into residuals for static Gaussian params (scale, opacity, SH)."""
+
+    def __init__(self, future_prediction_horizon: int):
+        super().__init__()
+        self.horizon_proj = nn.Embedding(max(1, int(future_prediction_horizon)), 128)
+        # Output channels: 3 (scale) + 1 (opacity) + 9 (SH) = 13
+        self.net = nn.Sequential(
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.GroupNorm(min(32, 128), 128),
+            nn.GELU(),
+            nn.Conv2d(128, 13, 3, padding=1),
+        )
+        nn.init.xavier_uniform_(self.net[-1].weight, gain=0.01)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, shared_features: torch.Tensor, horizon_idx: int) -> torch.Tensor:
+        horizon_idx = max(0, min(int(horizon_idx), self.horizon_proj.num_embeddings - 1))
+        horizon_ids = torch.full(
+            (shared_features.shape[0],), horizon_idx, device=shared_features.device, dtype=torch.long
+        )
+        horizon_bias = self.horizon_proj(horizon_ids).view(shared_features.shape[0], -1, 1, 1)
+        return self.net(shared_features + horizon_bias)
+
 class GaussianDecoder(nn.Module):
     """
     Decoder that converts shared future-token features into 3D Gaussian parameters.
@@ -240,8 +264,10 @@ class GaussianDecoder(nn.Module):
 
         if use_velocity_future_gaussians:
             self.velocity_head = VelocityGaussianHead(self.future_prediction_horizon)
+            self.static_residual_head = StaticResidualHead(self.future_prediction_horizon)
         else:
             self.velocity_head = None
+            self.static_residual_head = None
 
     def _normalize_tokens_to_canonical_grid(self, z: torch.Tensor) -> torch.Tensor:
         """Normalize 256/768/1024-token inputs onto the canonical future-token grid."""
@@ -322,7 +348,7 @@ class GaussianDecoder(nn.Module):
         current_frame_img = None
         if future_observation is None and current_observation is not None and gaussian_adapter is not None:
             vggt_inputs = gaussian_adapter.prepare_inputs(
-                current_observation, shared_features.device, shared_features.shape[0], is_training=False
+                current_observation, shared_features.device, shared_features.shape[0], is_training=True
             )
             if vggt_inputs is not None:
                 current_frame_img = vggt_inputs[:, -1]
@@ -557,6 +583,31 @@ class GaussianDecoder(nn.Module):
                 ).squeeze(1)
             depth_delta_map = depth_map - base_depth_map.unsqueeze(1)
 
+        # Start from static reference parameters
+        scales = static_reference_params["scales"]
+        opacity = static_reference_params["opacity"]
+        sh = static_reference_params["sh"]
+        rotations = static_reference_params["rotations"]
+
+        # Optional horizon-conditioned static residuals for future frames
+        if getattr(self, "static_residual_head", None) is not None:
+            res_map = self.static_residual_head(shared_features, horizon_idx=horizon_idx)
+            res_up = F.interpolate(res_map, size=(H, W), mode="bilinear", align_corners=False)
+            res_flat = res_up.permute(0, 2, 3, 1).reshape(B, Npts, -1)
+            delta_scale_raw, delta_opacity_raw, delta_sh_raw = torch.split(res_flat, [3, 1, 9], dim=-1)
+
+            # Scale: log-space residual, keep within reasonable bounds
+            scale_log = torch.log(scales.clamp(min=1e-7, max=10.0))
+            scales = torch.exp(scale_log + 0.1 * delta_scale_raw).clamp(min=1e-7, max=10.0)
+
+            # Opacity: residual in logit space
+            opacity_logits = torch.logit(opacity.clamp(1e-4, 1.0 - 1e-4))
+            opacity = torch.sigmoid(opacity_logits + 0.1 * delta_opacity_raw)
+
+            # SH: small additive residual with SH magnitude mask
+            sh_mask = self.static_head.sh_mask.view(1, 1, -1)
+            sh = sh + 0.1 * delta_sh_raw * sh_mask
+
         if step is not None and step % 400 == 0:
             import logging
 
@@ -575,10 +626,10 @@ class GaussianDecoder(nn.Module):
 
         return {
             "xyz": xyz,
-            "scales": static_reference_params["scales"],
-            "opacity": static_reference_params["opacity"],
-            "sh": static_reference_params["sh"],
-            "rotations": static_reference_params["rotations"],
+            "scales": scales,
+            "opacity": opacity,
+            "sh": sh,
+            "rotations": rotations,
             "depth_map": depth_map,
             "depth_delta_map": depth_delta_map,
             "raw_delta_xyz": raw_delta,
