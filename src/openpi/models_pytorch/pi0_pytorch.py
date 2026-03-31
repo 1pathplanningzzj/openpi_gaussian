@@ -873,7 +873,6 @@ class PI0Pytorch(nn.Module):
                     future_observation = _preprocessing.preprocess_observation_pytorch(future_observation, train=False)
 
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
-
         # Store the preprocessed observation for later use in World Model
         # This ensures that when _prepare_gaussian_inputs is called later, it uses the observation
         # with preserved temporal dimension, not the original one
