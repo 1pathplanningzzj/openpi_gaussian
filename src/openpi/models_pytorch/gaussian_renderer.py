@@ -1068,6 +1068,19 @@ def visualize_future_rollout_comparison(
             axes[context_row, dst_col].set_title(f"ctx_{col_idx}", fontsize=13)
 
     gt_key = f"{view_name}_image"
+    pred_velocity_vmax = 1.0
+    if pred_velocity_row is not None:
+        pred_velocity_max = 0.0
+        for horizon_idx in range(min(horizon, total_future_cols)):
+            if horizon_idx >= len(pred_velocity_seq):
+                continue
+            pred_velocity_entry = pred_velocity_seq[horizon_idx]
+            if gt_key not in pred_velocity_entry:
+                continue
+            pred_velocity_map = pred_velocity_entry[gt_key][idx].detach().cpu().numpy()
+            pred_velocity_max = max(pred_velocity_max, float(np.max(pred_velocity_map)))
+        pred_velocity_vmax = max(pred_velocity_max, 1e-6)
+
     base_gt_img = None
     base_render_img = None
 
@@ -1091,7 +1104,7 @@ def visualize_future_rollout_comparison(
             axes[motion_row, 0].imshow(blank_motion, cmap="magma", vmin=0.0, vmax=1.0)
         if pred_velocity_row is not None:
             blank_velocity = _blank_latent_like(base_gt_img, fallback_size=224)
-            axes[pred_velocity_row, 0].imshow(blank_velocity, cmap="magma", vmin=0.0, vmax=1.0)
+            axes[pred_velocity_row, 0].imshow(blank_velocity, cmap="magma", vmin=0.0, vmax=pred_velocity_vmax)
 
     for horizon_idx in range(min(horizon, total_future_cols)):
         col = start_col + horizon_idx
@@ -1116,7 +1129,7 @@ def visualize_future_rollout_comparison(
             pred_velocity_entry = pred_velocity_seq[horizon_idx]
             if gt_key in pred_velocity_entry:
                 pred_velocity_map = pred_velocity_entry[gt_key][idx].detach().cpu().numpy()
-                axes[pred_velocity_row, col].imshow(pred_velocity_map, cmap="magma", vmin=0.0, vmax=1.0)
+                axes[pred_velocity_row, col].imshow(pred_velocity_map, cmap="magma", vmin=0.0, vmax=pred_velocity_vmax)
 
     fig.suptitle(f"Future Rollout Visualization - Step {step}", fontsize=16)
     save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}.png")

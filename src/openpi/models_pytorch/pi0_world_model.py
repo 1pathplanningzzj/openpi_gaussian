@@ -467,7 +467,6 @@ class GaussianDecoder(nn.Module):
         horizon_idx: int = 0,
         static_reference_params: dict | None = None,
         velocity_time_factor: float = 1.0,
-        motion_gate: torch.Tensor | None = None,
         shared_state: dict[str, torch.Tensor | int] | None = None,
     ):
         """Decode latent tokens → Gaussian parameters."""
@@ -482,7 +481,6 @@ class GaussianDecoder(nn.Module):
             horizon_idx=horizon_idx,
             static_reference_params=static_reference_params,
             velocity_time_factor=velocity_time_factor,
-            motion_gate=motion_gate,
             shared_state=shared_state,
         )
 
@@ -520,7 +518,6 @@ class GaussianDecoder(nn.Module):
         step: int | None,
         horizon_idx: int = 0,
         base_depth: torch.Tensor | None = None,
-        motion_gate: torch.Tensor | None = None,
     ) -> dict:
         """Reuse the base Gaussian template and predict future dynamics via delta xyz only."""
         shared_features = shared_state["shared_features"]
@@ -542,33 +539,6 @@ class GaussianDecoder(nn.Module):
         vel_flat = vel_up.permute(0, 2, 3, 1).reshape(B, Npts, 3)
 
         raw_delta = torch.tanh(vel_flat) * self.velocity_world_model_scale * float(velocity_time_factor)
-        motion_gate_up = None
-        if motion_gate is not None:
-            if motion_gate.ndim == 3:
-                motion_gate = motion_gate.unsqueeze(-1)
-            elif motion_gate.ndim != 4:
-                raise ValueError(f"motion_gate must have shape [B, N, 1] or [B, H, W, 1], got {tuple(motion_gate.shape)}")
-
-            if motion_gate.shape[0] != B:
-                raise ValueError(f"motion_gate batch mismatch: expected {B}, got {motion_gate.shape[0]}")
-
-            if motion_gate.shape[1] * motion_gate.shape[2] == Npts and motion_gate.ndim == 4:
-                motion_gate_up = motion_gate.permute(0, 3, 1, 2)
-                if motion_gate_up.shape[-2:] != (H, W):
-                    motion_gate_up = F.interpolate(motion_gate_up, size=(H, W), mode="bilinear", align_corners=False)
-                motion_gate_up = motion_gate_up.permute(0, 2, 3, 1).reshape(B, Npts, -1)
-            else:
-                token_count = self.canonical_grid_size * self.canonical_grid_size
-                if motion_gate.shape[1] != token_count:
-                    raise ValueError(
-                        f"motion_gate token/spatial size mismatch: got {tuple(motion_gate.shape)}, expected token count {token_count} or point count {Npts}"
-                    )
-                motion_gate_up = motion_gate.reshape(B, self.canonical_grid_size, self.canonical_grid_size, -1).permute(0, 3, 1, 2)
-                motion_gate_up = F.interpolate(motion_gate_up, size=(H, W), mode="bilinear", align_corners=False)
-                motion_gate_up = motion_gate_up.permute(0, 2, 3, 1).reshape(B, Npts, -1)
-
-            motion_gate_up = torch.clamp(motion_gate_up.to(device=raw_delta.device, dtype=raw_delta.dtype), 0.0, 1.0)
-            raw_delta = raw_delta * motion_gate_up
 
         xyz = xyz0 + raw_delta.to(dtype=xyz0.dtype)
         xyz = torch.clamp(xyz, min=-100.0, max=100.0)
@@ -615,13 +585,11 @@ class GaussianDecoder(nn.Module):
 
             static_scale_mean = static_reference_params["scales"].float().mean().item()
             static_scale_max = static_reference_params["scales"].float().max().item()
-            gate_mean = motion_gate_up.mean().item() if motion_gate_up is not None else 1.0
-            gate_max = motion_gate_up.max().item() if motion_gate_up is not None else 1.0
             logging.info(
                 f"[VelocityDecoder][h={horizon_idx}][t+~{horizon_idx + 1}] delta_xyz: "
                 f"motion_scale={self.velocity_world_model_scale}, "
                 f"time_factor={velocity_time_factor:.4f}, |delta|_mean={raw_delta.abs().mean().item():.6f}, "
-                f"|delta|_max={raw_delta.abs().max().item():.6f}, gate_mean={gate_mean:.6f}, gate_max={gate_max:.6f}, "
+                f"|delta|_max={raw_delta.abs().max().item():.6f}, "
                 f"static_gaussian_scale_mean={static_scale_mean:.6f}, "
                 f"static_gaussian_scale_max={static_scale_max:.6f}"
             )
@@ -645,7 +613,6 @@ class GaussianDecoder(nn.Module):
         step: int | None,
         horizon_idx: int = 0,
         base_depth: torch.Tensor | None = None,
-        motion_gate: torch.Tensor | None = None,
     ) -> dict:
         """Decode shared motion-query features into a constant-velocity dynamic Gaussian update."""
         return self._decode_velocity_from_static(
@@ -655,7 +622,6 @@ class GaussianDecoder(nn.Module):
             step,
             horizon_idx=horizon_idx,
             base_depth=base_depth,
-            motion_gate=motion_gate,
         )
 
     def _decode_independent(
@@ -671,7 +637,6 @@ class GaussianDecoder(nn.Module):
         static_reference_params: dict | None = None,
         velocity_time_factor: float = 1.0,
         skip_horizon_embedding: bool = False,
-        motion_gate: torch.Tensor | None = None,
         shared_state: dict[str, torch.Tensor | int] | None = None,
     ):
         """Decode VLM tokens into Gaussian parameters using the shared backbone state."""
@@ -693,7 +658,6 @@ class GaussianDecoder(nn.Module):
                 step,
                 horizon_idx=horizon_idx,
                 base_depth=base_depth,
-                motion_gate=motion_gate,
             )
 
         gaussian_params = self._decode_static_from_shared(

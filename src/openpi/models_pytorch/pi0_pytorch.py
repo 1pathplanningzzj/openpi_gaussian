@@ -1194,44 +1194,6 @@ class PI0Pytorch(nn.Module):
 
         return motion_prior_maps
 
-    def _build_future_motion_token_gate(self, observation, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
-        """Downsample the soft motion prior to the 32×32 future-token grid."""
-        if not self.use_world_tokens_in_prefix or self.future_token_count <= 0:
-            return None
-
-        motion_prior_maps = getattr(observation, "future_motion_prior", None)
-        if not motion_prior_maps:
-            return None
-
-        prior_map = motion_prior_maps.get("agent_image")
-        if prior_map is None:
-            prior_map = next(iter(motion_prior_maps.values()), None)
-        if prior_map is None:
-            return None
-
-        if prior_map.ndim == 3:
-            prior_map = prior_map.unsqueeze(1)
-        elif prior_map.ndim != 4:
-            return None
-
-        prior_map = prior_map.to(device=device, dtype=torch.float32)
-        prior_tokens = F.interpolate(
-            prior_map,
-            size=(self.future_grid_size, self.future_grid_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-        prior_tokens = prior_tokens.flatten(2).transpose(1, 2)
-        gate = 0.5 + 0.5 * torch.clamp(prior_tokens, 0.0, 1.0)
-        return gate.to(dtype=dtype)
-
-    def _build_future_motion_delta_gate(self, observation, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
-        """Build a soft 32×32 gate for future delta_xyz updates from the motion prior."""
-        gate = self._build_future_motion_token_gate(observation, device=device, dtype=torch.float32)
-        if gate is None:
-            return None
-        return gate.to(dtype=dtype)
-
     def _build_future_motion_weight_map(
         self,
         current_image: torch.Tensor | None,
@@ -1612,7 +1574,6 @@ class PI0Pytorch(nn.Module):
                 horizon_idx=horizon_idx,
                 static_reference_params=static_gaussian_params,
                 velocity_time_factor=velocity_time_factor,
-                motion_gate=None,
                 shared_state=decoder_state,
             )
 
@@ -1708,12 +1669,6 @@ class PI0Pytorch(nn.Module):
             gaussian_embs, g_mask, mta_features = gaussian_result
         else:
             gaussian_embs, g_mask = gaussian_result
-
-        future_motion_gate = self._build_future_motion_token_gate(
-            motion_prior_observation,
-            device=lang_emb.device,
-            dtype=self.future_query_tokens.dtype if self.future_query_tokens is not None else lang_emb.dtype,
-        )
 
         gaussian_embs_for_prefix = None
         g_mask_for_prefix = None
@@ -2245,8 +2200,6 @@ class PI0Pytorch(nn.Module):
         if speed_map.shape[-2:] != target_hw:
             speed_map = F.interpolate(speed_map, size=target_hw, mode="bilinear", align_corners=False)
 
-        max_speed = speed_map.amax(dim=(-2, -1), keepdim=True)
-        speed_map = speed_map / (max_speed + 1e-6)
         return speed_map.squeeze(1)
 
     def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names, time_suffix="", temporal_frames=None, temporal_labels=None, future_label="future"):
@@ -2424,7 +2377,6 @@ class PI0Pytorch(nn.Module):
                     horizon_idx=horizon_idx,
                     static_reference_params=reused_template,
                     velocity_time_factor=vtf,
-                    motion_gate=None,
                 )
                 if getattr(self, "use_velocity_future_gaussians", False) and horizon_idx == 0 and viz_static_template is None:
                     viz_static_template = {

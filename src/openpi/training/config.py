@@ -104,9 +104,6 @@ class DataConfig:
     # Optional sidecar root for precomputed flow supervision.
     flow_root: str | None = None
 
-    # Optional RGB-difference threshold for masking non-dynamic flow regions at load time.
-    rgb_diff_threshold: float | None = None
-
 
 
 class GroupFactory(Protocol):
@@ -298,7 +295,6 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
     extra_delta_transform: bool = False
     flow_root: str | None = None
-    rgb_diff_threshold: float | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -337,17 +333,12 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         if effective_flow_root is None and self.base_config is not None:
             effective_flow_root = self.base_config.flow_root
 
-        effective_rgb_diff_threshold = self.rgb_diff_threshold
-        if effective_rgb_diff_threshold is None and self.base_config is not None:
-            effective_rgb_diff_threshold = self.base_config.rgb_diff_threshold
-
         data_transforms = _transforms.Group(
             inputs=[
                 depth_transform.LoadDepthTransform(use_depth=True, depth_key="observation/depth"),
                 depth_transform.LoadFlowTransform(
                     flow_root=effective_flow_root,
                     future_horizon=max(1, int(getattr(model_config, "future_prediction_horizon", 1))),
-                    rgb_diff_threshold=effective_rgb_diff_threshold,
                 ),
                 libero_policy.LiberoInputs(model_type=model_config.model_type),
             ],
@@ -384,7 +375,6 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             flow_root=effective_flow_root,
-            rgb_diff_threshold=effective_rgb_diff_threshold,
         )
 
 
@@ -877,7 +867,6 @@ _CONFIGS = [
                 prompt_from_task=True,
                 dataset_root="/data/zijianzhang/LIBERA/data_with_depth",
                 flow_root="/data/zijianzhang/LIBERA/flow_sidecars_raft",
-                rgb_diff_threshold=0.03,
             ),
             extra_delta_transform=False,
         ),
