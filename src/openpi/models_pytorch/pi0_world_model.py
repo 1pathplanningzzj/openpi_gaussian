@@ -169,6 +169,12 @@ class VelocityGaussianHead(nn.Module):
     def __init__(self, future_prediction_horizon: int):
         super().__init__()
         self.horizon_proj = nn.Embedding(max(1, int(future_prediction_horizon)), 128)
+        self.state_proj = nn.Sequential(
+            nn.Linear(8, 128),
+            nn.GELU(),
+            nn.Linear(128, 128),
+        )
+        self.eef_map_proj = nn.Conv2d(1, 128, kernel_size=1)
         self.net = nn.Sequential(
             nn.Conv2d(128, 128, 3, padding=1),
             nn.GroupNorm(min(32, 128), 128),
@@ -178,13 +184,35 @@ class VelocityGaussianHead(nn.Module):
         nn.init.xavier_uniform_(self.net[-1].weight, gain=0.01)
         nn.init.zeros_(self.net[-1].bias)
 
-    def forward(self, shared_features: torch.Tensor, horizon_idx: int) -> torch.Tensor:
+    def forward(
+        self,
+        shared_features: torch.Tensor,
+        horizon_idx: int,
+        state: torch.Tensor | None = None,
+        eef_heatmap: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         horizon_idx = max(0, min(int(horizon_idx), self.horizon_proj.num_embeddings - 1))
         horizon_ids = torch.full(
             (shared_features.shape[0],), horizon_idx, device=shared_features.device, dtype=torch.long
         )
-        horizon_bias = self.horizon_proj(horizon_ids).view(shared_features.shape[0], -1, 1, 1)
-        return self.net(shared_features + horizon_bias)
+        feat = shared_features + self.horizon_proj(horizon_ids).view(shared_features.shape[0], -1, 1, 1)
+
+        if state is not None:
+            state = state.to(device=shared_features.device, dtype=shared_features.dtype)
+            feat = feat + self.state_proj(state[..., :8]).view(shared_features.shape[0], -1, 1, 1)
+
+        if eef_heatmap is not None:
+            eef_heatmap = eef_heatmap.to(device=shared_features.device, dtype=shared_features.dtype)
+            if eef_heatmap.shape[-2:] != shared_features.shape[-2:]:
+                eef_heatmap = F.interpolate(
+                    eef_heatmap,
+                    size=shared_features.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            feat = feat + self.eef_map_proj(eef_heatmap)
+
+        return self.net(feat)
 
 
 class StaticResidualHead(nn.Module):
@@ -468,6 +496,8 @@ class GaussianDecoder(nn.Module):
         static_reference_params: dict | None = None,
         velocity_time_factor: float = 1.0,
         shared_state: dict[str, torch.Tensor | int] | None = None,
+        state: torch.Tensor | None = None,
+        eef_heatmap: torch.Tensor | None = None,
     ):
         """Decode latent tokens → Gaussian parameters."""
         return self._decode_independent(
@@ -482,6 +512,8 @@ class GaussianDecoder(nn.Module):
             static_reference_params=static_reference_params,
             velocity_time_factor=velocity_time_factor,
             shared_state=shared_state,
+            state=state,
+            eef_heatmap=eef_heatmap,
         )
 
     def decode_gaussian_prefix_template(
@@ -518,6 +550,8 @@ class GaussianDecoder(nn.Module):
         step: int | None,
         horizon_idx: int = 0,
         base_depth: torch.Tensor | None = None,
+        state: torch.Tensor | None = None,
+        eef_heatmap: torch.Tensor | None = None,
     ) -> dict:
         """Reuse the base Gaussian template and predict future dynamics via delta xyz only."""
         shared_features = shared_state["shared_features"]
@@ -527,7 +561,12 @@ class GaussianDecoder(nn.Module):
             raise ValueError("Velocity head is not initialized")
 
         B = shared_features.shape[0]
-        vel_map = self.velocity_head(shared_features, horizon_idx=horizon_idx)
+        vel_map = self.velocity_head(
+            shared_features,
+            horizon_idx=horizon_idx,
+            state=state,
+            eef_heatmap=eef_heatmap,
+        )
 
         xyz0 = static_reference_params["xyz"]
         Npts = xyz0.shape[1]
@@ -613,6 +652,8 @@ class GaussianDecoder(nn.Module):
         step: int | None,
         horizon_idx: int = 0,
         base_depth: torch.Tensor | None = None,
+        state: torch.Tensor | None = None,
+        eef_heatmap: torch.Tensor | None = None,
     ) -> dict:
         """Decode shared motion-query features into a constant-velocity dynamic Gaussian update."""
         return self._decode_velocity_from_static(
@@ -622,6 +663,8 @@ class GaussianDecoder(nn.Module):
             step,
             horizon_idx=horizon_idx,
             base_depth=base_depth,
+            state=state,
+            eef_heatmap=eef_heatmap,
         )
 
     def _decode_independent(
@@ -638,6 +681,8 @@ class GaussianDecoder(nn.Module):
         velocity_time_factor: float = 1.0,
         skip_horizon_embedding: bool = False,
         shared_state: dict[str, torch.Tensor | int] | None = None,
+        state: torch.Tensor | None = None,
+        eef_heatmap: torch.Tensor | None = None,
     ):
         """Decode VLM tokens into Gaussian parameters using the shared backbone state."""
         if shared_state is None:
@@ -658,6 +703,8 @@ class GaussianDecoder(nn.Module):
                 step,
                 horizon_idx=horizon_idx,
                 base_depth=base_depth,
+                state=state,
+                eef_heatmap=eef_heatmap,
             )
 
         gaussian_params = self._decode_static_from_shared(

@@ -20,7 +20,8 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
 BASE_PATH = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(BASE_PATH / "third_party" / "robosuite"))
+# Prefer the active environment's robosuite installation. Only inject third_party
+# LIBERO since this environment does not provide a pip-installed libero package.
 sys.path.insert(0, str(BASE_PATH / "third_party" / "libero"))
 
 from libero.libero import benchmark, get_libero_path  # noqa: E402

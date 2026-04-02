@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import flax.nnx as nnx
 import jax
@@ -30,6 +30,9 @@ class Pi0Config(_model.BaseModelConfig):
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
     pi05: bool = False
+    # Optional state normalization metadata for PyTorch-only conditioning paths.
+    state_norm_stats: Any | None = None
+    state_use_quantile_norm: bool | None = None
     # Whether to use 3D Gaussian Splatting Encoder as additional conditioning
     use_gaussian: bool = False
     # Whether to use single-frame mode for VGGT (only use current frame t, not t-2, t-1)

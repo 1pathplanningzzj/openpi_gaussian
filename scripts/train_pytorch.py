@@ -580,11 +580,15 @@ def train_loop(config: _config.TrainConfig):
             paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
             action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
             pi05=getattr(config.model, "pi05", False),
+            state_norm_stats=data_config.norm_stats.get("state") if data_config.norm_stats is not None else None,
+            state_use_quantile_norm=data_config.use_quantile_norm,
         )
     else:
         model_cfg = config.model
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+        object.__setattr__(model_cfg, "state_norm_stats", data_config.norm_stats.get("state") if data_config.norm_stats is not None else None)
+        object.__setattr__(model_cfg, "state_use_quantile_norm", data_config.use_quantile_norm)
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
