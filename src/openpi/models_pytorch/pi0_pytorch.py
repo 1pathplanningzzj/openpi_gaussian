@@ -516,28 +516,22 @@ class PI0Pytorch(nn.Module):
         freeze_static_head: bool = True,
     ):
         """Apply staged trainability for action/world-model branches."""
+        del freeze_velocity_head, freeze_static_head
         if stage == 1:
-            # Stage 1: only train static head (geometry + depth), freeze dynamics and action.
+            # Stage 1: train the full world model, freeze action.
             self.freeze_action_expert()
             self.unfreeze_shared_backbone()
             self.unfreeze_static_head()
-            self.freeze_velocity_head()
-        elif stage == 2:
-            # Stage 2: only train dynamics heads (velocity + residual), freeze static and action.
-            self.freeze_action_expert()
-            self.unfreeze_shared_backbone()
-            self.freeze_static_head()
             self.unfreeze_velocity_head()
-        elif stage == 3:
-            # Stage 3: freeze world model, only train action expert.
-            self.freeze_shared_backbone()
-            self.freeze_static_head()
-            self.freeze_velocity_head()
+        elif stage == 2:
+            # Stage 2: keep training the world model and enable action.
+            self.unfreeze_shared_backbone()
+            self.unfreeze_static_head()
+            self.unfreeze_velocity_head()
             self.unfreeze_action_expert()
         else:
             raise ValueError(f"Unsupported stage: {stage}")
 
-        self.set_render_loss_weight(render_weight)
 
     def get_stage_trainability_summary(self) -> dict[str, bool]:
         """Return whether key training groups currently require gradients."""
@@ -559,7 +553,7 @@ class PI0Pytorch(nn.Module):
             return [self.state_proj, self.action_time_mlp_in, self.action_time_mlp_out]
 
     def freeze_action_expert(self):
-        """Freeze action expert and related projections for Stage 1 (render+depth only)."""
+        """Freeze action expert and related projections during world-only training."""
         for param in self.paligemma_with_expert.gemma_expert.parameters():
             param.requires_grad = False
         for module in [self.action_in_proj, self.action_out_proj] + self._get_action_mlp_modules():
@@ -569,7 +563,7 @@ class PI0Pytorch(nn.Module):
         logging.info("Froze Action Expert + projections, disabled action loss")
 
     def unfreeze_action_expert(self):
-        """Unfreeze action expert for Stage 2 (joint training)."""
+        """Unfreeze action expert for joint world+action training."""
         for param in self.paligemma_with_expert.gemma_expert.parameters():
             param.requires_grad = True
         for module in [self.action_in_proj, self.action_out_proj] + self._get_action_mlp_modules():
@@ -582,10 +576,6 @@ class PI0Pytorch(nn.Module):
         """Dynamically set render loss weight for stage-based training."""
         self.render_loss_weight = weight
         logging.info(f"Set render_loss_weight = {weight}")
-
-    def is_gradient_checkpointing_enabled(self):
-        """Check if gradient checkpointing is enabled."""
-        return self.gradient_checkpointing_enabled
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -1570,13 +1560,6 @@ class PI0Pytorch(nn.Module):
                     preprocessed_observation, current_obs_steps - 1
                 )
 
-            cond_state, eef_heatmap = self._get_velocity_condition_inputs(
-                getattr(current_condition_observation, "state", None),
-                camera_params_for_decode,
-                decoder_state,
-                step=step,
-            )
-
             gaussian_params = self.world_model.decode(
                 z_next.float(),
                 future_observation=future_target,
@@ -1589,8 +1572,6 @@ class PI0Pytorch(nn.Module):
                 static_reference_params=static_gaussian_params,
                 velocity_time_factor=velocity_time_factor,
                 shared_state=decoder_state,
-                state=cond_state,
-                eef_heatmap=eef_heatmap,
             )
 
             return self._compute_gaussian_supervision_loss(
@@ -2038,144 +2019,6 @@ class PI0Pytorch(nn.Module):
         }
     
 
-    def _denormalize_state_for_velocity(self, state: torch.Tensor | None) -> torch.Tensor | None:
-        """Recover metric state values for velocity conditioning from normalized observation state."""
-        if state is None:
-            return None
-        if state.ndim != 2:
-            return state
-        if self.state_norm_stats is None:
-            return state
-
-        state_out = state.detach().clone().to(dtype=torch.float32)
-
-        if self.state_use_quantile_norm:
-            q01 = getattr(self.state_norm_stats, "q01", None)
-            q99 = getattr(self.state_norm_stats, "q99", None)
-            if q01 is None or q99 is None:
-                return state_out
-            q01_t = torch.as_tensor(q01, device=state_out.device, dtype=state_out.dtype)
-            q99_t = torch.as_tensor(q99, device=state_out.device, dtype=state_out.dtype)
-            dim = min(q01_t.shape[-1], state_out.shape[-1])
-            state_out[..., :dim] = (state_out[..., :dim] + 1.0) / 2.0 * (q99_t[..., :dim] - q01_t[..., :dim] + 1e-6) + q01_t[..., :dim]
-            return state_out
-
-        mean = getattr(self.state_norm_stats, "mean", None)
-        std = getattr(self.state_norm_stats, "std", None)
-        if mean is None or std is None:
-            return state_out
-        mean_t = torch.as_tensor(mean, device=state_out.device, dtype=state_out.dtype)
-        std_t = torch.as_tensor(std, device=state_out.device, dtype=state_out.dtype)
-        dim = min(mean_t.shape[-1], state_out.shape[-1])
-        state_out[..., :dim] = state_out[..., :dim] * (std_t[..., :dim] + 1e-6) + mean_t[..., :dim]
-        return state_out
-
-
-    def _build_eef_heatmap(
-        self,
-        eef_pos: torch.Tensor | None,
-        height: int,
-        width: int,
-        camera_params: dict | None,
-        *,
-        debug_state: torch.Tensor | None = None,
-        denorm_state: torch.Tensor | None = None,
-        step: int | None = None,
-    ) -> torch.Tensor | None:
-        """Project an aligned EEF position into a soft spatial prior heatmap."""
-        if eef_pos is None or eef_pos.ndim != 2 or eef_pos.shape[-1] < 3:
-            return None
-        if camera_params is None:
-            return None
-
-        fx = float(camera_params["fx"])
-        fy = float(camera_params["fy"])
-        cx = float(camera_params["cx"])
-        cy = float(camera_params["cy"])
-        depth_h = float(camera_params["cy"] * 2.0)
-        depth_w = float(camera_params["cx"] * 2.0)
-
-        eef_pos = eef_pos[:, :3].to(dtype=torch.float32)
-        x, y, z = eef_pos.unbind(dim=-1)
-        finite_mask = torch.isfinite(eef_pos).all(dim=-1)
-        valid_z = z > 1e-6
-        valid = finite_mask & valid_z
-
-        u = torch.zeros_like(z)
-        v = torch.zeros_like(z)
-        u[valid] = fx * x[valid] / z[valid] + cx
-        v[valid] = fy * y[valid] / z[valid] + cy
-
-        x_feat = ((u + 0.5) / depth_w) * width - 0.5
-        y_feat = ((v + 0.5) / depth_h) * height - 0.5
-        in_bounds = (x_feat >= 0.0) & (x_feat <= width - 1) & (y_feat >= 0.0) & (y_feat <= height - 1)
-        valid = valid & in_bounds
-
-        yy = torch.arange(height, device=eef_pos.device, dtype=torch.float32).view(1, height, 1)
-        xx = torch.arange(width, device=eef_pos.device, dtype=torch.float32).view(1, 1, width)
-        sigma = max(1.0, 0.06 * float(max(height, width)))
-        dist2 = (xx - x_feat.view(-1, 1, 1)) ** 2 + (yy - y_feat.view(-1, 1, 1)) ** 2
-        heatmap = torch.exp(-0.5 * dist2 / (sigma ** 2))
-        heatmap = heatmap * valid.view(-1, 1, 1).to(dtype=torch.float32)
-
-        should_log = step is not None and step % 400 == 0
-        if should_log and eef_pos.shape[0] > 0:
-            state_xyz = None
-            denorm_state_xyz = None
-            if debug_state is not None and debug_state.ndim == 2 and debug_state.shape[-1] >= 3:
-                state_xyz = debug_state[0, :3].detach().float().cpu().tolist()
-            if denorm_state is not None and denorm_state.ndim == 2 and denorm_state.shape[-1] >= 3:
-                denorm_state_xyz = denorm_state[0, :3].detach().float().cpu().tolist()
-            heatmap_peak = heatmap[0]
-            peak_flat = int(heatmap_peak.reshape(-1).argmax().item())
-            peak_y, peak_x = divmod(peak_flat, width)
-            logging.info(
-                "Step %s: Velocity Heatmap Debug | state[:3]=%s, denorm_state[:3]=%s, "
-                "eef_pos[:3]=%s, projected_uv=(%.2f, %.2f), feature_uv=(%.2f, %.2f), "
-                "heatmap_center=(%d, %d), out_of_bounds=%s, valid_z=%s",
-                step,
-                state_xyz,
-                denorm_state_xyz,
-                eef_pos[0].detach().float().cpu().tolist(),
-                u[0].item(),
-                v[0].item(),
-                x_feat[0].item(),
-                y_feat[0].item(),
-                peak_x,
-                peak_y,
-                bool((~in_bounds)[0].item()),
-                bool(valid_z[0].item()),
-            )
-        return heatmap.unsqueeze(1)
-
-    def _get_velocity_condition_inputs(
-        self,
-        state: torch.Tensor | None,
-        camera_params: dict | None,
-        shared_state: dict | None,
-        raw_state: torch.Tensor | None = None,
-        step: int | None = None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Prepare optional robot-state conditioning for the velocity branch."""
-        del raw_state
-        cond_state = self._denormalize_state_for_velocity(state)
-        if cond_state is None:
-            return None, None
-        cond_state = cond_state if cond_state.ndim == 2 else None
-        shared_features = shared_state.get("shared_features") if shared_state is not None else None
-        if cond_state is None or not torch.is_tensor(shared_features):
-            return cond_state, None
-        eef_heatmap = self._build_eef_heatmap(
-            cond_state[:, :3],
-            shared_features.shape[-2],
-            shared_features.shape[-1],
-            camera_params,
-            debug_state=state,
-            denorm_state=cond_state,
-            step=step,
-        )
-        return cond_state, eef_heatmap
-
     def _compute_2d_maps_loss(self, pred_2d_maps, gt_2d_maps):
         """
         Compute loss between predicted and GT 2D maps from VGGT decoder.
@@ -2522,13 +2365,6 @@ class PI0Pytorch(nn.Module):
                     oh = self.future_prediction_offsets[horizon_idx]
                     vtf = float(oh) / float(o0) if o0 else 1.0
 
-                cond_state, eef_heatmap = self._get_velocity_condition_inputs(
-                    getattr(current_target, "state", None),
-                    camera_params_for_decode,
-                    decoder_state,
-                    step=step,
-                )
-
                 gaussian_params = self.world_model.decode(
                     z_future_pred_tokens.float(),
                     future_observation=future_target,
@@ -2541,8 +2377,6 @@ class PI0Pytorch(nn.Module):
                     static_reference_params=reused_template,
                     velocity_time_factor=vtf,
                     shared_state=decoder_state,
-                    state=cond_state,
-                    eef_heatmap=eef_heatmap,
                 )
                 if getattr(self, "use_velocity_future_gaussians", False) and horizon_idx == 0 and viz_static_template is None:
                     viz_static_template = {

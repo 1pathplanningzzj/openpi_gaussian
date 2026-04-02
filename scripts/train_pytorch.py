@@ -414,21 +414,15 @@ def _stage_lr_scales(config: _config.TrainConfig, stage: int) -> dict[str, float
             "default": 1.0,
             "wm_shared_backbone": 1.0,
             "wm_static_head": 1.0,
-            "wm_velocity_head": 0.0,
+            "wm_velocity_head": 1.0,
         }
     if stage == 2:
+        world_lr_scale = float(getattr(config, "stage2_shared_backbone_lr_scale", 1.0))
         return {
             "default": 1.0,
-            "wm_shared_backbone": float(getattr(config, "stage2_shared_backbone_lr_scale", 1.0)),
-            "wm_static_head": 0.0,
-            "wm_velocity_head": 1.0,
-        }
-    if stage == 3:
-        return {
-            "default": 1.0,
-            "wm_shared_backbone": 1.0,
-            "wm_static_head": 1.0,
-            "wm_velocity_head": 1.0,
+            "wm_shared_backbone": world_lr_scale,
+            "wm_static_head": world_lr_scale,
+            "wm_velocity_head": world_lr_scale,
         }
     raise ValueError(f"Unsupported stage: {stage}")
 

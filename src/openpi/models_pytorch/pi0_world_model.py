@@ -164,80 +164,87 @@ class StaticGaussianHead(nn.Module):
 
 
 class VelocityGaussianHead(nn.Module):
-    """Decode shared features into horizon-conditioned xyz velocity maps."""
+    """Decode shared features into horizon-conditioned xyz velocity maps with a cross-attention decoder."""
 
-    def __init__(self, future_prediction_horizon: int):
+    def __init__(
+        self,
+        future_prediction_horizon: int,
+        model_dim: int = 128,
+        memory_grid_size: int = 32,
+        num_motion_queries: int = 8,
+    ):
         super().__init__()
-        self.horizon_proj = nn.Embedding(max(1, int(future_prediction_horizon)), 128)
-        self.state_proj = nn.Sequential(
-            nn.Linear(8, 128),
-            nn.GELU(),
-            nn.Linear(128, 128),
+        self.model_dim = model_dim
+        self.memory_grid_size = max(4, int(memory_grid_size))
+        self.num_motion_queries = max(1, int(num_motion_queries))
+        self.horizon_proj = nn.Embedding(max(1, int(future_prediction_horizon)), model_dim)
+        self.motion_queries = nn.Embedding(self.num_motion_queries, model_dim)
+        self.input_proj = nn.Conv2d(128, model_dim, kernel_size=1)
+        self.pos_proj = nn.Conv2d(2, model_dim, kernel_size=1)
+        self.query_norm = nn.LayerNorm(model_dim)
+        self.memory_norm = nn.LayerNorm(model_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=model_dim,
+            num_heads=8,
+            dropout=0.0,
+            batch_first=True,
         )
-        self.eef_map_proj = nn.Conv2d(1, 128, kernel_size=1)
-        self.net = nn.Sequential(
-            nn.Conv2d(128, 128, 3, padding=1),
-            nn.GroupNorm(min(32, 128), 128),
+        self.query_mlp = nn.Sequential(
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, model_dim * 4),
             nn.GELU(),
-            nn.Conv2d(128, 3, 3, padding=1),
+            nn.Linear(model_dim * 4, model_dim),
         )
-        nn.init.xavier_uniform_(self.net[-1].weight, gain=0.01)
-        nn.init.zeros_(self.net[-1].bias)
+        self.fuse_proj = nn.Conv2d(model_dim * (1 + self.num_motion_queries), model_dim, kernel_size=1)
+        self.out_proj = nn.Sequential(
+            nn.Conv2d(model_dim, model_dim, 3, padding=1),
+            nn.GroupNorm(min(32, model_dim), model_dim),
+            nn.GELU(),
+            nn.Conv2d(model_dim, 3, 3, padding=1),
+        )
+        nn.init.xavier_uniform_(self.out_proj[-1].weight, gain=0.01)
+        nn.init.zeros_(self.out_proj[-1].bias)
+
+    def _positional_grid(self, batch_size: int, height: int, width: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        ys = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+        xs = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        pos = torch.stack([grid_y, grid_x], dim=0).unsqueeze(0)
+        return pos.expand(batch_size, -1, -1, -1)
 
     def forward(
         self,
         shared_features: torch.Tensor,
         horizon_idx: int,
-        state: torch.Tensor | None = None,
-        eef_heatmap: torch.Tensor | None = None,
     ) -> torch.Tensor:
         horizon_idx = max(0, min(int(horizon_idx), self.horizon_proj.num_embeddings - 1))
-        horizon_ids = torch.full(
-            (shared_features.shape[0],), horizon_idx, device=shared_features.device, dtype=torch.long
-        )
-        feat = shared_features + self.horizon_proj(horizon_ids).view(shared_features.shape[0], -1, 1, 1)
+        batch_size, _, height, width = shared_features.shape
+        feat = self.input_proj(shared_features)
+        feat = F.adaptive_avg_pool2d(feat, output_size=(self.memory_grid_size, self.memory_grid_size))
+        feat = feat + self.pos_proj(self._positional_grid(batch_size, feat.shape[-2], feat.shape[-1], feat.device, feat.dtype))
 
-        if state is not None:
-            state = state.to(device=shared_features.device, dtype=shared_features.dtype)
-            feat = feat + self.state_proj(state[..., :8]).view(shared_features.shape[0], -1, 1, 1)
+        memory = feat.flatten(2).transpose(1, 2)
+        memory = self.memory_norm(memory)
 
-        if eef_heatmap is not None:
-            eef_heatmap = eef_heatmap.to(device=shared_features.device, dtype=shared_features.dtype)
-            if eef_heatmap.shape[-2:] != shared_features.shape[-2:]:
-                eef_heatmap = F.interpolate(
-                    eef_heatmap,
-                    size=shared_features.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            feat = feat + self.eef_map_proj(eef_heatmap)
+        horizon_ids = torch.full((batch_size,), horizon_idx, device=shared_features.device, dtype=torch.long)
+        horizon_query = self.horizon_proj(horizon_ids).unsqueeze(1)
+        learned_queries = self.motion_queries.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        query = learned_queries + horizon_query
+        query = self.query_norm(query)
+        attn_out, _ = self.cross_attn(query, memory, memory, need_weights=False)
+        query = query + attn_out
+        query = query + self.query_mlp(query)
 
-        return self.net(feat)
+        query_map = query.transpose(1, 2).reshape(batch_size, self.model_dim * self.num_motion_queries, 1, 1)
+        query_map = query_map.expand(-1, -1, feat.shape[-2], feat.shape[-1])
+        fused = torch.cat([feat, query_map], dim=1)
+        fused = self.fuse_proj(fused)
 
+        vel_map = self.out_proj(fused)
+        if vel_map.shape[-2:] != (height, width):
+            vel_map = F.interpolate(vel_map, size=(height, width), mode="bilinear", align_corners=False)
+        return vel_map
 
-class StaticResidualHead(nn.Module):
-    """Decode shared features into residuals for static Gaussian params (scale, opacity, SH)."""
-
-    def __init__(self, future_prediction_horizon: int):
-        super().__init__()
-        self.horizon_proj = nn.Embedding(max(1, int(future_prediction_horizon)), 128)
-        # Output channels: 3 (scale) + 1 (opacity) + 9 (SH) = 13
-        self.net = nn.Sequential(
-            nn.Conv2d(128, 128, 3, padding=1),
-            nn.GroupNorm(min(32, 128), 128),
-            nn.GELU(),
-            nn.Conv2d(128, 13, 3, padding=1),
-        )
-        nn.init.xavier_uniform_(self.net[-1].weight, gain=0.01)
-        nn.init.zeros_(self.net[-1].bias)
-
-    def forward(self, shared_features: torch.Tensor, horizon_idx: int) -> torch.Tensor:
-        horizon_idx = max(0, min(int(horizon_idx), self.horizon_proj.num_embeddings - 1))
-        horizon_ids = torch.full(
-            (shared_features.shape[0],), horizon_idx, device=shared_features.device, dtype=torch.long
-        )
-        horizon_bias = self.horizon_proj(horizon_ids).view(shared_features.shape[0], -1, 1, 1)
-        return self.net(shared_features + horizon_bias)
 
 class GaussianDecoder(nn.Module):
     """
@@ -294,10 +301,8 @@ class GaussianDecoder(nn.Module):
 
         if use_velocity_future_gaussians:
             self.velocity_head = VelocityGaussianHead(self.future_prediction_horizon)
-            self.static_residual_head = StaticResidualHead(self.future_prediction_horizon)
         else:
             self.velocity_head = None
-            self.static_residual_head = None
 
     def _normalize_tokens_to_canonical_grid(self, z: torch.Tensor) -> torch.Tensor:
         """Normalize 256/768/1024-token inputs onto the canonical future-token grid."""
@@ -496,8 +501,6 @@ class GaussianDecoder(nn.Module):
         static_reference_params: dict | None = None,
         velocity_time_factor: float = 1.0,
         shared_state: dict[str, torch.Tensor | int] | None = None,
-        state: torch.Tensor | None = None,
-        eef_heatmap: torch.Tensor | None = None,
     ):
         """Decode latent tokens → Gaussian parameters."""
         return self._decode_independent(
@@ -512,8 +515,6 @@ class GaussianDecoder(nn.Module):
             static_reference_params=static_reference_params,
             velocity_time_factor=velocity_time_factor,
             shared_state=shared_state,
-            state=state,
-            eef_heatmap=eef_heatmap,
         )
 
     def decode_gaussian_prefix_template(
@@ -550,8 +551,6 @@ class GaussianDecoder(nn.Module):
         step: int | None,
         horizon_idx: int = 0,
         base_depth: torch.Tensor | None = None,
-        state: torch.Tensor | None = None,
-        eef_heatmap: torch.Tensor | None = None,
     ) -> dict:
         """Reuse the base Gaussian template and predict future dynamics via delta xyz only."""
         shared_features = shared_state["shared_features"]
@@ -564,8 +563,6 @@ class GaussianDecoder(nn.Module):
         vel_map = self.velocity_head(
             shared_features,
             horizon_idx=horizon_idx,
-            state=state,
-            eef_heatmap=eef_heatmap,
         )
 
         xyz0 = static_reference_params["xyz"]
@@ -600,25 +597,6 @@ class GaussianDecoder(nn.Module):
         sh = static_reference_params["sh"]
         rotations = static_reference_params["rotations"]
 
-        # Optional horizon-conditioned static residuals for future frames
-        if getattr(self, "static_residual_head", None) is not None:
-            res_map = self.static_residual_head(shared_features, horizon_idx=horizon_idx)
-            res_up = F.interpolate(res_map, size=(H, W), mode="bilinear", align_corners=False)
-            res_flat = res_up.permute(0, 2, 3, 1).reshape(B, Npts, -1)
-            delta_scale_raw, delta_opacity_raw, delta_sh_raw = torch.split(res_flat, [3, 1, 9], dim=-1)
-
-            # Scale: log-space residual, keep within reasonable bounds
-            scale_log = torch.log(scales.clamp(min=1e-7, max=10.0))
-            scales = torch.exp(scale_log + 0.1 * delta_scale_raw).clamp(min=1e-7, max=10.0)
-
-            # Opacity: residual in logit space
-            opacity_logits = torch.logit(opacity.clamp(1e-4, 1.0 - 1e-4))
-            opacity = torch.sigmoid(opacity_logits + 0.1 * delta_opacity_raw)
-
-            # SH: small additive residual with SH magnitude mask
-            sh_mask = self.static_head.sh_mask.view(1, 1, -1)
-            sh = sh + 0.1 * delta_sh_raw * sh_mask
-
         if step is not None and step % 400 == 0:
             import logging
 
@@ -652,8 +630,6 @@ class GaussianDecoder(nn.Module):
         step: int | None,
         horizon_idx: int = 0,
         base_depth: torch.Tensor | None = None,
-        state: torch.Tensor | None = None,
-        eef_heatmap: torch.Tensor | None = None,
     ) -> dict:
         """Decode shared motion-query features into a constant-velocity dynamic Gaussian update."""
         return self._decode_velocity_from_static(
@@ -663,8 +639,6 @@ class GaussianDecoder(nn.Module):
             step,
             horizon_idx=horizon_idx,
             base_depth=base_depth,
-            state=state,
-            eef_heatmap=eef_heatmap,
         )
 
     def _decode_independent(
@@ -681,8 +655,6 @@ class GaussianDecoder(nn.Module):
         velocity_time_factor: float = 1.0,
         skip_horizon_embedding: bool = False,
         shared_state: dict[str, torch.Tensor | int] | None = None,
-        state: torch.Tensor | None = None,
-        eef_heatmap: torch.Tensor | None = None,
     ):
         """Decode VLM tokens into Gaussian parameters using the shared backbone state."""
         if shared_state is None:
@@ -703,8 +675,6 @@ class GaussianDecoder(nn.Module):
                 step,
                 horizon_idx=horizon_idx,
                 base_depth=base_depth,
-                state=state,
-                eef_heatmap=eef_heatmap,
             )
 
         gaussian_params = self._decode_static_from_shared(

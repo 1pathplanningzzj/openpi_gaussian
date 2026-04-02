@@ -597,13 +597,14 @@ class TrainConfig:
     # Staged training:
     # - Stage 1: [0, stage1_steps) static-focused world-model training
     #   (action frozen, shared_backbone/static_head train, velocity_head optionally frozen,
+    # Stage schedule:
+    # - Stage 1: [0, stage1_steps) world-model-only training
+    #   (action frozen, shared_backbone/static_head/velocity_head train,
     #    render weight = stage1_render_weight)
-    # - Stage 2: [stage1_steps, stage2_steps) velocity-focused world-model training
-    #   (action frozen, shared_backbone trains at scaled LR, static_head optionally frozen,
-    #    velocity_head trains at normal LR, render weight = stage2_render_weight)
-    # - Stage 3: [stage2_steps, end) joint/action training
-    #   (action enabled, world-model fully trainable, render weight = stage3_render_weight)
-    # If stage2_steps <= stage1_steps, the schedule falls back to the legacy two-stage setup.
+    # - Stage 2: [stage1_steps, stage2_steps) world-model + action training
+    #   (action enabled, world-model stays trainable, optional world LR scaling via
+    #    stage2_shared_backbone_lr_scale, render weight = stage2_render_weight)
+    # - After stage2_steps: keep Stage 2 behavior with stage3_render_weight.
     stage1_steps: int = 0
     stage2_steps: int = 0
     stage1_render_weight: float = 0.0
@@ -884,9 +885,9 @@ _CONFIGS = [
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
         save_interval=3000,  # Changed from default 1000 to 3000
-        stage1_steps=5_000,  # Stage 1: static-focused world-model training, 0-5000
-        stage2_steps=10_000,  # Stage 2: velocity-focused world-model training, 5000-10000
-        stage1_render_weight=0.2,  # Keep render on from step 0 during static-focused stage
+        stage1_steps=5_000,  # Stage 1: world-only training, 0-5000
+        stage2_steps=10_000,  # Stage 2: add action training after 5000
+        stage1_render_weight=0.2,  # Keep render on from step 0 during world-only stage
         stage2_render_weight=0.1,
         stage3_render_weight=0.0,
         stage2_shared_backbone_lr_scale=0.25,
