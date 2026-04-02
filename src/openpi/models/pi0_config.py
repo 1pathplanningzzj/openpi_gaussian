@@ -75,6 +75,14 @@ class Pi0Config(_model.BaseModelConfig):
     use_velocity_future_gaussians: bool = False
     # Scale for camera-space displacement from predicted velocity (meters-scale heuristic).
     velocity_world_model_scale: float = 1.0
+    # Slot-rigid future motion options.
+    num_motion_slots: int = 8
+    slot_assignment_temperature: float = 1.0
+    slot_translation_scale: float | None = None
+    slot_rotation_scale: float = 1.0
+    slot_entropy_loss_weight: float = 0.0
+    slot_balance_loss_weight: float = 0.0
+    slot_transform_reg_weight: float = 0.0
     # Optional masked 3D flow supervision on raw_delta_xyz.
     flow_loss_weight: float = 0.0
     flow_first_horizon_only: bool = True

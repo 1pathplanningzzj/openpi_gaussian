@@ -181,6 +181,134 @@ def validate_camera_params(camera_params: Dict[str, torch.Tensor], batch_idx: in
     return is_valid, issues
 
 
+def _scale_intrinsics_to_target(
+    intrinsics: torch.Tensor,
+    target_hw: Tuple[int, int],
+) -> torch.Tensor:
+    """Scale camera intrinsics from their native resolution to target image size."""
+    target_h, target_w = target_hw
+    scaled = intrinsics.clone()
+    base_w = 2.0 * intrinsics[..., 0, 2].clamp_min(1e-6)
+    base_h = 2.0 * intrinsics[..., 1, 2].clamp_min(1e-6)
+    sx = float(target_w) / base_w
+    sy = float(target_h) / base_h
+    scaled[..., 0, 0] = scaled[..., 0, 0] * sx
+    scaled[..., 1, 1] = scaled[..., 1, 1] * sy
+    scaled[..., 0, 2] = scaled[..., 0, 2] * sx
+    scaled[..., 1, 2] = scaled[..., 1, 2] * sy
+    return scaled
+
+
+@torch.no_grad()
+def build_projected_velocity_map(
+    gaussian_params: Dict[str, torch.Tensor],
+    camera_params: Dict[str, torch.Tensor],
+    target_hw: Tuple[int, int],
+    znear: float = 0.01,
+) -> Optional[torch.Tensor]:
+    """Project Gaussian center motion into image space and splat pixel-speed magnitude."""
+    xyz_future = gaussian_params.get("xyz")
+    raw_delta_xyz = gaussian_params.get("raw_delta_xyz")
+    opacity = gaussian_params.get("opacity")
+    intrinsics = camera_params.get("intrinsics")
+    viewmatrix = camera_params.get("viewmatrix")
+
+    if xyz_future is None or raw_delta_xyz is None or opacity is None or intrinsics is None or viewmatrix is None:
+        return None
+    if xyz_future.ndim != 3 or raw_delta_xyz.ndim != 3 or opacity.ndim != 3:
+        return None
+    if xyz_future.shape != raw_delta_xyz.shape or xyz_future.shape[:2] != opacity.shape[:2]:
+        return None
+
+    bsize, _, coord_dim = xyz_future.shape
+    if coord_dim != 3:
+        return None
+
+    xyz_prev = xyz_future - raw_delta_xyz
+    intrinsics = _scale_intrinsics_to_target(intrinsics, target_hw).to(device=xyz_future.device, dtype=xyz_future.dtype)
+    viewmatrix = viewmatrix.to(device=xyz_future.device, dtype=xyz_future.dtype)
+    opacity = opacity.squeeze(-1).float().clamp_min(0.0)
+
+    def _project(points_xyz: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ones = torch.ones(*points_xyz.shape[:2], 1, device=points_xyz.device, dtype=points_xyz.dtype)
+        points_h = torch.cat([points_xyz, ones], dim=-1)
+        points_cam = torch.matmul(points_h, viewmatrix.transpose(-1, -2))
+        x_cam = points_cam[..., 0]
+        y_cam = points_cam[..., 1]
+        z_cam = points_cam[..., 2]
+        z_safe = z_cam.clamp_min(znear)
+        fx = intrinsics[..., 0, 0].unsqueeze(1)
+        fy = intrinsics[..., 1, 1].unsqueeze(1)
+        cx = intrinsics[..., 0, 2].unsqueeze(1)
+        cy = intrinsics[..., 1, 2].unsqueeze(1)
+        u = fx * (x_cam / z_safe) + cx
+        v = fy * (y_cam / z_safe) + cy
+        uv = torch.stack([u, v], dim=-1)
+        return uv, z_cam, torch.isfinite(uv).all(dim=-1)
+
+    uv_prev, z_prev, finite_prev = _project(xyz_prev)
+    uv_future, z_future, finite_future = _project(xyz_future)
+    delta_uv = uv_future - uv_prev
+    speed = delta_uv.norm(dim=-1).float()
+
+    target_h, target_w = target_hw
+    valid = (
+        finite_prev
+        & finite_future
+        & (z_prev > znear)
+        & (z_future > znear)
+        & torch.isfinite(speed)
+    )
+
+    u = uv_future[..., 0]
+    v = uv_future[..., 1]
+    valid = valid & (u >= 0.0) & (u <= target_w - 1) & (v >= 0.0) & (v <= target_h - 1)
+    if not valid.any():
+        return torch.zeros((bsize, target_h, target_w), device=xyz_future.device, dtype=torch.float32)
+
+    u0 = torch.floor(u)
+    v0 = torch.floor(v)
+    du = u - u0
+    dv = v - v0
+
+    maps = []
+    flat_size = target_h * target_w
+    for b in range(bsize):
+        accum = torch.zeros(flat_size, device=xyz_future.device, dtype=torch.float32)
+        weights = torch.zeros(flat_size, device=xyz_future.device, dtype=torch.float32)
+        mask_b = valid[b]
+        if mask_b.any():
+            speed_b = speed[b, mask_b]
+            opacity_b = opacity[b, mask_b]
+            x0 = u0[b, mask_b].long()
+            y0 = v0[b, mask_b].long()
+            frac_x = du[b, mask_b].float()
+            frac_y = dv[b, mask_b].float()
+
+            for dx, dy, w in (
+                (0, 0, (1.0 - frac_x) * (1.0 - frac_y)),
+                (1, 0, frac_x * (1.0 - frac_y)),
+                (0, 1, (1.0 - frac_x) * frac_y),
+                (1, 1, frac_x * frac_y),
+            ):
+                xx = x0 + dx
+                yy = y0 + dy
+                in_bounds = (xx >= 0) & (xx < target_w) & (yy >= 0) & (yy < target_h)
+                if not in_bounds.any():
+                    continue
+                ww = (w * opacity_b)[in_bounds]
+                idx = yy[in_bounds] * target_w + xx[in_bounds]
+                accum.scatter_add_(0, idx, speed_b[in_bounds] * ww)
+                weights.scatter_add_(0, idx, ww)
+
+        map_b = accum.view(target_h, target_w)
+        weight_b = weights.view(target_h, target_w)
+        map_b = torch.where(weight_b > 1e-8, map_b / weight_b, torch.zeros_like(map_b))
+        maps.append(map_b)
+
+    return torch.stack(maps, dim=0)
+
+
 class GaussianRenderer(nn.Module):
     """
     Wrapper for AD-FFgsStudio's GaussianRasterizer.
@@ -1039,7 +1167,7 @@ def visualize_future_rollout_comparison(
     pred_velocity_row = None
     if show_pred_velocity:
         pred_velocity_row = len(row_titles)
-        row_titles.append("Pred Speed |Δxyz|")
+        row_titles.append("Projected Speed |Δuv|")
 
     num_rows = len(row_titles)
     fig, axes = plt.subplots(num_rows, num_cols, figsize=(4 * num_cols, 3.6 * num_rows))

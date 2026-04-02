@@ -5,6 +5,7 @@ import logging
 import math
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch import nn
@@ -16,7 +17,12 @@ import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 from openpi.models_pytorch.pi0_vggt import GaussianAdapter
 from openpi.models_pytorch.pi0_world_model import GaussianDecoder
 # Import Gaussian Renderer
-from openpi.models_pytorch.gaussian_renderer import GaussianRenderer, compute_multi_view_rendering_loss
+from openpi.models_pytorch.gaussian_renderer import (
+    GaussianRenderer,
+    build_projected_velocity_map,
+    compute_multi_view_rendering_loss,
+    visualize_rendering_comparison,
+)
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -345,6 +351,12 @@ class PI0Pytorch(nn.Module):
                 future_prediction_horizon=self.future_prediction_horizon,
                 use_velocity_future_gaussians=_vel_g,
                 velocity_world_model_scale=float(getattr(config, "velocity_world_model_scale", 2.0)),
+                num_motion_slots=int(getattr(config, "num_motion_slots", 8)),
+                slot_assignment_temperature=float(getattr(config, "slot_assignment_temperature", 1.0)),
+                slot_translation_scale=float(
+                    getattr(config, "slot_translation_scale", getattr(config, "velocity_world_model_scale", 2.0))
+                ),
+                slot_rotation_scale=float(getattr(config, "slot_rotation_scale", 1.0)),
             )
 
             # Initialize Gaussian Renderer (sh_degree=1 for DC + 1st order SH)
@@ -392,6 +404,9 @@ class PI0Pytorch(nn.Module):
         else:
             self.flow_horizon_weights = None
         self.future_delta_reg_weight = getattr(config, "future_delta_reg_weight", 1e-4)
+        self.slot_entropy_loss_weight = float(getattr(config, "slot_entropy_loss_weight", 0.0))
+        self.slot_balance_loss_weight = float(getattr(config, "slot_balance_loss_weight", 0.0))
+        self.slot_transform_reg_weight = float(getattr(config, "slot_transform_reg_weight", 0.0))
         self.future_motion_loss_gain = float(getattr(config, "future_motion_loss_gain", 2.0))
         self.future_motion_rgb_threshold = float(getattr(config, "future_motion_rgb_threshold", 0.03))
         self.future_motion_depth_threshold = float(getattr(config, "future_motion_depth_threshold", 0.01))
@@ -1274,6 +1289,16 @@ class PI0Pytorch(nn.Module):
         depth_map = gaussian_params.pop("depth_map", None)
         gaussian_params.pop("depth_delta_map", None)
         raw_delta_xyz = gaussian_params.pop("raw_delta_xyz", None)
+        slot_entropy = gaussian_params.pop("slot_entropy", None)
+        slot_balance_loss = gaussian_params.pop("slot_balance_loss", None)
+        slot_trans_reg = gaussian_params.pop("slot_trans_reg", None)
+        slot_rot_reg = gaussian_params.pop("slot_rot_reg", None)
+        slot_usage = gaussian_params.pop("slot_usage", None)
+        gaussian_params.pop("slot_probs", None)
+        gaussian_params.pop("slot_logits", None)
+        gaussian_params.pop("slot_trans", None)
+        gaussian_params.pop("slot_rot_6d", None)
+        gaussian_params.pop("slot_pivots", None)
 
         if step is not None and step % 400 == 0:
             raw_delta_abs_mean = float("nan")
@@ -1285,6 +1310,16 @@ class PI0Pytorch(nn.Module):
                 f"has_depth_attr={hasattr(target_observation, 'depth')}, "
                 f"depth_value={target_observation.depth is not None if hasattr(target_observation, 'depth') else 'N/A'}"
             )
+            if slot_usage is not None:
+                slot_usage_str = ", ".join(f"{value:.4f}" for value in slot_usage.float().mean(dim=0).detach().cpu().tolist())
+                logging.info(
+                    f"Step {step}{time_suffix}: Slot Motion Diagnostics | "
+                    f"entropy={slot_entropy.item() if slot_entropy is not None else float('nan'):.6f}, "
+                    f"balance={slot_balance_loss.item() if slot_balance_loss is not None else float('nan'):.6f}, "
+                    f"trans_reg={slot_trans_reg.item() if slot_trans_reg is not None else float('nan'):.6f}, "
+                    f"rot_reg={slot_rot_reg.item() if slot_rot_reg is not None else float('nan'):.6f}, "
+                    f"usage=[{slot_usage_str}]"
+                )
 
         if enable_depth_supervision and depth_map is not None and hasattr(target_observation, "depth") and target_observation.depth is not None:
             gt_depth = target_observation.depth
@@ -1311,6 +1346,16 @@ class PI0Pytorch(nn.Module):
             )
             if torch.isfinite(flow_loss):
                 total_loss = total_loss + self.flow_loss_weight * flow_loss
+
+        if slot_entropy is not None and torch.isfinite(slot_entropy) and self.slot_entropy_loss_weight > 0.0:
+            total_loss = total_loss + self.slot_entropy_loss_weight * slot_entropy.to(total_loss.dtype)
+        if slot_balance_loss is not None and torch.isfinite(slot_balance_loss) and self.slot_balance_loss_weight > 0.0:
+            total_loss = total_loss + self.slot_balance_loss_weight * slot_balance_loss.to(total_loss.dtype)
+        if self.slot_transform_reg_weight > 0.0:
+            if slot_trans_reg is not None and torch.isfinite(slot_trans_reg):
+                total_loss = total_loss + self.slot_transform_reg_weight * slot_trans_reg.to(total_loss.dtype)
+            if slot_rot_reg is not None and torch.isfinite(slot_rot_reg):
+                total_loss = total_loss + self.slot_transform_reg_weight * slot_rot_reg.to(total_loss.dtype)
 
         for key, value in gaussian_params.items():
             if torch.is_tensor(value) and (torch.isnan(value).any() or torch.isinf(value).any()):
@@ -2203,8 +2248,6 @@ class PI0Pytorch(nn.Module):
     def _visualize_rendering_comparison(self, step, gaussian_params, target_obs, cam_params_dict, view_names, time_suffix="", temporal_frames=None, temporal_labels=None, future_label="future"):
         """Helper to visualize Rendered vs GT images. Delegated to GaussianRenderer."""
         # Cleanly moved to gaussian_renderer.py
-        from openpi.models_pytorch.gaussian_renderer import visualize_rendering_comparison
-
         visualize_rendering_comparison(
             step,
             gaussian_params,
@@ -2419,7 +2462,13 @@ class PI0Pytorch(nn.Module):
                     for render_view in render_views:
                         view_key = f"{render_view}_image"
                         target_hw = target_obs[view_key].shape[-2:]
-                        pred_velocity_map = self._build_future_velocity_heatmap(raw_delta_xyz, target_hw)
+                        pred_velocity_map = build_projected_velocity_map(
+                            gaussian_params,
+                            cam_params_dict[render_view],
+                            target_hw,
+                        )
+                        if pred_velocity_map is None:
+                            pred_velocity_map = self._build_future_velocity_heatmap(raw_delta_xyz, target_hw)
                         if pred_velocity_map is not None:
                             pred_velocity_entry[view_key] = pred_velocity_map[:1].float()
                 pred_velocity_seq.append(pred_velocity_entry)
