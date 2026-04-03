@@ -69,13 +69,13 @@ class Pi0Config(_model.BaseModelConfig):
     use_incremental_depth: bool = False
     # If True, the world model uses one shared future-token decoder backbone, then:
     # - decodes a current/base Gaussian template via a static head
-    # - predicts horizon-conditioned raw_delta_xyz via a velocity head
-    # Future rollouts reuse the same shared future-token features and detached static template,
-    # scaling motion by velocity_world_model_scale * (offset[h]/offset[0]).
+    # - predicts one shared per-Gaussian nu_xyz velocity field via a velocity head
+    # Future rollouts reuse the same detached static template and apply:
+    #   xyz_h = xyz_0 + nu_xyz * (offset[h] / offset[0])
     use_velocity_future_gaussians: bool = False
     # Scale for camera-space displacement from predicted velocity (meters-scale heuristic).
     velocity_world_model_scale: float = 1.0
-    # Slot-rigid future motion options.
+    # Legacy velocity-head knobs. slot_translation_scale is reused as nu_xyz magnitude scale.
     num_motion_slots: int = 8
     slot_assignment_temperature: float = 1.0
     slot_translation_scale: float | None = None

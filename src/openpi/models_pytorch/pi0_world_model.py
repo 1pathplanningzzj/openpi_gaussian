@@ -109,7 +109,7 @@ def quaternion_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
     return out / (out.norm(dim=-1, keepdim=True) + 1e-8)
 
 
-class _UpsampleBlock(nn.Module):
+class _UpsampleBlock(nn.Module): 
     """ConvTranspose upsample block with GroupNorm + GELU + residual."""
 
     def __init__(self, in_ch: int, out_ch: int):
@@ -265,124 +265,60 @@ class StaticGaussianHead(nn.Module):
 
 
 class VelocityGaussianHead(nn.Module):
-    """Decode shared features into horizon-conditioned slot-rigid motion parameters."""
+    """Decode shared features into a per-Gaussian shared velocity field."""
 
     def __init__(
         self,
         future_prediction_horizon: int,
         model_dim: int = 128,
-        memory_grid_size: int = 32,
-        num_motion_queries: int = 8,
-        slot_assignment_temperature: float = 1.0,
-        slot_translation_scale: float = 2.0,
-        slot_rotation_scale: float = 1.0,
+        velocity_scale: float = 1.0,
     ):
         super().__init__()
         self.model_dim = model_dim
-        self.memory_grid_size = max(4, int(memory_grid_size))
-        self.num_motion_queries = max(1, int(num_motion_queries))
-        self.slot_assignment_temperature = max(1e-4, float(slot_assignment_temperature))
-        self.slot_translation_scale = float(slot_translation_scale)
-        self.slot_rotation_scale = float(slot_rotation_scale)
+        self.velocity_scale = float(velocity_scale)
         self.horizon_proj = nn.Embedding(max(1, int(future_prediction_horizon)), model_dim)
-        self.motion_queries = nn.Embedding(self.num_motion_queries, model_dim)
-        self.input_proj = nn.Conv2d(128, model_dim, kernel_size=1)
-        self.pos_proj = nn.Conv2d(2, model_dim, kernel_size=1)
-        self.query_norm = nn.LayerNorm(model_dim)
-        self.memory_norm = nn.LayerNorm(model_dim)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=model_dim,
-            num_heads=8,
-            dropout=0.0,
-            batch_first=True,
-        )
-        self.query_mlp = nn.Sequential(
-            nn.LayerNorm(model_dim),
-            nn.Linear(model_dim, model_dim * 4),
+        self.input_proj = nn.Sequential(
+            nn.Conv2d(128, model_dim, kernel_size=3, padding=1, bias=True),
+            nn.GroupNorm(min(32, model_dim), model_dim),
             nn.GELU(),
-            nn.Linear(model_dim * 4, model_dim),
         )
-        self.slot_param_head = nn.Sequential(
-            nn.LayerNorm(model_dim),
-            nn.Linear(model_dim, model_dim * 2),
+        self.res_block = nn.Sequential(
+            nn.Conv2d(model_dim, model_dim, kernel_size=3, padding=1, bias=True),
+            nn.GroupNorm(min(32, model_dim), model_dim),
             nn.GELU(),
-            nn.Linear(model_dim * 2, 12),
+            nn.Conv2d(model_dim, model_dim, kernel_size=3, padding=1, bias=True),
+            nn.GroupNorm(min(32, model_dim), model_dim),
         )
-        self.spatial_proj = nn.Conv2d(model_dim, model_dim, kernel_size=1)
-        self.query_proj = nn.Linear(model_dim, model_dim)
-        self.query_bias = nn.Linear(model_dim, 1)
-        nn.init.xavier_uniform_(self.slot_param_head[-1].weight, gain=0.01)
-        nn.init.zeros_(self.slot_param_head[-1].bias)
-        nn.init.xavier_uniform_(self.spatial_proj.weight, gain=1.0)
-        nn.init.zeros_(self.spatial_proj.bias)
-        nn.init.xavier_uniform_(self.query_proj.weight, gain=1.0)
-        nn.init.zeros_(self.query_proj.bias)
-        nn.init.zeros_(self.query_bias.weight)
-        nn.init.zeros_(self.query_bias.bias)
-
-    def _positional_grid(self, batch_size: int, height: int, width: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        ys = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
-        xs = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        pos = torch.stack([grid_y, grid_x], dim=0).unsqueeze(0)
-        return pos.expand(batch_size, -1, -1, -1)
+        self.velocity_head = nn.Sequential(
+            nn.Conv2d(model_dim, model_dim, kernel_size=3, padding=1, bias=True),
+            nn.GroupNorm(min(32, model_dim), model_dim),
+            nn.GELU(),
+            nn.Conv2d(model_dim, 3, kernel_size=1, bias=True),
+        )
+        nn.init.xavier_uniform_(self.velocity_head[-1].weight, gain=0.01)
+        nn.init.zeros_(self.velocity_head[-1].bias)
 
     def forward(
         self,
         shared_features: torch.Tensor,
         horizon_idx: int,
     ) -> dict[str, torch.Tensor]:
-        horizon_idx = max(0, min(int(horizon_idx), self.horizon_proj.num_embeddings - 1))
         batch_size, _, height, width = shared_features.shape
         feat = self.input_proj(shared_features)
-        feat = F.adaptive_avg_pool2d(feat, output_size=(self.memory_grid_size, self.memory_grid_size))
-        feat = feat + self.pos_proj(self._positional_grid(batch_size, feat.shape[-2], feat.shape[-1], feat.device, feat.dtype))
-
-        memory = feat.flatten(2).transpose(1, 2)
-        memory = self.memory_norm(memory)
-
+        horizon_idx = max(0, min(int(horizon_idx), self.horizon_proj.num_embeddings - 1))
         horizon_ids = torch.full((batch_size,), horizon_idx, device=shared_features.device, dtype=torch.long)
-        horizon_query = self.horizon_proj(horizon_ids).unsqueeze(1)
-        learned_queries = self.motion_queries.weight.unsqueeze(0).expand(batch_size, -1, -1)
-        query = learned_queries + horizon_query
-        query = self.query_norm(query)
-        attn_out, _ = self.cross_attn(query, memory, memory, need_weights=False)
-        query = query + attn_out
-        query = query + self.query_mlp(query)
-
-        slot_params = self.slot_param_head(query)
-        slot_rot_6d = slot_params[..., :6] * self.slot_rotation_scale
-        slot_trans = torch.tanh(slot_params[..., 6:9]) * self.slot_translation_scale
-        slot_pivot_offset = torch.tanh(slot_params[..., 9:12]) * self.slot_translation_scale
-
-        spatial = self.spatial_proj(feat)
-        query_feat = self.query_proj(query)
-        slot_logits = torch.einsum("bkc,bchw->bkhw", query_feat, spatial)
-        slot_logits = slot_logits + self.query_bias(query).unsqueeze(-1)
-        if slot_logits.shape[-2:] != (height, width):
-            slot_logits = F.interpolate(slot_logits, size=(height, width), mode="bilinear", align_corners=False)
-
-        slot_probs = F.softmax(slot_logits / self.slot_assignment_temperature, dim=1)
-        slot_probs_flat = slot_probs.flatten(2).transpose(1, 2)
-
-        slot_entropy = -(slot_probs_flat * (slot_probs_flat.clamp_min(1e-8).log())).sum(dim=-1).mean()
-        slot_usage = slot_probs_flat.mean(dim=1)
-        balance_target = torch.full_like(slot_usage, 1.0 / self.num_motion_queries)
-        slot_balance_loss = F.mse_loss(slot_usage, balance_target)
-        slot_trans_reg = slot_trans.pow(2).mean()
-        slot_rot_reg = slot_rot_6d.pow(2).mean()
-
+        horizon_bias = self.horizon_proj(horizon_ids).view(batch_size, self.model_dim, 1, 1)
+        feat = feat + horizon_bias
+        feat = feat + self.res_block(feat)
+        nu_xyz_map = torch.tanh(self.velocity_head(feat)) * self.velocity_scale
+        velocity_reg = nu_xyz_map.pow(2).mean()
+        velocity_abs_mean = nu_xyz_map.abs().mean()
+        velocity_max = nu_xyz_map.abs().max()
         return {
-            "slot_logits": slot_logits,
-            "slot_probs": slot_probs_flat,
-            "slot_rot_6d": slot_rot_6d,
-            "slot_trans": slot_trans,
-            "slot_pivot_offset": slot_pivot_offset,
-            "slot_entropy": slot_entropy,
-            "slot_balance_loss": slot_balance_loss,
-            "slot_trans_reg": slot_trans_reg,
-            "slot_rot_reg": slot_rot_reg,
-            "slot_usage": slot_usage,
+            "nu_xyz_map": nu_xyz_map.reshape(batch_size, 3, height, width),
+            "velocity_reg": velocity_reg,
+            "velocity_abs_mean": velocity_abs_mean,
+            "velocity_max": velocity_max,
         }
 
 
@@ -393,7 +329,7 @@ class GaussianDecoder(nn.Module):
     The shared token block is normalized onto the canonical future-token grid once,
     passed through one shared spatial backbone, then split into two heads:
     - static head: predicts current/base Gaussian parameters + absolute depth
-    - velocity head: predicts horizon-conditioned raw_delta_xyz rollout updates
+    - velocity head: predicts a shared per-Gaussian nu_xyz velocity field
 
     Future rollouts reuse the detached static template for scale / opacity / SH /
     rotation while applying horizon-scaled xyz motion from the velocity head.
@@ -450,10 +386,7 @@ class GaussianDecoder(nn.Module):
         if use_velocity_future_gaussians:
             self.velocity_head = VelocityGaussianHead(
                 self.future_prediction_horizon,
-                num_motion_queries=self.num_motion_slots,
-                slot_assignment_temperature=self.slot_assignment_temperature,
-                slot_translation_scale=self.slot_translation_scale,
-                slot_rotation_scale=self.slot_rotation_scale,
+                velocity_scale=self.slot_translation_scale,
             )
         else:
             self.velocity_head = None
@@ -705,8 +638,9 @@ class GaussianDecoder(nn.Module):
         step: int | None,
         horizon_idx: int = 0,
         base_depth: torch.Tensor | None = None,
+        current_observation=None,
     ) -> dict:
-        """Reuse the base Gaussian template and predict future dynamics via slot-rigid motion."""
+        """Reuse the base Gaussian template and predict future dynamics via a shared nu_xyz field."""
         shared_features = shared_state["shared_features"]
         assert isinstance(shared_features, torch.Tensor)
 
@@ -724,21 +658,27 @@ class GaussianDecoder(nn.Module):
         if H * W != Npts:
             raise ValueError(f"static xyz N={Npts} is not a square grid")
 
-        slot_probs = motion_outputs["slot_probs"].to(dtype=xyz0.dtype)
-        slot_rot_6d = motion_outputs["slot_rot_6d"].to(dtype=xyz0.dtype)
-        slot_trans = motion_outputs["slot_trans"].to(dtype=xyz0.dtype) * float(velocity_time_factor)
-        slot_pivot_offset = motion_outputs["slot_pivot_offset"].to(dtype=xyz0.dtype)
-        slot_usage = slot_probs.mean(dim=1)
-        slot_weight_sum = slot_probs.sum(dim=1)
-        slot_centers = torch.einsum("bnk,bnc->bkc", slot_probs, xyz0)
-        slot_centers = slot_centers / slot_weight_sum.unsqueeze(-1).clamp_min(1e-6)
-        slot_pivots = slot_centers + slot_pivot_offset
-
-        rot_mats = rotation_6d_to_matrix(slot_rot_6d.reshape(-1, 6)).reshape(B, self.num_motion_slots, 3, 3)
-        xyz_rel = xyz0.unsqueeze(2) - slot_pivots.unsqueeze(1)
-        xyz_slots = torch.einsum("bkdc,bnkc->bnkd", rot_mats, xyz_rel) + slot_pivots.unsqueeze(1) + slot_trans.unsqueeze(1)
-        xyz = (slot_probs.unsqueeze(-1) * xyz_slots).sum(dim=2)
-        raw_delta = xyz - xyz0
+        nu_xyz_map = motion_outputs["nu_xyz_map"].to(dtype=xyz0.dtype)
+        motion_gate = None
+        future_motion_prior = getattr(current_observation, "future_motion_prior", None)
+        if isinstance(future_motion_prior, dict):
+            motion_prior = future_motion_prior.get("agent_image")
+            if motion_prior is not None:
+                if motion_prior.ndim == 3:
+                    motion_prior = motion_prior.unsqueeze(1)
+                motion_prior = F.interpolate(
+                    motion_prior.to(device=nu_xyz_map.device, dtype=nu_xyz_map.dtype),
+                    size=nu_xyz_map.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).clamp_(0.0, 1.0)
+                gate_floor = 0.1
+                motion_gate = gate_floor + (1.0 - gate_floor) * motion_prior
+                nu_xyz_map = nu_xyz_map * motion_gate
+        nu_xyz = nu_xyz_map.permute(0, 2, 3, 1).reshape(B, Npts, 3)
+        nu_xyz = torch.where(torch.isnan(nu_xyz) | torch.isinf(nu_xyz), torch.zeros_like(nu_xyz), nu_xyz)
+        raw_delta = nu_xyz * float(velocity_time_factor)
+        xyz = xyz0 + raw_delta
 
         xyz = torch.clamp(xyz, min=-100.0, max=100.0)
         xyz = torch.where(torch.isnan(xyz) | torch.isinf(xyz), torch.zeros_like(xyz), xyz)
@@ -760,23 +700,23 @@ class GaussianDecoder(nn.Module):
         sh = static_reference_params["sh"]
         rotations = static_reference_params["rotations"]
 
-        slot_quat = matrix_to_quaternion(rot_mats)
-        slot_assign = slot_probs.argmax(dim=-1)
-        point_slot_quat = torch.gather(slot_quat, 1, slot_assign.unsqueeze(-1).expand(-1, -1, 4))
-        rotations = quaternion_multiply(point_slot_quat, rotations.to(dtype=xyz0.dtype))
-
         if step is not None and step % 400 == 0:
             import logging
 
             static_scale_mean = static_reference_params["scales"].float().mean().item()
             static_scale_max = static_reference_params["scales"].float().max().item()
-            trans_norm = slot_trans.norm(dim=-1)
+            gate_mean = motion_gate.mean().item() if motion_gate is not None else 1.0
+            gate_min = motion_gate.min().item() if motion_gate is not None else 1.0
+            gate_max = motion_gate.max().item() if motion_gate is not None else 1.0
             logging.info(
-                f"[VelocityDecoder][h={horizon_idx}][t+~{horizon_idx + 1}] slot_rigid: "
-                f"motion_scale={self.slot_translation_scale}, "
+                f"[VelocityDecoder][h={horizon_idx}][t+~{horizon_idx + 1}] shared_nu: "
+                f"velocity_scale={self.slot_translation_scale}, "
                 f"time_factor={velocity_time_factor:.4f}, |delta|_mean={raw_delta.abs().mean().item():.6f}, "
-                f"|delta|_max={raw_delta.abs().max().item():.6f}, slot_entropy={motion_outputs['slot_entropy'].item():.6f}, "
-                f"slot_usage_mean={slot_usage.mean().item():.6f}, slot_trans_norm_mean={trans_norm.mean().item():.6f}, "
+                f"|delta|_max={raw_delta.abs().max().item():.6f}, |nu|_mean={motion_outputs['velocity_abs_mean'].item():.6f}, "
+                f"|nu|_max={motion_outputs['velocity_max'].item():.6f}, "
+                f"motion_gate_mean={gate_mean:.6f}, "
+                f"motion_gate_min={gate_min:.6f}, "
+                f"motion_gate_max={gate_max:.6f}, "
                 f"static_gaussian_scale_mean={static_scale_mean:.6f}, "
                 f"static_gaussian_scale_max={static_scale_max:.6f}"
             )
@@ -790,15 +730,16 @@ class GaussianDecoder(nn.Module):
             "depth_map": depth_map,
             "depth_delta_map": depth_delta_map,
             "raw_delta_xyz": raw_delta,
-            "slot_probs": slot_probs,
-            "slot_usage": slot_usage,
-            "slot_entropy": motion_outputs["slot_entropy"],
-            "slot_balance_loss": motion_outputs["slot_balance_loss"],
-            "slot_trans_reg": motion_outputs["slot_trans_reg"],
-            "slot_rot_reg": motion_outputs["slot_rot_reg"],
-            "slot_trans": slot_trans,
-            "slot_rot_6d": slot_rot_6d,
-            "slot_pivots": slot_pivots,
+            "nu_xyz": nu_xyz,
+            "slot_probs": None,
+            "slot_usage": None,
+            "slot_entropy": None,
+            "slot_balance_loss": None,
+            "slot_trans_reg": motion_outputs["velocity_reg"],
+            "slot_rot_reg": None,
+            "slot_trans": None,
+            "slot_rot_6d": None,
+            "slot_pivots": None,
         }
 
     def decode_dynamic_gaussians_from_static(
@@ -809,6 +750,7 @@ class GaussianDecoder(nn.Module):
         step: int | None,
         horizon_idx: int = 0,
         base_depth: torch.Tensor | None = None,
+        current_observation=None,
     ) -> dict:
         """Decode shared motion-query features into a constant-velocity dynamic Gaussian update."""
         return self._decode_velocity_from_static(
@@ -818,6 +760,7 @@ class GaussianDecoder(nn.Module):
             step,
             horizon_idx=horizon_idx,
             base_depth=base_depth,
+            current_observation=current_observation,
         )
 
     def _decode_independent(
@@ -854,6 +797,7 @@ class GaussianDecoder(nn.Module):
                 step,
                 horizon_idx=horizon_idx,
                 base_depth=base_depth,
+                current_observation=current_observation,
             )
 
         gaussian_params = self._decode_static_from_shared(

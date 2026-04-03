@@ -250,7 +250,7 @@ class PI0Pytorch(nn.Module):
 
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0331_lpips_future_5_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0401_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -522,6 +522,16 @@ class PI0Pytorch(nn.Module):
         if self._set_module_requires_grad(getattr(self.world_model, "shared_backbone", None), True):
             logging.info("Unfroze world-model shared_backbone")
 
+    def freeze_prefix_vlm_backbone(self):
+        """Freeze the full PaliGemma prefix backbone while keeping custom world-token modules trainable."""
+        self._set_module_requires_grad(self.paligemma_with_expert.paligemma, False)
+        logging.info("Froze full prefix VLM backbone (entire PaliGemma module)")
+
+    def unfreeze_prefix_vlm_backbone(self):
+        """Unfreeze the full PaliGemma prefix backbone."""
+        self._set_module_requires_grad(self.paligemma_with_expert.paligemma, True)
+        logging.info("Unfroze full prefix VLM backbone (entire PaliGemma module)")
+
     def apply_world_model_stage(
         self,
         stage: int,
@@ -531,15 +541,30 @@ class PI0Pytorch(nn.Module):
         freeze_static_head: bool = True,
     ):
         """Apply staged trainability for action/world-model branches."""
-        del freeze_velocity_head, freeze_static_head
+        self.set_render_loss_weight(render_weight)
         if stage == 1:
-            # Stage 1: train the full world model, freeze action.
+            # Stage 1: static-focused world-model training, action off.
             self.freeze_action_expert()
+            self.freeze_prefix_vlm_backbone()
             self.unfreeze_shared_backbone()
             self.unfreeze_static_head()
-            self.unfreeze_velocity_head()
+            if freeze_velocity_head:
+                self.freeze_velocity_head()
+            else:
+                self.unfreeze_velocity_head()
         elif stage == 2:
-            # Stage 2: keep training the world model and enable action.
+            # Stage 2: velocity-focused world-model training, action still off.
+            self.freeze_action_expert()
+            self.freeze_prefix_vlm_backbone()
+            self.unfreeze_shared_backbone()
+            self.unfreeze_velocity_head()
+            if freeze_static_head:
+                self.freeze_static_head()
+            else:
+                self.unfreeze_static_head()
+        elif stage == 3:
+            # Stage 3: joint training, action on and full world model trainable.
+            self.unfreeze_prefix_vlm_backbone()
             self.unfreeze_shared_backbone()
             self.unfreeze_static_head()
             self.unfreeze_velocity_head()
@@ -554,6 +579,16 @@ class PI0Pytorch(nn.Module):
             return bool(module is not None and any(param.requires_grad for param in module.parameters()))
 
         return {
+            "prefix_paligemma": _module_trainable(self.paligemma_with_expert.paligemma),
+            "prefix_language_model": _module_trainable(
+                getattr(self.paligemma_with_expert.paligemma, "language_model", None)
+            ),
+            "prefix_vision_tower": _module_trainable(
+                getattr(self.paligemma_with_expert.paligemma, "vision_tower", None)
+            ),
+            "prefix_multimodal_projector": _module_trainable(
+                getattr(self.paligemma_with_expert.paligemma, "multi_modal_projector", None)
+            ),
             "action_expert": _module_trainable(self.paligemma_with_expert.gemma_expert),
             "shared_backbone": _module_trainable(getattr(self.world_model, "shared_backbone", None)),
             "static_head": _module_trainable(getattr(self.world_model, "static_head", None)),
@@ -707,6 +742,7 @@ class PI0Pytorch(nn.Module):
 
         # --- Handle Future Split for 3DGS World Model ---
         future_observation = None
+        motion_weight_observation = None
         # Check if first image has T dimension (ndim=5 for B,T,H,W,C now due to model.py fix)
         if observation.images:
             # Inspect first image to detect time dimension
@@ -877,17 +913,24 @@ class PI0Pytorch(nn.Module):
                     # Also preprocess future observation (normalization etc)
                     future_observation = _preprocessing.preprocess_observation_pytorch(future_observation, train=False)
 
+                    # Motion weights should use the unaugmented current observation.
+                    motion_weight_observation = _preprocessing.preprocess_observation_pytorch(observation, train=False)
+
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
         # Store the preprocessed observation for later use in World Model
         # This ensures that when _prepare_gaussian_inputs is called later, it uses the observation
         # with preserved temporal dimension, not the original one
         preprocessed_observation = observation
+        if motion_weight_observation is not None:
+            preprocessed_observation.motion_weight_observation = motion_weight_observation
 
         if 'raw_temporal_images' in locals() and raw_temporal_images:
             preprocessed_observation.raw_temporal_images = raw_temporal_images
             preprocessed_observation.raw_temporal_labels = raw_temporal_labels
 
-        future_motion_prior = self._build_temporal_motion_prior_maps(preprocessed_observation)
+        future_motion_prior = self._build_temporal_motion_prior_maps(
+            self._get_motion_weight_source_observation(preprocessed_observation)
+        )
         if future_motion_prior:
             preprocessed_observation.future_motion_prior = future_motion_prior
             if future_observation is not None:
@@ -1086,7 +1129,7 @@ class PI0Pytorch(nn.Module):
             else getattr(observation, "flow_valid_mask", None)
         )
 
-        return SimpleNamespace(
+        sliced_observation = SimpleNamespace(
             images=images,
             image_masks=image_masks,
             state=state,
@@ -1098,6 +1141,18 @@ class PI0Pytorch(nn.Module):
             flow_3d=flow_3d,
             flow_valid_mask=flow_valid_mask,
         )
+        motion_weight_observation = getattr(observation, "motion_weight_observation", None)
+        if motion_weight_observation is not None:
+            sliced_observation.motion_weight_observation = self._slice_temporal_observation(
+                motion_weight_observation, index
+            )
+        return sliced_observation
+
+    def _get_motion_weight_source_observation(self, observation):
+        """Return the observation variant that should be used to build motion weights."""
+        if observation is None:
+            return None
+        return getattr(observation, "motion_weight_observation", observation)
 
 
 
@@ -1282,9 +1337,10 @@ class PI0Pytorch(nn.Module):
         is_main_process = not dist.is_initialized() or dist.get_rank() == 0
         gaussian_params = dict(gaussian_params)
 
-        base_depth = getattr(reference_observation, "depth", None)
-        if base_depth is not None and base_depth.ndim == 5:
-            base_depth = base_depth[:, -1]
+        motion_weight_reference = self._get_motion_weight_source_observation(reference_observation)
+        motion_weight_base_depth = getattr(motion_weight_reference, "depth", None)
+        if motion_weight_base_depth is not None and motion_weight_base_depth.ndim == 5:
+            motion_weight_base_depth = motion_weight_base_depth[:, -1]
 
         depth_map = gaussian_params.pop("depth_map", None)
         gaussian_params.pop("depth_delta_map", None)
@@ -1395,9 +1451,9 @@ class PI0Pytorch(nn.Module):
             motion_weight_maps = {}
             for render_view in render_views:
                 view_key = f"{render_view}_image"
-                current_image = self._extract_reference_view_image(reference_observation, render_view)
+                current_image = self._extract_reference_view_image(motion_weight_reference, render_view)
                 future_image = target_obs[view_key]
-                current_depth_for_view = base_depth if render_view == "agent" else None
+                current_depth_for_view = motion_weight_base_depth if render_view == "agent" else None
                 future_depth_for_view = (
                     target_observation.depth
                     if render_view == "agent" and hasattr(target_observation, "depth")
@@ -2382,6 +2438,10 @@ class PI0Pytorch(nn.Module):
             base_depth = getattr(preprocessed_observation, "depth", None)
             if base_depth is not None and base_depth.ndim == 5:
                 base_depth = base_depth[:, -1]
+            motion_weight_reference = self._get_motion_weight_source_observation(preprocessed_observation)
+            motion_weight_base_depth = getattr(motion_weight_reference, "depth", None)
+            if motion_weight_base_depth is not None and motion_weight_base_depth.ndim == 5:
+                motion_weight_base_depth = motion_weight_base_depth[:, -1]
 
             current_obs_steps = self._get_temporal_observation_length(preprocessed_observation)
             current_target = (
@@ -2440,9 +2500,9 @@ class PI0Pytorch(nn.Module):
                 motion_weight_entry = {}
                 for render_view in render_views:
                     view_key = f"{render_view}_image"
-                    current_image = self._extract_reference_view_image(preprocessed_observation, render_view)
+                    current_image = self._extract_reference_view_image(motion_weight_reference, render_view)
                     future_image = target_obs[view_key]
-                    current_depth_for_view = base_depth if render_view == "agent" else None
+                    current_depth_for_view = motion_weight_base_depth if render_view == "agent" else None
                     future_depth_for_view = (
                         future_target.depth
                         if render_view == "agent" and hasattr(future_target, "depth")

@@ -859,7 +859,7 @@ _CONFIGS = [
             render_loss_weight=0.2,
             depth_loss_weight=0.1,
             flow_loss_weight=15.0,
-            flow_first_horizon_only=True,
+            flow_first_horizon_only=False,
             flow_horizon_weights=(1.0, 1.0, 1.0, 1.0, 1.0),
             use_lpips=True,  # Enable LPIPS perceptual loss
             lpips_weight=0.1,  # Weight for LPIPS loss
@@ -879,7 +879,7 @@ _CONFIGS = [
             extra_delta_transform=False,
         ),
         # batch_size=256,
-        batch_size=8,  # Increased from 4 to 8 for single-frame mode (lower memory usage without temporal modules)
+        batch_size=8,  # Restored after larger per-GPU batch reduced training efficiency
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -891,12 +891,13 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
-        save_interval=3000,  # Changed from default 1000 to 3000
-        stage1_steps=5_000,  # Stage 1: world-only training, 0-5000
-        stage2_steps=10_000,  # Stage 2: add action training after 5000
-        stage1_render_weight=0.2,  # Keep render on from step 0 during world-only stage
-        stage2_render_weight=0.1,
-        stage3_render_weight=0.0,
+        save_interval=1000,  # Save more frequently to make resume easier during long experiments
+        stage1_steps=5_000,  # Stage 1: static + dynamic world-model training, action off
+        stage2_steps=0,  # Disable 3-stage schedule; switch directly to legacy joint stage after stage1
+        stage1_render_weight=0.2,  # Moderate render supervision during world-model-only warmup
+        stage2_render_weight=0.05,  # Lower render weight once action loss is enabled in joint training
+        stage3_render_weight=0.0,  # Unused unless 3-stage schedule is re-enabled
+        stage1_freeze_velocity_head=False,  # Train static and dynamic branches together during stage1
         stage2_shared_backbone_lr_scale=0.25,
     ),
     #

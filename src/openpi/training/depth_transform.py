@@ -200,11 +200,41 @@ class LoadFlowTransform:
         mask_targets = np.zeros((self.future_horizon, height, width), dtype=np.bool_)
 
         max_pairs = flow_3d.shape[0]
-        if frame_index < max_pairs:
-            step_flow_3d = flow_3d[frame_index]
-            step_mask = valid_mask[frame_index]
-            flow_targets[0] = np.where(step_mask[..., None], step_flow_3d, 0.0)
-            mask_targets[0] = step_mask
+        if frame_index >= max_pairs:
+            return flow_targets, mask_targets
+
+        # Compose long-range anchor flow targets by tracking each anchor pixel through
+        # consecutive 2D flows and summing the sampled 3D displacements along that path.
+        # This converts pairwise t->t+1 sidecars into anchor-aligned t->t+h supervision.
+        grid_x, grid_y = np.meshgrid(
+            np.arange(width, dtype=np.float32),
+            np.arange(height, dtype=np.float32),
+            indexing="xy",
+        )
+        track_x = grid_x.copy()
+        track_y = grid_y.copy()
+        accumulated_flow = np.zeros((height, width, 3), dtype=np.float32)
+        trajectory_valid = np.ones((height, width), dtype=np.bool_)
+
+        max_horizon = min(self.future_horizon, max_pairs - frame_index)
+        for horizon_idx in range(max_horizon):
+            step_index = frame_index + horizon_idx
+
+            sampled_flow_2d = self._bilinear_sample_field(flow_2d[step_index], track_x, track_y)
+            sampled_flow_3d = self._bilinear_sample_field(flow_3d[step_index], track_x, track_y)
+            sampled_mask = self._sample_mask(valid_mask[step_index], track_x, track_y)
+
+            sampled_flow_2d = np.where(sampled_mask[..., None], sampled_flow_2d, 0.0)
+            sampled_flow_3d = np.where(sampled_mask[..., None], sampled_flow_3d, 0.0)
+
+            accumulated_flow = accumulated_flow + sampled_flow_3d
+            trajectory_valid = trajectory_valid & sampled_mask
+
+            flow_targets[horizon_idx] = np.where(trajectory_valid[..., None], accumulated_flow, 0.0)
+            mask_targets[horizon_idx] = trajectory_valid
+
+            track_x = track_x + sampled_flow_2d[..., 0]
+            track_y = track_y + sampled_flow_2d[..., 1]
 
         return flow_targets, mask_targets
 

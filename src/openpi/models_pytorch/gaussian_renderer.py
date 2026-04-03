@@ -765,8 +765,9 @@ def compute_rendering_loss(
         l1_loss = (rendered_image - target_image).abs()
         ssim_loss = compute_ssim_loss(rendered_image, target_image)
         pixel_loss = 0.85 * ssim_loss + 0.15 * l1_loss
-        weighted_loss = M_attn.unsqueeze(1) * pixel_loss
-        base_loss = weighted_loss.mean()
+        weights = M_attn.unsqueeze(1).to(dtype=pixel_loss.dtype)
+        weighted_loss = weights * pixel_loss
+        base_loss = weighted_loss.sum() / weights.sum().clamp_min(1e-6)
 
         # Add LPIPS perceptual loss if available (applied to full images, not masked)
         if lpips_fn is not None:
