@@ -357,6 +357,8 @@ class PI0Pytorch(nn.Module):
                     getattr(config, "slot_translation_scale", getattr(config, "velocity_world_model_scale", 2.0))
                 ),
                 slot_rotation_scale=float(getattr(config, "slot_rotation_scale", 1.0)),
+                use_future_depth_aux=bool(getattr(config, "use_future_depth_aux", False)),
+                future_depth_aux_downsample=int(getattr(config, "future_depth_aux_downsample", 2)),
             )
 
             # Initialize Gaussian Renderer (sh_degree=1 for DC + 1st order SH)
@@ -396,6 +398,9 @@ class PI0Pytorch(nn.Module):
         # Initialize render loss weight (can be changed dynamically for staged training)
         self.render_loss_weight = getattr(config, "render_loss_weight", 0.1)  # 降低render loss权重，让action loss主导
         self.depth_loss_weight = getattr(config, "depth_loss_weight", 0.1)
+        self.use_future_depth_aux = bool(getattr(config, "use_future_depth_aux", False))
+        self.future_depth_aux_loss_weight = float(getattr(config, "future_depth_aux_loss_weight", 0.0))
+        self.future_depth_aux_downsample = max(1, int(getattr(config, "future_depth_aux_downsample", 2)))
         self.flow_loss_weight = float(getattr(config, "flow_loss_weight", 0.0))
         self.flow_first_horizon_only = bool(getattr(config, "flow_first_horizon_only", True))
         raw_flow_horizon_weights = getattr(config, "flow_horizon_weights", None)
@@ -522,6 +527,14 @@ class PI0Pytorch(nn.Module):
         if self._set_module_requires_grad(getattr(self.world_model, "shared_backbone", None), True):
             logging.info("Unfroze world-model shared_backbone")
 
+    def set_world_model_image_fusion(self, enabled: bool):
+        if self.world_model is None:
+            return
+        setter = getattr(self.world_model, "set_image_fusion_enabled", None)
+        if setter is not None:
+            setter(enabled)
+            logging.info("Set world-model image fusion to %s", "enabled" if enabled else "disabled")
+
     def freeze_prefix_vlm_backbone(self):
         """Freeze the full PaliGemma prefix backbone while keeping custom world-token modules trainable."""
         self._set_module_requires_grad(self.paligemma_with_expert.paligemma, False)
@@ -546,6 +559,7 @@ class PI0Pytorch(nn.Module):
             # Stage 1: static-focused world-model training, action off.
             self.freeze_action_expert()
             self.freeze_prefix_vlm_backbone()
+            self.set_world_model_image_fusion(False)
             self.unfreeze_shared_backbone()
             self.unfreeze_static_head()
             if freeze_velocity_head:
@@ -556,6 +570,7 @@ class PI0Pytorch(nn.Module):
             # Stage 2: velocity-focused world-model training, action still off.
             self.freeze_action_expert()
             self.freeze_prefix_vlm_backbone()
+            self.set_world_model_image_fusion(False)
             self.unfreeze_shared_backbone()
             self.unfreeze_velocity_head()
             if freeze_static_head:
@@ -565,6 +580,7 @@ class PI0Pytorch(nn.Module):
         elif stage == 3:
             # Stage 3: joint training, action on and full world model trainable.
             self.unfreeze_prefix_vlm_backbone()
+            self.set_world_model_image_fusion(True)
             self.unfreeze_shared_backbone()
             self.unfreeze_static_head()
             self.unfreeze_velocity_head()
@@ -1640,11 +1656,17 @@ class PI0Pytorch(nn.Module):
         velocity_time_factor: float = 1.0,
         return_gaussian_params: bool = False,
         decoder_state: dict | None = None,
+        return_aux: bool = False,
     ):
         """Decode one future horizon and compute depth/render supervision."""
         device = z_next.device
         total_loss = torch.zeros((), dtype=torch.float32, device=device)
+        aux_outputs: dict[str, torch.Tensor] = {}
         if self.world_model is None or self.gaussian_renderer is None or future_target is None:
+            if return_aux and return_gaussian_params:
+                return total_loss, {}, aux_outputs
+            if return_aux:
+                return total_loss, aux_outputs
             return (total_loss, {}) if return_gaussian_params else total_loss
 
         gaussian_params: dict = {}
@@ -1675,7 +1697,30 @@ class PI0Pytorch(nn.Module):
                 shared_state=decoder_state,
             )
 
-            return self._compute_gaussian_supervision_loss(
+            if self.use_future_depth_aux and decoder_state is not None:
+                aux_future_depth = self.world_model.predict_future_depth_aux(decoder_state, horizon_idx=horizon_idx)
+                if aux_future_depth is not None:
+                    aux_outputs["future_depth_aux"] = aux_future_depth
+                    gt_depth = getattr(future_target, "depth", None)
+                    if gt_depth is not None:
+                        gt_aux_depth = gt_depth
+                        if gt_aux_depth.shape[-2:] != aux_future_depth.shape[-2:]:
+                            gt_aux_depth = F.interpolate(
+                                gt_aux_depth,
+                                size=aux_future_depth.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+                        aux_depth_loss = F.l1_loss(aux_future_depth, gt_aux_depth)
+                        if torch.isfinite(aux_depth_loss) and self.future_depth_aux_loss_weight > 0.0:
+                            total_loss = total_loss + self.future_depth_aux_loss_weight * aux_depth_loss
+                        if step is not None and step % 400 == 0:
+                            logging.info(
+                                f"Step {step}{time_suffix}: Future Depth Aux Loss = {aux_depth_loss.item():.6f}, "
+                                f"weight={self.future_depth_aux_loss_weight}"
+                            )
+
+            supervision_result = self._compute_gaussian_supervision_loss(
                 gaussian_params,
                 future_target,
                 preprocessed_observation,
@@ -1687,6 +1732,16 @@ class PI0Pytorch(nn.Module):
                 enable_depth_supervision=True,
                 enable_render_supervision=True,
             )
+            if return_gaussian_params:
+                supervision_loss, returned_gaussian_params = supervision_result
+                total_loss = total_loss + supervision_loss
+                if return_aux:
+                    return total_loss, returned_gaussian_params, aux_outputs
+                return total_loss, returned_gaussian_params
+            total_loss = total_loss + supervision_result
+            if return_aux:
+                return total_loss, aux_outputs
+            return total_loss
         except Exception as error:
             import traceback
 
@@ -1695,6 +1750,10 @@ class PI0Pytorch(nn.Module):
                 traceback.print_exc()
                 logging.warning(traceback.format_exc())
 
+        if return_aux and return_gaussian_params:
+            return total_loss, gaussian_params, aux_outputs
+        if return_aux:
+            return total_loss, aux_outputs
         if return_gaussian_params:
             return total_loss, gaussian_params
         return total_loss
@@ -2377,6 +2436,8 @@ class PI0Pytorch(nn.Module):
         rendered_obs_seq = []
         motion_weight_seq = []
         pred_velocity_seq = []
+        aux_future_depth_seq = []
+        overlay_render_seq = []
         render_views = None
         base_target_obs = None
         base_rendered_obs = None
@@ -2481,6 +2542,7 @@ class PI0Pytorch(nn.Module):
                     velocity_time_factor=vtf,
                     shared_state=decoder_state,
                 )
+                aux_future_depth = self.world_model.predict_future_depth_aux(decoder_state, horizon_idx=horizon_idx)
                 if getattr(self, "use_velocity_future_gaussians", False) and horizon_idx == 0 and viz_static_template is None:
                     viz_static_template = {
                         k: v.detach() if torch.is_tensor(v) else v for k, v in gaussian_params.items()
@@ -2496,6 +2558,17 @@ class PI0Pytorch(nn.Module):
                 rendered_obs = _render_single_batch(gaussian_params, cam_params_dict, render_views)
                 target_obs_seq.append({key: value[:1].float() for key, value in target_obs.items()})
                 rendered_obs_seq.append(rendered_obs)
+
+                if aux_future_depth is not None:
+                    aux_future_depth_seq.append(aux_future_depth[:1].float())
+                else:
+                    aux_future_depth_seq.append(None)
+
+                overlay_render_entry = {}
+                for render_view in render_views:
+                    view_key = f"{render_view}_image"
+                    overlay_render_entry[view_key] = rendered_obs[view_key][:1].float()
+                overlay_render_seq.append(overlay_render_entry)
 
                 motion_weight_entry = {}
                 for render_view in render_views:
@@ -2558,6 +2631,8 @@ class PI0Pytorch(nn.Module):
             motion_weight_seq=motion_weight_seq,
             pred_velocity_seq=pred_velocity_seq,
             context_labels=getattr(preprocessed_observation, "raw_temporal_labels", self._temporal_context_labels()),
+            aux_future_depth_seq=aux_future_depth_seq,
+            overlay_render_seq=overlay_render_seq,
         )
         self._log_future_rollout_pixel_lpips(step, rendered_obs_seq)
 

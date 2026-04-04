@@ -515,6 +515,16 @@ def train_loop(config: _config.TrainConfig):
         f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
     )
 
+    # Staged training changes which branches participate in backward across steps,
+    # which is incompatible with DDP static_graph mode.
+    stage1_steps = getattr(config, "stage1_steps", 0)
+    stage2_steps = getattr(config, "stage2_steps", 0)
+    stage1_render_weight = getattr(config, "stage1_render_weight", 0.0)
+    stage2_render_weight = getattr(config, "stage2_render_weight", 0.2)
+    stage3_render_weight = getattr(config, "stage3_render_weight", 0.1)
+    use_three_stage = stage1_steps > 0 and stage2_steps > stage1_steps
+    staged_training_enabled = stage1_steps > 0
+
     # Pass the original batch size to data loader - it will handle DDP splitting internally
     loader, data_config = build_datasets(config)
 
@@ -620,13 +630,20 @@ def train_loop(config: _config.TrainConfig):
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
+    ddp_static_graph = world_size >= 8 and not staged_training_enabled
+    if use_ddp and is_main:
+        if ddp_static_graph:
+            logging.info("DDP static_graph enabled (8+ GPUs and no staged training detected)")
+        elif world_size >= 8 and staged_training_enabled:
+            logging.info("DDP static_graph disabled because staged training changes the backward graph across steps")
+
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
             find_unused_parameters=True,  # Disable for memory efficiency
             gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            static_graph=ddp_static_graph,
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
@@ -693,15 +710,6 @@ def train_loop(config: _config.TrainConfig):
         if is_main
         else None
     )
-
-    # Staged training configuration
-    stage1_steps = getattr(config, "stage1_steps", 0)
-    stage2_steps = getattr(config, "stage2_steps", 0)
-    stage1_render_weight = getattr(config, "stage1_render_weight", 0.0)
-    stage2_render_weight = getattr(config, "stage2_render_weight", 0.2)
-    stage3_render_weight = getattr(config, "stage3_render_weight", 0.1)
-    use_three_stage = stage1_steps > 0 and stage2_steps > stage1_steps
-    staged_training_enabled = stage1_steps > 0
 
     if staged_training_enabled and is_main:
         logging.info(f"=== Staged Training Enabled ===")

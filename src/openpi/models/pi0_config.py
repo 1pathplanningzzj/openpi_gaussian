@@ -63,6 +63,11 @@ class Pi0Config(_model.BaseModelConfig):
     depth_loss_weight: float = 0.02  # Weight for depth supervision loss (from Depth Anything V2) - reduced to let action loss dominate
     # Incremental-depth auxiliary supervision weight. 0 disables delta-depth loss.
     delta_depth_loss_weight: float = 0.0
+    # Lightweight future-depth auxiliary head on shared future features. 0 disables the loss.
+    use_future_depth_aux: bool = False
+    future_depth_aux_loss_weight: float = 0.0
+    # Optional spatial downsample factor for the auxiliary future-depth target/prediction.
+    future_depth_aux_downsample: int = 2
     # If True, only supervise delta depth for t->t+1. Default False supervises t->t+h for all horizons.
     delta_depth_first_horizon_only: bool = False
     # Make world-model depth prediction absolute rather than residual wrt current depth.

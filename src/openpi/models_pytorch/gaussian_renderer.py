@@ -1079,6 +1079,8 @@ def visualize_future_rollout_comparison(
     motion_weight_seq=None,
     pred_velocity_seq=None,
     context_labels=None,
+    aux_future_depth_seq=None,
+    overlay_render_seq=None,
 ):
     """Visualize context + multi-horizon future rollout in one figure."""
     import matplotlib
@@ -1137,6 +1139,8 @@ def visualize_future_rollout_comparison(
     show_future_vs_base = base_rendered_obs is not None
     show_motion = motion_weight_seq is not None and len(motion_weight_seq) > 0
     show_pred_velocity = pred_velocity_seq is not None and len(pred_velocity_seq) > 0
+    show_aux_future_depth = aux_future_depth_seq is not None and len(aux_future_depth_seq) > 0
+    show_overlay = overlay_render_seq is not None and len(overlay_render_seq) > 0
 
     total_future_cols = max(
         horizon,
@@ -1159,6 +1163,16 @@ def visualize_future_rollout_comparison(
     if show_future_vs_base:
         render_base_row = len(row_titles)
         row_titles.append("|Render-Base|")
+
+    overlay_row = None
+    if show_overlay:
+        overlay_row = len(row_titles)
+        row_titles.append("Trajectory Overlay")
+
+    aux_future_depth_row = None
+    if show_aux_future_depth:
+        aux_future_depth_row = len(row_titles)
+        row_titles.append("Aux Future Depth")
 
     motion_row = None
     if show_motion:
@@ -1188,6 +1202,51 @@ def visualize_future_rollout_comparison(
 
     start_col = 1 if show_base else 0
 
+    overlay_key = f"{view_name}_image"
+    overlay_palette = np.array(
+        [
+            [1.0, 0.25, 0.25],
+            [1.0, 0.65, 0.20],
+            [0.95, 0.90, 0.20],
+            [0.20, 0.85, 0.35],
+            [0.20, 0.80, 0.95],
+            [0.35, 0.45, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    def _to_numpy_rgb(image_tensor):
+        image_np = image_tensor[idx].permute(1, 2, 0).detach().cpu().numpy()
+        return np.clip(image_np, 0, 1)
+
+    def _build_trajectory_overlay(base_img, max_horizon_idx):
+        if base_img is None or not overlay_render_seq:
+            return None
+        overlay_vis = base_img.copy()
+        for overlay_idx in range(min(max_horizon_idx + 1, len(overlay_render_seq))):
+            overlay_entry = overlay_render_seq[overlay_idx]
+            if overlay_key not in overlay_entry:
+                continue
+            overlay_img = _to_numpy_rgb(overlay_entry[overlay_key])
+            if overlay_img.shape != overlay_vis.shape:
+                continue
+            motion_map = np.mean(np.abs(overlay_img - base_img), axis=-1, keepdims=True)
+            motion_strength = np.clip((motion_map - 0.03) / 0.22, 0.0, 1.0)
+            if float(motion_strength.max()) <= 1e-6:
+                continue
+            color = overlay_palette[overlay_idx % len(overlay_palette)].reshape(1, 1, 3)
+            alpha = 0.18 + 0.42 * (overlay_idx + 1) / max(horizon, 1)
+            overlay_vis = np.clip(
+                overlay_vis * (1.0 - alpha * motion_strength)
+                + color * (alpha * motion_strength)
+                + overlay_img * (0.10 * motion_strength),
+                0,
+                1,
+            )
+        return overlay_vis
+
+    context_overlay = None
+
     for col_idx, frame in enumerate(context_frames[:total_future_cols]):
         dst_col = start_col + col_idx
         axes[context_row, dst_col].imshow(frame)
@@ -1195,6 +1254,11 @@ def visualize_future_rollout_comparison(
             axes[context_row, dst_col].set_title(context_labels[col_idx], fontsize=13)
         else:
             axes[context_row, dst_col].set_title(f"ctx_{col_idx}", fontsize=13)
+        if show_overlay and dst_col == min(num_cols - 1, start_col + max(0, len(context_frames[:total_future_cols]) - 1)):
+            if context_overlay is None:
+                context_overlay = _build_trajectory_overlay(frame, horizon - 1)
+            if context_overlay is not None:
+                axes[context_row, dst_col].imshow(context_overlay, alpha=0.75)
 
     gt_key = f"{view_name}_image"
     pred_velocity_vmax = 1.0
@@ -1210,37 +1274,50 @@ def visualize_future_rollout_comparison(
             pred_velocity_max = max(pred_velocity_max, float(np.max(pred_velocity_map)))
         pred_velocity_vmax = max(pred_velocity_max, 1e-6)
 
+    aux_depth_vmax = 1.0
+    if aux_future_depth_row is not None:
+        aux_depth_max = 0.0
+        for horizon_idx in range(min(horizon, total_future_cols)):
+            if horizon_idx >= len(aux_future_depth_seq):
+                continue
+            aux_depth_map = aux_future_depth_seq[horizon_idx]
+            if aux_depth_map is None:
+                continue
+            aux_depth_max = max(aux_depth_max, float(aux_depth_map[idx].detach().cpu().amax().item()))
+        aux_depth_vmax = max(aux_depth_max, 1e-6)
+
     base_gt_img = None
     base_render_img = None
 
     if show_base:
         axes[context_row, 0].set_title(base_label, fontsize=13)
         if base_target_obs is not None and gt_key in base_target_obs:
-            base_gt_img = base_target_obs[gt_key][idx].permute(1, 2, 0).detach().cpu().numpy()
-            base_gt_img = np.clip(base_gt_img, 0, 1)
+            base_gt_img = _to_numpy_rgb(base_target_obs[gt_key])
             axes[context_row, 0].imshow(base_gt_img)
             axes[gt_row, 0].imshow(base_gt_img)
         if base_rendered_obs is not None and gt_key in base_rendered_obs:
-            base_render_img = base_rendered_obs[gt_key][0].permute(1, 2, 0).detach().cpu().numpy()
-            base_render_img = np.clip(base_render_img, 0, 1)
+            base_render_img = _to_numpy_rgb(base_rendered_obs[gt_key])
             axes[rendered_row, 0].imshow(base_render_img)
         if base_gt_img is not None and base_render_img is not None:
             axes[diff_row, 0].imshow(np.abs(base_render_img - base_gt_img))
         if render_base_row is not None and base_render_img is not None:
             axes[render_base_row, 0].imshow(np.zeros_like(base_render_img))
+        if overlay_row is not None and base_render_img is not None:
+            axes[overlay_row, 0].imshow(base_render_img)
         if motion_row is not None:
             blank_motion = _blank_latent_like(base_gt_img, fallback_size=224)
             axes[motion_row, 0].imshow(blank_motion, cmap="magma", vmin=0.0, vmax=1.0)
+        if aux_future_depth_row is not None:
+            blank_aux_depth = _blank_latent_like(base_gt_img, fallback_size=224)
+            axes[aux_future_depth_row, 0].imshow(blank_aux_depth, cmap="magma", vmin=0.0, vmax=aux_depth_vmax)
         if pred_velocity_row is not None:
             blank_velocity = _blank_latent_like(base_gt_img, fallback_size=224)
             axes[pred_velocity_row, 0].imshow(blank_velocity, cmap="magma", vmin=0.0, vmax=pred_velocity_vmax)
 
     for horizon_idx in range(min(horizon, total_future_cols)):
         col = start_col + horizon_idx
-        gt_img = target_obs_seq[horizon_idx][gt_key][idx].permute(1, 2, 0).detach().cpu().numpy()
-        gt_img = np.clip(gt_img, 0, 1)
-        rendered_img = rendered_obs_seq[horizon_idx][gt_key][idx].permute(1, 2, 0).detach().cpu().numpy()
-        rendered_img = np.clip(rendered_img, 0, 1)
+        gt_img = _to_numpy_rgb(target_obs_seq[horizon_idx][gt_key])
+        rendered_img = _to_numpy_rgb(rendered_obs_seq[horizon_idx][gt_key])
         diff_img = np.abs(rendered_img - gt_img)
 
         axes[gt_row, col].imshow(gt_img)
@@ -1249,11 +1326,23 @@ def visualize_future_rollout_comparison(
         axes[diff_row, col].imshow(diff_img)
         if render_base_row is not None and base_render_img is not None:
             axes[render_base_row, col].imshow(np.abs(rendered_img - base_render_img))
+        if overlay_row is not None and horizon_idx < len(overlay_render_seq):
+            overlay_base = base_render_img if base_render_img is not None else rendered_img
+            overlay_vis = _build_trajectory_overlay(overlay_base, horizon_idx)
+            if overlay_vis is not None:
+                axes[overlay_row, col].imshow(overlay_vis)
         if motion_row is not None and horizon_idx < len(motion_weight_seq):
             motion_entry = motion_weight_seq[horizon_idx]
             if gt_key in motion_entry:
                 motion_map = motion_entry[gt_key][idx].detach().cpu().numpy()
                 axes[motion_row, col].imshow(motion_map, cmap="magma")
+        if aux_future_depth_row is not None and horizon_idx < len(aux_future_depth_seq):
+            aux_depth_map = aux_future_depth_seq[horizon_idx]
+            if aux_depth_map is not None:
+                aux_depth_np = aux_depth_map[idx].detach().cpu().numpy()
+                if aux_depth_np.ndim == 3 and aux_depth_np.shape[0] == 1:
+                    aux_depth_np = aux_depth_np[0]
+                axes[aux_future_depth_row, col].imshow(aux_depth_np, cmap="magma", vmin=0.0, vmax=aux_depth_vmax)
         if pred_velocity_row is not None and horizon_idx < len(pred_velocity_seq):
             pred_velocity_entry = pred_velocity_seq[horizon_idx]
             if gt_key in pred_velocity_entry:
