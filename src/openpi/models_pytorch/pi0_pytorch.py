@@ -167,7 +167,7 @@ class MotionAwareTemporalBlock(nn.Module):
 
 
 class MotionAwareTemporalEncoder(nn.Module):
-    """Three-layer MTA encoder following paper equations (5)-(9)."""
+    """Stacked MTA encoder following paper equations (5)-(9)."""
 
     def __init__(
         self,
@@ -250,7 +250,7 @@ class PI0Pytorch(nn.Module):
 
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0401_lpips_future_5_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0404_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -331,10 +331,11 @@ class PI0Pytorch(nn.Module):
                 )
 
             self.future_query_to_mta = nn.Linear(paligemma_config.width, 512)
+            self.future_mta_layer_keys = tuple(getattr(self.gaussian_adapter, "mta_layer_keys", (11, 17, 23)))
             self.future_mta_encoder = MotionAwareTemporalEncoder(
                 embed_dim=512,
                 num_heads=8,
-                num_layers=3,
+                num_layers=len(self.future_mta_layer_keys),
                 max_temporal_frames=max(1, self.temporal_context_count),
             )
             self.mta_to_future = nn.Linear(512, paligemma_config.width)
@@ -398,6 +399,7 @@ class PI0Pytorch(nn.Module):
             self.future_query_to_mta = None
             self.future_mta_encoder = None
             self.mta_to_future = None
+            self.future_mta_layer_keys = ()
             self.future_spatial_pos = None
             self.use_sinusoidal_spatial = False
 
@@ -408,12 +410,15 @@ class PI0Pytorch(nn.Module):
         self.future_depth_aux_loss_weight = float(getattr(config, "future_depth_aux_loss_weight", 0.0))
         self.future_depth_aux_downsample = max(1, int(getattr(config, "future_depth_aux_downsample", 2)))
         self.flow_loss_weight = float(getattr(config, "flow_loss_weight", 0.0))
+        self.flow_loss_type = str(getattr(config, "flow_loss_type", "smooth_l1")).lower()
         self.flow_first_horizon_only = bool(getattr(config, "flow_first_horizon_only", True))
         raw_flow_horizon_weights = getattr(config, "flow_horizon_weights", None)
         if raw_flow_horizon_weights:
             self.flow_horizon_weights = [float(weight) for weight in raw_flow_horizon_weights]
         else:
             self.flow_horizon_weights = None
+        raw_flow_channel_weights = getattr(config, "flow_loss_channel_weights", (1.0, 1.0, 1.0))
+        self.flow_loss_channel_weights = tuple(float(weight) for weight in raw_flow_channel_weights)
         self.future_delta_reg_weight = getattr(config, "future_delta_reg_weight", 1e-4)
         self.slot_entropy_loss_weight = float(getattr(config, "slot_entropy_loss_weight", 0.0))
         self.slot_balance_loss_weight = float(getattr(config, "slot_balance_loss_weight", 0.0))
@@ -1948,7 +1953,7 @@ class PI0Pytorch(nn.Module):
                 and self.future_mta_encoder is not None
                 and self.mta_to_future is not None
             ):
-                layer_order = [11, 17, 23]
+                layer_order = list(self.future_mta_layer_keys) if self.future_mta_layer_keys else sorted(mta_features.keys())
                 layer_features = [mta_features.get(layer_idx) for layer_idx in layer_order]
                 expected_frames = self.temporal_context_count
                 has_all_layers = all(feature is not None for feature in layer_features)
@@ -2337,14 +2342,25 @@ class PI0Pytorch(nn.Module):
         if denom.item() <= 0:
             return torch.zeros((), dtype=torch.float32, device=raw_delta_xyz.device)
 
-        diff = F.smooth_l1_loss(pred_flow, target_flow, reduction="none")
+        if self.flow_loss_type == "mse":
+            diff = F.mse_loss(pred_flow, target_flow, reduction="none")
+        else:
+            diff = F.smooth_l1_loss(pred_flow, target_flow, reduction="none")
+
+        channel_weights = torch.tensor(
+            self.flow_loss_channel_weights,
+            device=pred_flow.device,
+            dtype=pred_flow.dtype,
+        ).view(1, pred_flow.shape[1], 1, 1)
+        diff = diff * channel_weights
         flow_loss = (diff * valid_mask_f).sum() / (denom * pred_flow.shape[1])
         flow_loss = flow_loss * horizon_weight
 
         if step is not None and step % 400 == 0:
             logging.info(
                 f"Step {step}{time_suffix}: Flow Loss = {flow_loss.item():.6f}, "
-                f"weight={self.flow_loss_weight}, horizon_weight={horizon_weight:.4f}, "
+                f"weight={self.flow_loss_weight}, loss_type={self.flow_loss_type}, "
+                f"channel_weights={self.flow_loss_channel_weights}, horizon_weight={horizon_weight:.4f}, "
                 f"valid_ratio={(valid_mask_f.mean().item()):.6f}, horizon_idx={horizon_idx}"
             )
 
@@ -2450,11 +2466,14 @@ class PI0Pytorch(nn.Module):
         motion_weight_seq = []
         pred_velocity_seq = []
         aux_future_depth_seq = []
+        gaussian_depth_seq = []
+        delta_xyz_seq = []
         overlay_render_seq = []
         render_views = None
         base_target_obs = None
         base_rendered_obs = None
         base_aux_depth_map = None
+        base_gaussian_depth_map = None
 
         def _build_target_obs_and_cameras(obs):
             target_obs = {}
@@ -2578,6 +2597,24 @@ class PI0Pytorch(nn.Module):
                 else:
                     aux_future_depth_seq.append(None)
 
+                gaussian_depth = gaussian_params.get("depth_map")
+                if gaussian_depth is not None:
+                    gaussian_depth_seq.append(gaussian_depth[:1].float())
+                else:
+                    gaussian_depth_seq.append(None)
+
+                raw_delta_xyz = gaussian_params.get("raw_delta_xyz")
+                if raw_delta_xyz is not None:
+                    num_points = raw_delta_xyz.shape[1]
+                    grid_size = int(round(num_points ** 0.5))
+                    if grid_size * grid_size == num_points:
+                        delta_xyz_map = raw_delta_xyz[:1].reshape(1, grid_size, grid_size, 3).permute(0, 3, 1, 2).contiguous()
+                        delta_xyz_seq.append(delta_xyz_map.float())
+                    else:
+                        delta_xyz_seq.append(None)
+                else:
+                    delta_xyz_seq.append(None)
+
                 overlay_render_entry = {}
                 for render_view in render_views:
                     view_key = f"{render_view}_image"
@@ -2633,6 +2670,9 @@ class PI0Pytorch(nn.Module):
                 base_aux_depth_map = viz_static_template.get("depth_map")
                 if base_aux_depth_map is not None:
                     base_aux_depth_map = base_aux_depth_map[:1].float()
+                base_gaussian_depth_map = viz_static_template.get("depth_map")
+                if base_gaussian_depth_map is not None:
+                    base_gaussian_depth_map = base_gaussian_depth_map[:1].float()
 
         visualize_future_rollout_comparison(
             step,
@@ -2652,6 +2692,9 @@ class PI0Pytorch(nn.Module):
             aux_future_depth_seq=aux_future_depth_seq,
             overlay_render_seq=overlay_render_seq,
             base_aux_depth_map=base_aux_depth_map,
+            gaussian_depth_seq=gaussian_depth_seq,
+            base_gaussian_depth_map=base_gaussian_depth_map,
+            delta_xyz_seq=delta_xyz_seq,
         )
         self._log_future_rollout_pixel_lpips(step, rendered_obs_seq)
 

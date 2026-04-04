@@ -798,12 +798,24 @@ class GaussianDecoder(nn.Module):
             gate_mean = motion_gate.mean().item() if motion_gate is not None else 1.0
             gate_min = motion_gate.min().item() if motion_gate is not None else 1.0
             gate_max = motion_gate.max().item() if motion_gate is not None else 1.0
+            abs_delta = raw_delta.abs()
+            dx_mean = abs_delta[..., 0].mean().item()
+            dy_mean = abs_delta[..., 1].mean().item()
+            dz_mean = abs_delta[..., 2].mean().item()
+            dx_max = abs_delta[..., 0].max().item()
+            dy_max = abs_delta[..., 1].max().item()
+            dz_max = abs_delta[..., 2].max().item()
+            delta_component_sum = dx_mean + dy_mean + dz_mean
+            dz_ratio = dz_mean / max(delta_component_sum, 1e-8)
             logging.info(
                 f"[VelocityDecoder][h={horizon_idx}][t+~{horizon_idx + 1}] shared_nu: "
                 f"velocity_scale={self.slot_translation_scale}, "
                 f"time_factor={velocity_time_factor:.4f}, |delta|_mean={raw_delta.abs().mean().item():.6f}, "
                 f"|delta|_max={raw_delta.abs().max().item():.6f}, |nu|_mean={motion_outputs['velocity_abs_mean'].item():.6f}, "
                 f"|nu|_max={motion_outputs['velocity_max'].item():.6f}, "
+                f"|dx|_mean={dx_mean:.6f}, |dy|_mean={dy_mean:.6f}, |dz|_mean={dz_mean:.6f}, "
+                f"|dx|_max={dx_max:.6f}, |dy|_max={dy_max:.6f}, |dz|_max={dz_max:.6f}, "
+                f"dz_component_ratio={dz_ratio:.6f}, "
                 f"motion_gate_mean={gate_mean:.6f}, "
                 f"motion_gate_min={gate_min:.6f}, "
                 f"motion_gate_max={gate_max:.6f}, "

@@ -862,8 +862,10 @@ _CONFIGS = [
             render_loss_weight=0.2,
             depth_loss_weight=0.1,
             flow_loss_weight=15.0,
+            flow_loss_type="mse",
             flow_first_horizon_only=False,
             flow_horizon_weights=(1.0, 1.0, 1.0, 1.0, 1.0),
+            flow_loss_channel_weights=(1.0, 1.0, 2.0),
             use_lpips=True,  # Enable LPIPS perceptual loss
             lpips_weight=0.1,  # Weight for LPIPS loss
             future_horizon_curriculum_steps=5_000,
@@ -876,13 +878,13 @@ _CONFIGS = [
             # Using depth-augmented dataset with fixed LeRobot data loading
             base_config=DataConfig(
                 prompt_from_task=True,
-                dataset_root="/data/zijianzhang/LIBERA/data_with_depth",
-                flow_root="/data/zijianzhang/LIBERA/flow_sidecars_raft",
+                dataset_root="/home/zijianzhang/openpi/data_subsets/libero_tasks_0_9_with_depth",
+                flow_root="/home/zijianzhang/openpi/data_subsets/flow_sidecars_raft_tasks_0_9",
             ),
             extra_delta_transform=False,
         ),
         # batch_size=256,
-        batch_size=8,  # Restored after larger per-GPU batch reduced training efficiency
+        batch_size=24,  # Global batch size; with 4 GPUs this becomes 6 samples per GPU
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -895,12 +897,13 @@ _CONFIGS = [
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
         save_interval=1000,  # Save more frequently to make resume easier during long experiments
-        stage1_steps=2_000,  # Stage 1: static + dynamic world-model training, action off
-        stage2_steps=0,  # Disable 3-stage schedule; switch directly to legacy joint stage after stage1
+        stage1_steps=2_000,  # Stage 1: warm up current-frame + near-future world-model, action off
+        stage2_steps=10_000,  # Keep action off until 10k; switch to joint training afterwards
         stage1_render_weight=0.2,  # Moderate render supervision during world-model-only warmup
-        stage2_render_weight=0.05,  # Lower render weight once action loss is enabled in joint training
-        stage3_render_weight=0.0,  # Unused unless 3-stage schedule is re-enabled
+        stage2_render_weight=0.2,  # Keep current/future frame supervision strong while action is still frozen
+        stage3_render_weight=0.05,  # Lower render weight once action training is enabled
         stage1_freeze_velocity_head=False,  # Train static and dynamic branches together during stage1
+        stage2_freeze_static_head=False,  # Keep current-frame/static branch trainable during stage2 world-model-only training
         stage2_shared_backbone_lr_scale=0.25,
     ),
     #

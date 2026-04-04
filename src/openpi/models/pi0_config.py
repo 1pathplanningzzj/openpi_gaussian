@@ -90,10 +90,14 @@ class Pi0Config(_model.BaseModelConfig):
     slot_transform_reg_weight: float = 0.0
     # Optional masked 3D flow supervision on raw_delta_xyz.
     flow_loss_weight: float = 0.0
+    # Flow supervision loss type for raw_delta_xyz. Supported: "smooth_l1", "mse".
+    flow_loss_type: str = "smooth_l1"
     flow_first_horizon_only: bool = True
     # Optional per-horizon multipliers for flow supervision, e.g. (1.0, 0.7, 0.4, 0.2, 0.1).
     # If unset, all horizons use weight 1.0.
     flow_horizon_weights: tuple[float, ...] | None = None
+    # Optional per-channel weights for xyz flow supervision.
+    flow_loss_channel_weights: tuple[float, float, float] = (1.0, 1.0, 1.0)
     # LPIPS perceptual loss options
     use_lpips: bool = False  # Whether to use LPIPS perceptual loss for rendering
     lpips_weight: float = 0.1  # Weight for LPIPS perceptual loss

@@ -423,9 +423,16 @@ class GaussianAdapter(nn.Module):
                     # Dedicated projections for exposing per-layer MTA patch tokens.
                     # Main Gaussian embeddings stay at 16×16, while MTA features use a 32×32 pool
                     # so future motion-query tokens can operate at higher spatial resolution.
+                    # DynamicVGGT-style MTA consumes denser backbone taps than the static
+                    # Gaussian multi-scale branch, so keep a separate 12-stage AA pairing here.
+                    self.mta_layer_pairs = [(2 * idx, 2 * idx + 1) for idx in range(12)]
+                    self.mta_layer_keys = tuple(pair_high for _, pair_high in self.mta_layer_pairs)
                     self.mta_layer_pool = nn.AdaptiveAvgPool2d((32, 32))
+                    self.mta_pair_input_projs = nn.ModuleList([
+                        nn.Linear(2048, 512) for _ in self.mta_layer_pairs
+                    ])
                     self.mta_layer_projs = nn.ModuleList([
-                        nn.Linear(512, 512) for _ in self.layer_indices
+                        nn.Linear(512, 512) for _ in self.mta_layer_pairs
                     ])
 
                     # Projection to action_expert_width
@@ -691,7 +698,12 @@ class GaussianAdapter(nn.Module):
 
         Returns a dict mapping VGGT layer index -> [B, T, 1024, 512].
         """
-        if not (hasattr(self, 'use_multi_scale') and self.use_multi_scale and self.layer_projs is not None):
+        if not (
+            hasattr(self, 'use_multi_scale')
+            and self.use_multi_scale
+            and hasattr(self, 'mta_pair_input_projs')
+            and self.mta_pair_input_projs is not None
+        ):
             return None
 
         mta_features: Dict[int, torch.Tensor] = {}
@@ -699,19 +711,38 @@ class GaussianAdapter(nn.Module):
         if hasattr(self.encoder, 'aggregator') and hasattr(self.encoder.aggregator, 'patch_start_idx'):
             patch_start_idx_val = self.encoder.aggregator.patch_start_idx
 
-        for idx, layer_idx in enumerate(self.layer_indices):
-            layer_tokens = aggregated_tokens_list[layer_idx]  # [B, T, N, 2048]
-            if patch_start_idx_val is not None and layer_tokens.shape[2] > 1369:
-                layer_tokens = layer_tokens[:, :, patch_start_idx_val:]
+        for idx, (layer_lo_idx, layer_hi_idx) in enumerate(self.mta_layer_pairs):
+            if layer_hi_idx >= len(aggregated_tokens_list):
+                logging.warning(
+                    f"Requested MTA AA layer pair ({layer_lo_idx}, {layer_hi_idx}) but encoder only returned "
+                    f"{len(aggregated_tokens_list)} layers. Stopping MTA feature extraction."
+                )
+                break
+
+            layer_tokens_lo = aggregated_tokens_list[layer_lo_idx]  # [B, T, N, 2048]
+            layer_tokens_hi = aggregated_tokens_list[layer_hi_idx]  # [B, T, N, 2048]
+            if patch_start_idx_val is not None and layer_tokens_lo.shape[2] > 1369:
+                layer_tokens_lo = layer_tokens_lo[:, :, patch_start_idx_val:]
+            if patch_start_idx_val is not None and layer_tokens_hi.shape[2] > 1369:
+                layer_tokens_hi = layer_tokens_hi[:, :, patch_start_idx_val:]
+
+            if layer_tokens_lo.shape != layer_tokens_hi.shape:
+                logging.warning(
+                    f"MTA pair shape mismatch for layers ({layer_lo_idx}, {layer_hi_idx}): "
+                    f"{tuple(layer_tokens_lo.shape)} vs {tuple(layer_tokens_hi.shape)}. Skipping pair."
+                )
+                continue
+
+            layer_tokens = 0.5 * (layer_tokens_lo + layer_tokens_hi)
 
             bsz, num_frames, n_patches, _ = layer_tokens.shape
             if n_patches != 1369:
                 logging.warning(
-                    f"Expected 1369 patch tokens for MTA at layer {layer_idx}, got {n_patches}. Skipping layer."
+                    f"Expected 1369 patch tokens for MTA at pair ({layer_lo_idx}, {layer_hi_idx}), got {n_patches}. Skipping pair."
                 )
                 continue
 
-            layer_tokens = self.layer_projs[idx](layer_tokens)  # [B, T, 1369, 512]
+            layer_tokens = self.mta_pair_input_projs[idx](layer_tokens)  # [B, T, 1369, 512]
             layer_tokens_2d = layer_tokens.permute(0, 1, 3, 2).reshape(bsz * num_frames, 512, 37, 37)
             layer_tokens_pooled = self.mta_layer_pool(layer_tokens_2d)  # [B*T, 512, 32, 32]
             mta_grid_size = layer_tokens_pooled.shape[-1]
@@ -720,7 +751,7 @@ class GaussianAdapter(nn.Module):
                 bsz, num_frames, mta_grid_size * mta_grid_size, 512
             )
             layer_tokens_flat = self.mta_layer_projs[idx](layer_tokens_flat)
-            mta_features[layer_idx] = layer_tokens_flat
+            mta_features[layer_hi_idx] = layer_tokens_flat
 
         return mta_features if mta_features else None
 

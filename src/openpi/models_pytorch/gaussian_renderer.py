@@ -1082,6 +1082,9 @@ def visualize_future_rollout_comparison(
     aux_future_depth_seq=None,
     overlay_render_seq=None,
     base_aux_depth_map=None,
+    gaussian_depth_seq=None,
+    base_gaussian_depth_map=None,
+    delta_xyz_seq=None,
 ):
     """Visualize context + multi-horizon future rollout in one figure."""
     import matplotlib
@@ -1142,6 +1145,8 @@ def visualize_future_rollout_comparison(
     show_pred_velocity = pred_velocity_seq is not None and len(pred_velocity_seq) > 0
     show_aux_future_depth = aux_future_depth_seq is not None and len(aux_future_depth_seq) > 0
     show_overlay = overlay_render_seq is not None and len(overlay_render_seq) > 0
+    show_gaussian_depth = gaussian_depth_seq is not None and len(gaussian_depth_seq) > 0
+    show_delta_xyz = delta_xyz_seq is not None and len(delta_xyz_seq) > 0
 
     total_future_cols = max(
         horizon,
@@ -1184,6 +1189,22 @@ def visualize_future_rollout_comparison(
     if show_pred_velocity:
         pred_velocity_row = len(row_titles)
         row_titles.append("Projected Speed |Δuv|")
+
+    gaussian_depth_row = None
+    if show_gaussian_depth:
+        gaussian_depth_row = len(row_titles)
+        row_titles.append("Gaussian Future Depth")
+
+    delta_x_row = None
+    delta_y_row = None
+    delta_z_row = None
+    if show_delta_xyz:
+        delta_x_row = len(row_titles)
+        row_titles.append("Delta X")
+        delta_y_row = len(row_titles)
+        row_titles.append("Delta Y")
+        delta_z_row = len(row_titles)
+        row_titles.append("Delta Z")
 
     num_rows = len(row_titles)
     fig, axes = plt.subplots(num_rows, num_cols, figsize=(4 * num_cols, 3.6 * num_rows))
@@ -1287,6 +1308,37 @@ def visualize_future_rollout_comparison(
             aux_depth_max = max(aux_depth_max, float(aux_depth_map[idx].detach().cpu().amax().item()))
         aux_depth_vmax = max(aux_depth_max, 1e-6)
 
+    gaussian_depth_vmax = 1.0
+    if gaussian_depth_row is not None:
+        gaussian_depth_max = 0.0
+        if base_gaussian_depth_map is not None:
+            gaussian_depth_max = max(gaussian_depth_max, float(base_gaussian_depth_map[idx].detach().cpu().amax().item()))
+        for horizon_idx in range(min(horizon, total_future_cols)):
+            if horizon_idx >= len(gaussian_depth_seq):
+                continue
+            gaussian_depth_map = gaussian_depth_seq[horizon_idx]
+            if gaussian_depth_map is None:
+                continue
+            gaussian_depth_max = max(gaussian_depth_max, float(gaussian_depth_map[idx].detach().cpu().amax().item()))
+        gaussian_depth_vmax = max(gaussian_depth_max, 1e-6)
+
+    delta_xyz_vmax = np.zeros(3, dtype=np.float32)
+    if show_delta_xyz:
+        for horizon_idx in range(min(horizon, total_future_cols)):
+            if horizon_idx >= len(delta_xyz_seq):
+                continue
+            delta_xyz_map = delta_xyz_seq[horizon_idx]
+            if delta_xyz_map is None:
+                continue
+            delta_np = delta_xyz_map[idx].detach().cpu().numpy()
+            if delta_np.ndim == 3 and delta_np.shape[0] == 3:
+                for comp_idx in range(3):
+                    delta_xyz_vmax[comp_idx] = max(
+                        delta_xyz_vmax[comp_idx],
+                        float(np.max(np.abs(delta_np[comp_idx]))),
+                    )
+        delta_xyz_vmax = np.maximum(delta_xyz_vmax, 1e-6)
+
     base_gt_img = None
     base_render_img = None
 
@@ -1320,6 +1372,24 @@ def visualize_future_rollout_comparison(
         if pred_velocity_row is not None:
             blank_velocity = _blank_latent_like(base_gt_img, fallback_size=224)
             axes[pred_velocity_row, 0].imshow(blank_velocity, cmap="magma", vmin=0.0, vmax=pred_velocity_vmax)
+        if gaussian_depth_row is not None:
+            if base_gaussian_depth_map is not None:
+                base_gaussian_depth_np = base_gaussian_depth_map[idx].detach().cpu().numpy()
+                if base_gaussian_depth_np.ndim == 3 and base_gaussian_depth_np.shape[0] == 1:
+                    base_gaussian_depth_np = base_gaussian_depth_np[0]
+                axes[gaussian_depth_row, 0].imshow(
+                    base_gaussian_depth_np, cmap="magma", vmin=0.0, vmax=gaussian_depth_vmax
+                )
+            else:
+                blank_gaussian_depth = _blank_latent_like(base_gt_img, fallback_size=224)
+                axes[gaussian_depth_row, 0].imshow(
+                    blank_gaussian_depth, cmap="magma", vmin=0.0, vmax=gaussian_depth_vmax
+                )
+        if show_delta_xyz:
+            blank_delta = _blank_latent_like(base_gt_img, fallback_size=224)
+            axes[delta_x_row, 0].imshow(blank_delta, cmap="coolwarm", vmin=-delta_xyz_vmax[0], vmax=delta_xyz_vmax[0])
+            axes[delta_y_row, 0].imshow(blank_delta, cmap="coolwarm", vmin=-delta_xyz_vmax[1], vmax=delta_xyz_vmax[1])
+            axes[delta_z_row, 0].imshow(blank_delta, cmap="coolwarm", vmin=-delta_xyz_vmax[2], vmax=delta_xyz_vmax[2])
 
     for horizon_idx in range(min(horizon, total_future_cols)):
         col = start_col + horizon_idx
@@ -1355,6 +1425,29 @@ def visualize_future_rollout_comparison(
             if gt_key in pred_velocity_entry:
                 pred_velocity_map = pred_velocity_entry[gt_key][idx].detach().cpu().numpy()
                 axes[pred_velocity_row, col].imshow(pred_velocity_map, cmap="magma", vmin=0.0, vmax=pred_velocity_vmax)
+        if gaussian_depth_row is not None and horizon_idx < len(gaussian_depth_seq):
+            gaussian_depth_map = gaussian_depth_seq[horizon_idx]
+            if gaussian_depth_map is not None:
+                gaussian_depth_np = gaussian_depth_map[idx].detach().cpu().numpy()
+                if gaussian_depth_np.ndim == 3 and gaussian_depth_np.shape[0] == 1:
+                    gaussian_depth_np = gaussian_depth_np[0]
+                axes[gaussian_depth_row, col].imshow(
+                    gaussian_depth_np, cmap="magma", vmin=0.0, vmax=gaussian_depth_vmax
+                )
+        if show_delta_xyz and horizon_idx < len(delta_xyz_seq):
+            delta_xyz_map = delta_xyz_seq[horizon_idx]
+            if delta_xyz_map is not None:
+                delta_xyz_np = delta_xyz_map[idx].detach().cpu().numpy()
+                if delta_xyz_np.ndim == 3 and delta_xyz_np.shape[0] == 3:
+                    axes[delta_x_row, col].imshow(
+                        delta_xyz_np[0], cmap="coolwarm", vmin=-delta_xyz_vmax[0], vmax=delta_xyz_vmax[0]
+                    )
+                    axes[delta_y_row, col].imshow(
+                        delta_xyz_np[1], cmap="coolwarm", vmin=-delta_xyz_vmax[1], vmax=delta_xyz_vmax[1]
+                    )
+                    axes[delta_z_row, col].imshow(
+                        delta_xyz_np[2], cmap="coolwarm", vmin=-delta_xyz_vmax[2], vmax=delta_xyz_vmax[2]
+                    )
 
     fig.suptitle(f"Future Rollout Visualization - Step {step}", fontsize=16)
     save_path = os.path.join(save_dir, f"render_viz_step_{step:06d}{time_suffix}.png")
