@@ -643,10 +643,19 @@ class GaussianAdapter(nn.Module):
         processed_frames = []
         for t in range(img.shape[1]):
             frame = img[:, t]  # [B, C, H, W]
-            
-            # Normalize
+
+            # Normalize to [0, 1]. OpenPI observations are often float tensors in
+            # [-1, 1], while some loaders may still produce uint8 or float [0, 255].
             if frame.dtype == torch.uint8:
                 frame = frame.to(torch.float32) / 255.0
+            else:
+                frame = frame.to(torch.float32)
+                frame_min = float(frame.detach().amin().item())
+                frame_max = float(frame.detach().amax().item())
+                if frame_min < -0.1:
+                    frame = (frame + 1.0) / 2.0
+                elif frame_max > 1.5:
+                    frame = frame / 255.0
             
             # Resize
             if frame.shape[-2:] != (target_size, target_size):

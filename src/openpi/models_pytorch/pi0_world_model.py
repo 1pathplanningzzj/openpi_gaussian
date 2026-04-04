@@ -415,6 +415,7 @@ class GaussianDecoder(nn.Module):
         slot_rotation_scale: float = 1.0,
         use_future_depth_aux: bool = False,
         future_depth_aux_downsample: int = 2,
+        use_future_motion_gate: bool = False,
     ):
         super().__init__()
         self.token_dim = token_dim
@@ -433,6 +434,7 @@ class GaussianDecoder(nn.Module):
         self.slot_rotation_scale = float(slot_rotation_scale)
         self.use_future_depth_aux = bool(use_future_depth_aux)
         self.future_depth_aux_downsample = max(1, int(future_depth_aux_downsample))
+        self.use_future_motion_gate = bool(use_future_motion_gate)
 
         # Horizon embedding helps the decoder distinguish t+1 vs t+H.
         self.horizon_embed = nn.Embedding(self.future_prediction_horizon, token_dim)
@@ -747,21 +749,22 @@ class GaussianDecoder(nn.Module):
 
         nu_xyz_map = motion_outputs["nu_xyz_map"].to(dtype=xyz0.dtype)
         motion_gate = None
-        future_motion_prior = getattr(current_observation, "future_motion_prior", None)
-        if isinstance(future_motion_prior, dict):
-            motion_prior = future_motion_prior.get("agent_image")
-            if motion_prior is not None:
-                if motion_prior.ndim == 3:
-                    motion_prior = motion_prior.unsqueeze(1)
-                motion_prior = F.interpolate(
-                    motion_prior.to(device=nu_xyz_map.device, dtype=nu_xyz_map.dtype),
-                    size=nu_xyz_map.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                ).clamp_(0.0, 1.0)
-                gate_floor = 0.1
-                motion_gate = gate_floor + (1.0 - gate_floor) * motion_prior
-                nu_xyz_map = nu_xyz_map * motion_gate
+        if self.use_future_motion_gate:
+            future_motion_prior = getattr(current_observation, "future_motion_prior", None)
+            if isinstance(future_motion_prior, dict):
+                motion_prior = future_motion_prior.get("agent_image")
+                if motion_prior is not None:
+                    if motion_prior.ndim == 3:
+                        motion_prior = motion_prior.unsqueeze(1)
+                    motion_prior = F.interpolate(
+                        motion_prior.to(device=nu_xyz_map.device, dtype=nu_xyz_map.dtype),
+                        size=nu_xyz_map.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).clamp_(0.0, 1.0)
+                    gate_floor = 0.1
+                    motion_gate = gate_floor + (1.0 - gate_floor) * motion_prior
+                    nu_xyz_map = nu_xyz_map * motion_gate
         nu_xyz = nu_xyz_map.permute(0, 2, 3, 1).reshape(B, Npts, 3)
         nu_xyz = torch.where(torch.isnan(nu_xyz) | torch.isinf(nu_xyz), torch.zeros_like(nu_xyz), nu_xyz)
         raw_delta = nu_xyz * float(velocity_time_factor)

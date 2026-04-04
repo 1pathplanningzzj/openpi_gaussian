@@ -342,6 +342,7 @@ class PI0Pytorch(nn.Module):
             _vel_g = bool(getattr(config, "use_velocity_future_gaussians", False))
             self.use_velocity_future_gaussians = _vel_g
             self.use_shared_motion_query_velocity = _vel_g
+            self.use_future_motion_gate = bool(getattr(config, "use_future_motion_gate", False))
 
             self.world_model = GaussianDecoder(
                 token_dim=paligemma_config.width,
@@ -359,6 +360,11 @@ class PI0Pytorch(nn.Module):
                 slot_rotation_scale=float(getattr(config, "slot_rotation_scale", 1.0)),
                 use_future_depth_aux=bool(getattr(config, "use_future_depth_aux", False)),
                 future_depth_aux_downsample=int(getattr(config, "future_depth_aux_downsample", 2)),
+                use_future_motion_gate=self.use_future_motion_gate,
+            )
+            logging.info(
+                "Future velocity motion gate %s",
+                "enabled" if self.use_future_motion_gate else "disabled",
             )
 
             # Initialize Gaussian Renderer (sh_degree=1 for DC + 1st order SH)
@@ -1359,7 +1365,7 @@ class PI0Pytorch(nn.Module):
             motion_weight_base_depth = motion_weight_base_depth[:, -1]
 
         depth_map = gaussian_params.pop("depth_map", None)
-        gaussian_params.pop("depth_delta_map", None)
+        depth_delta_map = gaussian_params.pop("depth_delta_map", None)
         raw_delta_xyz = gaussian_params.pop("raw_delta_xyz", None)
         slot_entropy = gaussian_params.pop("slot_entropy", None)
         slot_balance_loss = gaussian_params.pop("slot_balance_loss", None)
@@ -1556,6 +1562,12 @@ class PI0Pytorch(nn.Module):
                         logging.warning(f"Step {step}{time_suffix}: Visualization failed: {viz_error}")
 
         if return_gaussian_params:
+            if depth_map is not None:
+                gaussian_params["depth_map"] = depth_map
+            if depth_delta_map is not None:
+                gaussian_params["depth_delta_map"] = depth_delta_map
+            if raw_delta_xyz is not None:
+                gaussian_params["raw_delta_xyz"] = raw_delta_xyz
             return total_loss, gaussian_params
         return total_loss
 
@@ -1835,10 +1847,11 @@ class PI0Pytorch(nn.Module):
             and self.static_gaussian_token_count > 0
             and gaussian_embs.shape[1] >= self.static_gaussian_token_count
         ):
-            # Keep current-frame Gaussian tokens out of the VLM prefix; current-frame supervision
-            # now decodes from the interaction-refined future token segment instead.
-            gaussian_embs_for_prefix = None
-            g_mask_for_prefix = None
+            # Keep only the current-frame Gaussian tokens (last context slot) in the prefix.
+            # This mirrors the original current-frame decode semantics used by AD-FFgsStudio:
+            # current/static reconstruction should come from current features, not future motion queries.
+            gaussian_embs_for_prefix = gaussian_embs[:, -self.static_gaussian_token_count :, :]
+            g_mask_for_prefix = g_mask[:, -self.static_gaussian_token_count :]
         else:
             gaussian_embs_for_prefix = gaussian_embs
             g_mask_for_prefix = g_mask
@@ -2441,6 +2454,7 @@ class PI0Pytorch(nn.Module):
         render_views = None
         base_target_obs = None
         base_rendered_obs = None
+        base_aux_depth_map = None
 
         def _build_target_obs_and_cameras(obs):
             target_obs = {}
@@ -2615,6 +2629,10 @@ class PI0Pytorch(nn.Module):
                 base_render_views = render_views or view_names
             if viz_static_template is not None and base_target_obs is not None and base_render_views:
                 base_rendered_obs = _render_single_batch(viz_static_template, base_cam_params_dict, base_render_views)
+            if viz_static_template is not None:
+                base_aux_depth_map = viz_static_template.get("depth_map")
+                if base_aux_depth_map is not None:
+                    base_aux_depth_map = base_aux_depth_map[:1].float()
 
         visualize_future_rollout_comparison(
             step,
@@ -2633,6 +2651,7 @@ class PI0Pytorch(nn.Module):
             context_labels=getattr(preprocessed_observation, "raw_temporal_labels", self._temporal_context_labels()),
             aux_future_depth_seq=aux_future_depth_seq,
             overlay_render_seq=overlay_render_seq,
+            base_aux_depth_map=base_aux_depth_map,
         )
         self._log_future_rollout_pixel_lpips(step, rendered_obs_seq)
 
@@ -2738,9 +2757,14 @@ class PI0Pytorch(nn.Module):
             loss = (suffix_out * 0).sum()
         
         # --- Extract Future Frame Tokens from Prefix Output (NEW) ---
+        z_current_static_tokens = None
         z_t1_pred_tokens = None
         z_future_pred_tokens = None
         per_step_delta = None
+        if self.use_world_tokens_in_prefix and 'gaussian' in segment_lengths:
+            gaussian_end = segment_lengths['gaussian']
+            if gaussian_end > 0:
+                z_current_static_tokens = prefix_out[:, :gaussian_end, :]
         if self.use_world_tokens_in_prefix and 'future' in segment_lengths:
             future_start = 0
             if 'gaussian' in segment_lengths:
@@ -2787,16 +2811,22 @@ class PI0Pytorch(nn.Module):
             if current_target is None:
                 current_target = preprocessed_observation
 
-            if z_future_pred_tokens is not None:
+            current_recon_tokens = z_current_static_tokens if z_current_static_tokens is not None else z_future_pred_tokens
+            if current_recon_tokens is not None:
                 try:
+                    current_decoder_state = (
+                        self._build_world_decoder_state(current_recon_tokens, step=step)
+                        if z_current_static_tokens is not None
+                        else decoder_state
+                    )
                     current_template_loss, static_template_raw = self._compute_current_frame_recon_loss(
-                        z_future_pred_tokens,
+                        current_recon_tokens,
                         current_target,
                         step=step,
                         time_suffix="_t_current_static",
                         visualize=False,
                         return_gaussian_params=True,
-                        decoder_state=decoder_state,
+                        decoder_state=current_decoder_state,
                     )
                     if static_template_raw and static_template_raw.get("xyz") is not None:
                         static_template = {
@@ -2809,7 +2839,8 @@ class PI0Pytorch(nn.Module):
                     if step is not None and step % 400 == 0:
                         logging.info(
                             f"Step {step}: Current Frame Static Recon = {current_template_loss.item():.6f}, "
-                            f"weight={self.current_frame_recon_loss_weight}"
+                            f"weight={self.current_frame_recon_loss_weight}, "
+                            f"source={'current_gaussian_tokens' if z_current_static_tokens is not None else 'future_tokens_fallback'}"
                         )
                 except Exception as e:
                     logging.warning(f"Current-frame static reconstruction failed: {e}")

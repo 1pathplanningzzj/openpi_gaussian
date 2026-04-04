@@ -1081,6 +1081,7 @@ def visualize_future_rollout_comparison(
     context_labels=None,
     aux_future_depth_seq=None,
     overlay_render_seq=None,
+    base_aux_depth_map=None,
 ):
     """Visualize context + multi-horizon future rollout in one figure."""
     import matplotlib
@@ -1308,8 +1309,14 @@ def visualize_future_rollout_comparison(
             blank_motion = _blank_latent_like(base_gt_img, fallback_size=224)
             axes[motion_row, 0].imshow(blank_motion, cmap="magma", vmin=0.0, vmax=1.0)
         if aux_future_depth_row is not None:
-            blank_aux_depth = _blank_latent_like(base_gt_img, fallback_size=224)
-            axes[aux_future_depth_row, 0].imshow(blank_aux_depth, cmap="magma", vmin=0.0, vmax=aux_depth_vmax)
+            if base_aux_depth_map is not None:
+                base_aux_depth_np = base_aux_depth_map[idx].detach().cpu().numpy()
+                if base_aux_depth_np.ndim == 3 and base_aux_depth_np.shape[0] == 1:
+                    base_aux_depth_np = base_aux_depth_np[0]
+                axes[aux_future_depth_row, 0].imshow(base_aux_depth_np, cmap="magma", vmin=0.0, vmax=aux_depth_vmax)
+            else:
+                blank_aux_depth = _blank_latent_like(base_gt_img, fallback_size=224)
+                axes[aux_future_depth_row, 0].imshow(blank_aux_depth, cmap="magma", vmin=0.0, vmax=aux_depth_vmax)
         if pred_velocity_row is not None:
             blank_velocity = _blank_latent_like(base_gt_img, fallback_size=224)
             axes[pred_velocity_row, 0].imshow(blank_velocity, cmap="magma", vmin=0.0, vmax=pred_velocity_vmax)
