@@ -19,6 +19,7 @@ from openpi.models_pytorch.pi0_world_model import GaussianDecoder
 # Import Gaussian Renderer
 from openpi.models_pytorch.gaussian_renderer import (
     GaussianRenderer,
+    build_orbit_camera_params,
     build_projected_velocity_map,
     compute_multi_view_rendering_loss,
     visualize_rendering_comparison,
@@ -245,6 +246,7 @@ class PI0Pytorch(nn.Module):
         # torch.compile disabled due to graph break issues with VGGT
 
         # Initialize gradient checkpointing flag
+        self.gradient_checkpointing_enabled = False
         self.state_norm_stats = getattr(config, "state_norm_stats", None)
         self.state_use_quantile_norm = bool(getattr(config, "state_use_quantile_norm", False))
 
@@ -589,7 +591,15 @@ class PI0Pytorch(nn.Module):
             else:
                 self.unfreeze_static_head()
         elif stage == 3:
-            # Stage 3: joint training, action on and full world model trainable.
+            # Stage 3: image-fusion world-model training, action/VLM still frozen.
+            self.freeze_action_expert()
+            self.freeze_prefix_vlm_backbone()
+            self.set_world_model_image_fusion(True)
+            self.unfreeze_shared_backbone()
+            self.unfreeze_static_head()
+            self.unfreeze_velocity_head()
+        elif stage == 4:
+            # Stage 4: joint training, action on and full world model trainable.
             self.unfreeze_prefix_vlm_backbone()
             self.set_world_model_image_fusion(True)
             self.unfreeze_shared_backbone()
@@ -656,7 +666,7 @@ class PI0Pytorch(nn.Module):
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
-        if self.gradient_checkpointing_enabled and self.training:
+        if getattr(self, "gradient_checkpointing_enabled", False) and self.training:
             return torch.utils.checkpoint.checkpoint(
                 func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
             )
@@ -2697,6 +2707,222 @@ class PI0Pytorch(nn.Module):
             delta_xyz_seq=delta_xyz_seq,
         )
         self._log_future_rollout_pixel_lpips(step, rendered_obs_seq)
+
+    def export_future_rollout_gaussians(self, observation, actions=None):
+        """Run offline rollout export without entering the training-loss path."""
+        if not self.use_world_tokens_in_prefix or self.world_model is None or self.gaussian_renderer is None:
+            raise ValueError("World-model Gaussian rollout export is not available for this model/config")
+
+        first_image = next(iter(observation.images.values()))
+        device = first_image.device
+        batch_size = first_image.shape[0]
+
+        if actions is None:
+            actions = torch.zeros(
+                batch_size,
+                self.config.action_horizon,
+                self.config.action_dim,
+                device=device,
+                dtype=torch.float32,
+            )
+
+        images, img_masks, lang_tokens, lang_masks, state, future_observation, preprocessed_observation = self._preprocess_observation(
+            observation, train=False
+        )
+
+        gaussian_inputs = None
+        if self.gaussian_adapter.use_gaussian:
+            gaussian_inputs = self._prepare_gaussian_inputs(preprocessed_observation, device, batch_size, is_training=False)
+
+        prefix_result = self.embed_prefix(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            gaussian_inputs=gaussian_inputs,
+            return_segment_lengths=True,
+            motion_prior_observation=preprocessed_observation,
+        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks, segment_lengths = prefix_result
+
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state,
+            torch.zeros_like(actions, dtype=torch.float32),
+            torch.zeros(batch_size, device=device, dtype=torch.float32),
+        )
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        (prefix_out, _), _ = self.paligemma_with_expert.forward(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+        )
+
+        z_current_static_tokens = None
+        z_future_pred_tokens = None
+        if 'gaussian' in segment_lengths:
+            gaussian_end = segment_lengths['gaussian']
+            if gaussian_end > 0:
+                z_current_static_tokens = prefix_out[:, :gaussian_end, :]
+        if 'future' in segment_lengths:
+            future_start = 0
+            if 'gaussian' in segment_lengths:
+                future_start += segment_lengths['gaussian']
+            if 'images' in segment_lengths:
+                future_start += segment_lengths['images']
+            if 'language' in segment_lengths:
+                future_start += segment_lengths['language']
+            if 'world' in segment_lengths:
+                future_start += segment_lengths['world']
+            future_end = future_start + segment_lengths['future']
+            z_future_pred_tokens = prefix_out[:, future_start:future_end, :]
+
+        if z_future_pred_tokens is None:
+            raise ValueError("Failed to extract future rollout tokens from prefix output")
+
+        available_future_steps = self._get_temporal_observation_length(future_observation)
+        rollout_horizon = min(self.future_prediction_horizon, available_future_steps or 1)
+        if rollout_horizon <= 0:
+            raise ValueError("No future horizons available in observation batch")
+
+        decoder_state = self._build_world_decoder_state(z_future_pred_tokens, step=None)
+        current_target = self._slice_temporal_observation(preprocessed_observation, self.temporal_context_count - 1)
+        if current_target is None:
+            current_target = preprocessed_observation
+
+        current_recon_tokens = z_current_static_tokens if z_current_static_tokens is not None else z_future_pred_tokens
+        current_decoder_state = (
+            self._build_world_decoder_state(current_recon_tokens, step=None)
+            if z_current_static_tokens is not None
+            else decoder_state
+        )
+        _, static_template_raw = self._compute_current_frame_recon_loss(
+            current_recon_tokens,
+            current_target,
+            step=None,
+            time_suffix="_export_static",
+            visualize=False,
+            return_gaussian_params=True,
+            decoder_state=current_decoder_state,
+        )
+        if not static_template_raw or static_template_raw.get("xyz") is None:
+            raise ValueError("Failed to decode base Gaussian template for export")
+
+        static_template = {
+            k: v.detach() if torch.is_tensor(v) else v for k, v in static_template_raw.items()
+        }
+
+        context_length = self._get_temporal_observation_length(preprocessed_observation)
+        context_observations = []
+        if context_length > 0:
+            for idx in range(context_length):
+                context_observations.append(self._slice_temporal_observation(preprocessed_observation, idx))
+        else:
+            context_observations.append(preprocessed_observation)
+
+        context_labels = getattr(preprocessed_observation, "raw_temporal_labels", self._temporal_context_labels())
+        context_labels = list(context_labels[: len(context_observations)])
+
+        future_targets = []
+        future_gaussians = []
+        future_depth_aux = []
+        for horizon_idx in range(rollout_horizon):
+            future_target = (
+                self._slice_temporal_observation(future_observation, horizon_idx)
+                if available_future_steps > 0
+                else future_observation
+            )
+            future_targets.append(future_target)
+            offset0 = self.future_prediction_offsets[0] if self.future_prediction_offsets else 1
+            offseth = self.future_prediction_offsets[horizon_idx] if horizon_idx < len(self.future_prediction_offsets) else (horizon_idx + 1)
+            velocity_time_factor = float(offseth) / float(offset0) if offset0 else 1.0
+            _, gaussian_params, aux_outputs = self._compute_world_model_frame_loss(
+                z_future_pred_tokens,
+                future_target,
+                preprocessed_observation,
+                step=None,
+                time_suffix=f"_export_tplus{offseth}",
+                visualize=False,
+                horizon_idx=horizon_idx,
+                static_gaussian_params=static_template if self.use_velocity_future_gaussians else None,
+                velocity_time_factor=velocity_time_factor,
+                return_gaussian_params=True,
+                decoder_state=decoder_state,
+                return_aux=True,
+            )
+            future_gaussians.append({
+                k: v.detach() if torch.is_tensor(v) else v for k, v in gaussian_params.items()
+            })
+            aux_depth = aux_outputs.get("future_depth_aux")
+            future_depth_aux.append(aux_depth.detach() if torch.is_tensor(aux_depth) else None)
+
+        return {
+            "context_observations": context_observations,
+            "context_labels": context_labels,
+            "current_observation": current_target,
+            "base_gaussian_params": static_template,
+            "future_gaussian_params_seq": future_gaussians,
+            "future_targets": future_targets,
+            "future_offsets": list(self.future_prediction_offsets[:rollout_horizon]),
+            "future_depth_aux_seq": future_depth_aux,
+            "preprocessed_observation": preprocessed_observation,
+        }
+
+    def render_gaussian_views_for_export(
+        self,
+        gaussian_params: dict,
+        *,
+        device: torch.device,
+        batch_size: int,
+        agent_view: bool = True,
+        orbit_azimuth_deg: float | None = None,
+        orbit_elevation_deg: float = 20.0,
+        orbit_radius_scale: float = 2.2,
+        target_hw: tuple[int, int] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Render Gaussian params from agent view and optional orbit view."""
+        renders: dict[str, torch.Tensor] = {}
+        params_single = {
+            "xyz": gaussian_params["xyz"][:1],
+            "sh": gaussian_params["sh"][:1],
+            "opacity": gaussian_params["opacity"][:1],
+            "scales": gaussian_params["scales"][:1],
+            "rotations": gaussian_params["rotations"][:1],
+        }
+        if target_hw is None:
+            render_size = int(getattr(self.gaussian_renderer, "image_size", 224))
+            target_hw = (render_size, render_size)
+        if agent_view:
+            agent_camera = {
+                key: value[:1] if isinstance(value, torch.Tensor) else value
+                for key, value in self._get_camera_params_for_view("agent", device, batch_size).items()
+            }
+            renders["agent"] = self.gaussian_renderer(params_single, agent_camera).float()
+        if orbit_azimuth_deg is not None:
+            orbit_camera = build_orbit_camera_params(
+                params_single["xyz"],
+                target_hw=target_hw,
+                azimuth_deg=orbit_azimuth_deg,
+                elevation_deg=orbit_elevation_deg,
+                radius_scale=orbit_radius_scale,
+                device=device,
+            )
+            renders["orbit"] = self.gaussian_renderer(params_single, orbit_camera).float()
+        return renders
 
     def forward(self, observation, actions, noise=None, time=None, step=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""

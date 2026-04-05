@@ -22,6 +22,7 @@
 #     ↓
 # 反向传播 → 更新世界模型
 
+import math
 import sys
 from pathlib import Path
 import numpy as np
@@ -197,6 +198,111 @@ def _scale_intrinsics_to_target(
     scaled[..., 0, 2] = scaled[..., 0, 2] * sx
     scaled[..., 1, 2] = scaled[..., 1, 2] * sy
     return scaled
+
+
+def build_orbit_camera_params(
+    reference_xyz: torch.Tensor,
+    *,
+    target_hw: Tuple[int, int],
+    azimuth_deg: float,
+    elevation_deg: float = 20.0,
+    radius_scale: float = 2.2,
+    fov_deg: float = 60.0,
+    device: torch.device | None = None,
+) -> Dict[str, torch.Tensor]:
+    """Build a simple look-at orbit camera around Gaussian centers."""
+    if reference_xyz.ndim != 3 or reference_xyz.shape[-1] != 3:
+        raise ValueError(f"Expected reference_xyz [B, N, 3], got {tuple(reference_xyz.shape)}")
+
+    xyz = reference_xyz
+    if device is None:
+        device = xyz.device
+    xyz = xyz.to(device=device, dtype=torch.float32)
+    batch_size = xyz.shape[0]
+    target_h, target_w = target_hw
+
+    finite_mask = torch.isfinite(xyz).all(dim=-1)
+    xyz_safe = torch.where(finite_mask.unsqueeze(-1), xyz, torch.zeros_like(xyz))
+    valid_counts = finite_mask.sum(dim=1, keepdim=True).clamp_min(1)
+    center = xyz_safe.sum(dim=1) / valid_counts
+
+    centered = torch.where(finite_mask.unsqueeze(-1), xyz_safe - center[:, None, :], torch.zeros_like(xyz_safe))
+    radii = centered.norm(dim=-1)
+    extent = radii.max(dim=1).values.clamp_min(0.25)
+    radius = extent * float(radius_scale)
+
+    azimuth = torch.full((batch_size,), float(azimuth_deg) * math.pi / 180.0, device=device, dtype=torch.float32)
+    elevation = torch.full((batch_size,), float(elevation_deg) * math.pi / 180.0, device=device, dtype=torch.float32)
+
+    cam_offset = torch.stack(
+        [
+            radius * torch.cos(elevation) * torch.sin(azimuth),
+            radius * torch.sin(elevation),
+            radius * torch.cos(elevation) * torch.cos(azimuth),
+        ],
+        dim=-1,
+    )
+    campos = center + cam_offset
+
+    forward = center - campos
+    forward = forward / forward.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    world_up = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=torch.float32).expand(batch_size, -1)
+    alt_up = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=torch.float32).expand(batch_size, -1)
+    use_alt = forward[:, 1].abs() > 0.98
+    up = torch.where(use_alt.unsqueeze(-1), alt_up, world_up)
+
+    right = torch.cross(up, forward, dim=-1)
+    right = right / right.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    true_up = torch.cross(forward, right, dim=-1)
+    true_up = true_up / true_up.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    rotation = torch.stack([right, true_up, forward], dim=1)
+    translation = -torch.bmm(rotation, campos.unsqueeze(-1)).squeeze(-1)
+
+    viewmatrix = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0).repeat(batch_size, 1, 1)
+    viewmatrix[:, :3, :3] = rotation
+    viewmatrix[:, :3, 3] = translation
+
+    fov_x = math.radians(float(fov_deg))
+    aspect = float(target_w) / float(max(target_h, 1))
+    tanfovx = math.tan(0.5 * fov_x)
+    tanfovy = tanfovx / max(aspect, 1e-6)
+    fov_y = 2.0 * math.atan(tanfovy)
+    znear, zfar = 0.01, 100.0
+
+    proj_base = torch.zeros((batch_size, 4, 4), device=device, dtype=torch.float32)
+    proj_base[:, 0, 0] = 1.0 / max(tanfovx, 1e-6)
+    proj_base[:, 1, 1] = 1.0 / max(tanfovy, 1e-6)
+    proj_base[:, 3, 2] = 1.0
+    proj_base[:, 2, 2] = zfar / (zfar - znear)
+    proj_base[:, 2, 3] = -(zfar * znear) / (zfar - znear)
+    projmatrix = torch.bmm(proj_base, viewmatrix)
+
+    fx = (0.5 * float(target_w)) / max(tanfovx, 1e-6)
+    fy = (0.5 * float(target_h)) / max(tanfovy, 1e-6)
+    cx = float(target_w) / 2.0
+    cy = float(target_h) / 2.0
+    intrinsics = torch.eye(3, device=device, dtype=torch.float32).unsqueeze(0).repeat(batch_size, 1, 1)
+    intrinsics[:, 0, 0] = fx
+    intrinsics[:, 1, 1] = fy
+    intrinsics[:, 0, 2] = cx
+    intrinsics[:, 1, 2] = cy
+
+    return {
+        "viewmatrix": viewmatrix,
+        "projmatrix": projmatrix,
+        "intrinsics": intrinsics,
+        "tanfovx": tanfovx,
+        "tanfovy": tanfovy,
+        "campos": campos,
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        "camera_pos": campos[0].tolist() if batch_size == 1 else campos.tolist(),
+        "camera_quat": None,
+    }
 
 
 @torch.no_grad()
