@@ -268,7 +268,103 @@ def build_orbit_camera_params(
     aspect = float(target_w) / float(max(target_h, 1))
     tanfovx = math.tan(0.5 * fov_x)
     tanfovy = tanfovx / max(aspect, 1e-6)
-    fov_y = 2.0 * math.atan(tanfovy)
+    znear, zfar = 0.01, 100.0
+
+    proj_base = torch.zeros((batch_size, 4, 4), device=device, dtype=torch.float32)
+    proj_base[:, 0, 0] = 1.0 / max(tanfovx, 1e-6)
+    proj_base[:, 1, 1] = 1.0 / max(tanfovy, 1e-6)
+    proj_base[:, 3, 2] = 1.0
+    proj_base[:, 2, 2] = zfar / (zfar - znear)
+    proj_base[:, 2, 3] = -(zfar * znear) / (zfar - znear)
+    projmatrix = torch.bmm(proj_base, viewmatrix)
+
+    fx = (0.5 * float(target_w)) / max(tanfovx, 1e-6)
+    fy = (0.5 * float(target_h)) / max(tanfovy, 1e-6)
+    cx = float(target_w) / 2.0
+    cy = float(target_h) / 2.0
+    intrinsics = torch.eye(3, device=device, dtype=torch.float32).unsqueeze(0).repeat(batch_size, 1, 1)
+    intrinsics[:, 0, 0] = fx
+    intrinsics[:, 1, 1] = fy
+    intrinsics[:, 0, 2] = cx
+    intrinsics[:, 1, 2] = cy
+
+    return {
+        "viewmatrix": viewmatrix,
+        "projmatrix": projmatrix,
+        "intrinsics": intrinsics,
+        "tanfovx": tanfovx,
+        "tanfovy": tanfovy,
+        "campos": campos,
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        "camera_pos": campos[0].tolist() if batch_size == 1 else campos.tolist(),
+        "camera_quat": None,
+    }
+
+
+def build_sweep_camera_params(
+    reference_xyz: torch.Tensor,
+    *,
+    target_hw: Tuple[int, int],
+    lateral_phase: float,
+    elevation_deg: float = 20.0,
+    radius_scale: float = 0.7,
+    sweep_ratio: float = 0.35,
+    fov_deg: float = 60.0,
+    device: torch.device | None = None,
+) -> Dict[str, torch.Tensor]:
+    """Build a side-to-side sweep camera with mostly fixed viewing direction."""
+    if reference_xyz.ndim != 3 or reference_xyz.shape[-1] != 3:
+        raise ValueError(f"Expected reference_xyz [B, N, 3], got {tuple(reference_xyz.shape)}")
+
+    xyz = reference_xyz
+    if device is None:
+        device = xyz.device
+    xyz = xyz.to(device=device, dtype=torch.float32)
+    batch_size = xyz.shape[0]
+    target_h, target_w = target_hw
+
+    finite_mask = torch.isfinite(xyz).all(dim=-1)
+    xyz_safe = torch.where(finite_mask.unsqueeze(-1), xyz, torch.zeros_like(xyz))
+    valid_counts = finite_mask.sum(dim=1, keepdim=True).clamp_min(1)
+    center = xyz_safe.sum(dim=1) / valid_counts
+
+    centered = torch.where(finite_mask.unsqueeze(-1), xyz_safe - center[:, None, :], torch.zeros_like(xyz_safe))
+    extent = centered.norm(dim=-1).max(dim=1).values.clamp_min(0.25)
+    depth_radius = extent * float(radius_scale)
+    lateral_span = extent * float(sweep_ratio)
+
+    elevation = torch.full((batch_size,), float(elevation_deg) * math.pi / 180.0, device=device, dtype=torch.float32)
+    phase = torch.full((batch_size,), float(lateral_phase), device=device, dtype=torch.float32)
+
+    campos = center.clone()
+    campos[:, 0] = center[:, 0] + lateral_span * phase
+    campos[:, 1] = center[:, 1] + 0.01 * depth_radius * torch.sin(elevation)
+    campos[:, 2] = center[:, 2] - depth_radius * torch.cos(elevation)
+
+    look_target = center.clone()
+    forward = look_target - campos
+    forward = forward / forward.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    world_up = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=torch.float32).expand(batch_size, -1)
+    right = torch.cross(world_up, forward, dim=-1)
+    right = right / right.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    true_up = torch.cross(forward, right, dim=-1)
+    true_up = true_up / true_up.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    rotation = torch.stack([right, true_up, forward], dim=1)
+    translation = -torch.bmm(rotation, campos.unsqueeze(-1)).squeeze(-1)
+
+    viewmatrix = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0).repeat(batch_size, 1, 1)
+    viewmatrix[:, :3, :3] = rotation
+    viewmatrix[:, :3, 3] = translation
+
+    fov_x = math.radians(float(fov_deg))
+    aspect = float(target_w) / float(max(target_h, 1))
+    tanfovx = math.tan(0.5 * fov_x)
+    tanfovy = tanfovx / max(aspect, 1e-6)
     znear, zfar = 0.01, 100.0
 
     proj_base = torch.zeros((batch_size, 4, 4), device=device, dtype=torch.float32)

@@ -20,6 +20,7 @@ from openpi.models_pytorch.pi0_world_model import GaussianDecoder
 from openpi.models_pytorch.gaussian_renderer import (
     GaussianRenderer,
     build_orbit_camera_params,
+    build_sweep_camera_params,
     build_projected_velocity_map,
     compute_multi_view_rendering_loss,
     visualize_rendering_comparison,
@@ -2892,9 +2893,10 @@ class PI0Pytorch(nn.Module):
         orbit_azimuth_deg: float | None = None,
         orbit_elevation_deg: float = 20.0,
         orbit_radius_scale: float = 2.2,
+        sweep_phase: float | None = None,
         target_hw: tuple[int, int] | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Render Gaussian params from agent view and optional orbit view."""
+        """Render Gaussian params from agent view and optional novel view."""
         renders: dict[str, torch.Tensor] = {}
         params_single = {
             "xyz": gaussian_params["xyz"][:1],
@@ -2922,6 +2924,16 @@ class PI0Pytorch(nn.Module):
                 device=device,
             )
             renders["orbit"] = self.gaussian_renderer(params_single, orbit_camera).float()
+        if sweep_phase is not None:
+            sweep_camera = build_sweep_camera_params(
+                params_single["xyz"],
+                target_hw=target_hw,
+                lateral_phase=sweep_phase,
+                elevation_deg=orbit_elevation_deg,
+                radius_scale=orbit_radius_scale,
+                device=device,
+            )
+            renders["sweep"] = self.gaussian_renderer(params_single, sweep_camera).float()
         return renders
 
     def forward(self, observation, actions, noise=None, time=None, step=None) -> Tensor:

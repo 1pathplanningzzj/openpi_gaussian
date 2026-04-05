@@ -162,7 +162,48 @@ def _collect_selected_samples(loader, device, start_index: int, count: int):
     return selected
 
 
-def _render_panels(model, gaussian_params, gt_observation, label_left: str, label_mid: str, orbit_label: str, *, device, orbit_azimuth_deg: float, orbit_elevation_deg: float, orbit_radius_scale: float, target_hw=None):
+def _collect_random_samples(loader, device, count: int, *, max_pool_size: int | None = None, seed: int = 0):
+    pool = []
+    global_idx = 0
+    target_pool_size = max(count, max_pool_size or count)
+    for observation, actions in loader:
+        observation = _to_device(observation, device)
+        actions = actions.to(device)
+        batch_size = actions.shape[0]
+        batch_start = global_idx
+        for local_idx in range(batch_size):
+            sample_idx = batch_start + local_idx
+            pool.append((_slice_sample(observation, local_idx), actions[local_idx : local_idx + 1], sample_idx))
+            if len(pool) >= target_pool_size:
+                break
+        global_idx += batch_size
+        if len(pool) >= target_pool_size:
+            break
+
+    if not pool:
+        return []
+
+    rng = np.random.default_rng(seed)
+    pick_count = min(count, len(pool))
+    picked = sorted(rng.choice(len(pool), size=pick_count, replace=False).tolist())
+    return [pool[idx] for idx in picked]
+
+
+def _render_panels(
+    model,
+    gaussian_params,
+    gt_observation,
+    label_left: str,
+    label_mid: str,
+    side_label: str,
+    *,
+    device,
+    orbit_azimuth_deg: float | None,
+    orbit_elevation_deg: float,
+    orbit_radius_scale: float,
+    sweep_phase: float | None = None,
+    target_hw=None,
+):
     renders = model.render_gaussian_views_for_export(
         gaussian_params,
         device=device,
@@ -171,18 +212,49 @@ def _render_panels(model, gaussian_params, gt_observation, label_left: str, labe
         orbit_azimuth_deg=orbit_azimuth_deg,
         orbit_elevation_deg=orbit_elevation_deg,
         orbit_radius_scale=orbit_radius_scale,
+        sweep_phase=sweep_phase,
         target_hw=target_hw,
     )
     panel_hw = renders["agent"].shape[-2:]
     gt_img = _extract_agent_image(gt_observation, target_hw=panel_hw)
     agent_pred = _tensor_to_uint8_image(renders["agent"], target_hw=panel_hw)
-    orbit_pred = _tensor_to_uint8_image(renders["orbit"], target_hw=panel_hw)
+    side_key = "sweep" if sweep_phase is not None else "orbit"
+    side_pred = _tensor_to_uint8_image(renders[side_key], target_hw=panel_hw)
     frame = _stack_panels([
         _draw_text(gt_img, label_left),
         _draw_text(agent_pred, label_mid),
-        _draw_text(orbit_pred, orbit_label),
+        _draw_text(side_pred, side_label),
     ])
     return frame, panel_hw
+
+
+def _build_schedule(orbit_mode: str, orbit_frames: int, orbit_azimuth_deg: float):
+    if orbit_mode == "fixed":
+        schedule = [(float(orbit_azimuth_deg), None, f"Base Gaussian Orbit az={orbit_azimuth_deg:.0f}")]
+        future_label_fn = lambda offset, _i, _az, _phase: f"Pred Orbit t+{offset}"
+        return schedule, future_label_fn
+
+    if orbit_mode == "spin":
+        azimuths = np.linspace(0.0, 360.0, num=max(orbit_frames, 1), endpoint=False).astype(float).tolist()
+        if len(azimuths) > 20:
+            rng = np.random.default_rng(0)
+            azimuths = sorted(rng.choice(azimuths, size=20, replace=False).tolist())
+        schedule = [(az, None, f"Orbit Spin az={az:.0f}") for az in azimuths]
+        future_label_fn = lambda offset, _i, az, _phase: f"Orbit Spin t+{offset} az={az:.0f}"
+        return schedule, future_label_fn
+
+    if orbit_mode == "sweep":
+        phases = np.linspace(-1.0, 1.0, num=max(orbit_frames * 20, 1), endpoint=True).astype(float).tolist()
+        if len(phases) > 1:
+            phases = phases + phases[-2:0:-1]
+        if len(phases) > 20:
+            step = max(1, len(phases) // 20)
+            phases = phases[::step][:20]
+        schedule = [(None, phase, f"Camera Sweep x={phase:+.2f}") for phase in phases]
+        future_label_fn = lambda offset, _i, _az, phase: f"Sweep t+{offset} x={phase:+.2f}"
+        return schedule, future_label_fn
+
+    raise ValueError(f"Unsupported orbit_mode: {orbit_mode}")
 
 
 def _render_video_frames(model, export, device, orbit_mode: str, orbit_azimuth_deg: float, orbit_elevation_deg: float, orbit_radius_scale: float, orbit_frames: int):
@@ -192,79 +264,49 @@ def _render_video_frames(model, export, device, orbit_mode: str, orbit_azimuth_d
     future_offsets = export["future_offsets"]
     future_targets = export["future_targets"]
     future_gaussians = export["future_gaussian_params_seq"]
-
-    if orbit_mode == "fixed":
-        orbit_schedule = [float(orbit_azimuth_deg)]
-    else:
-        orbit_schedule = np.linspace(0.0, 360.0, num=max(orbit_frames, 1), endpoint=False).astype(float).tolist()
+    schedule, future_label_fn = _build_schedule(orbit_mode, orbit_frames, orbit_azimuth_deg)
 
     panel_hw = None
     for context_idx, context_obs in enumerate(context_observations):
         gaussian_params = export["base_gaussian_params"]
-        if orbit_mode == "fixed":
+        for schedule_idx, (azimuth, sweep_phase, context_side_label) in enumerate(schedule):
+            if orbit_mode == "fixed" and schedule_idx > 0:
+                break
             frame, panel_hw = _render_panels(
                 model,
                 gaussian_params,
                 context_obs,
                 f"GT Context {context_labels[context_idx]}",
                 "Base Gaussian Agent",
-                f"Base Gaussian Orbit az={orbit_azimuth_deg:.0f}",
+                context_side_label,
                 device=device,
-                orbit_azimuth_deg=orbit_schedule[0],
+                orbit_azimuth_deg=azimuth,
                 orbit_elevation_deg=orbit_elevation_deg,
                 orbit_radius_scale=orbit_radius_scale,
+                sweep_phase=sweep_phase,
                 target_hw=panel_hw,
             )
             frames.append(frame)
-        else:
-            for az in orbit_schedule:
-                frame, panel_hw = _render_panels(
-                    model,
-                    gaussian_params,
-                    context_obs,
-                    f"GT Context {context_labels[context_idx]}",
-                    "Base Gaussian Agent",
-                    f"Orbit Spin az={az:.0f}",
-                    device=device,
-                    orbit_azimuth_deg=az,
-                    orbit_elevation_deg=orbit_elevation_deg,
-                    orbit_radius_scale=orbit_radius_scale,
-                    target_hw=panel_hw,
-                )
-                frames.append(frame)
 
     for offset, future_target, gaussian_params in zip(future_offsets, future_targets, future_gaussians, strict=True):
-        if orbit_mode == "fixed":
+        for schedule_idx, (azimuth, sweep_phase, _context_side_label) in enumerate(schedule):
+            if orbit_mode == "fixed" and schedule_idx > 0:
+                break
             frame, panel_hw = _render_panels(
                 model,
                 gaussian_params,
                 future_target,
                 f"GT Future t+{offset}",
                 f"Pred Agent t+{offset}",
-                f"Pred Orbit t+{offset}",
+                future_label_fn(offset, schedule_idx, azimuth, sweep_phase),
                 device=device,
-                orbit_azimuth_deg=orbit_schedule[0],
+                orbit_azimuth_deg=azimuth,
                 orbit_elevation_deg=orbit_elevation_deg,
                 orbit_radius_scale=orbit_radius_scale,
+                sweep_phase=sweep_phase,
                 target_hw=panel_hw,
             )
             frames.append(frame)
-        else:
-            for az in orbit_schedule:
-                frame, panel_hw = _render_panels(
-                    model,
-                    gaussian_params,
-                    future_target,
-                    f"GT Future t+{offset}",
-                    f"Pred Agent t+{offset}",
-                    f"Orbit Spin t+{offset} az={az:.0f}",
-                    device=device,
-                    orbit_azimuth_deg=az,
-                    orbit_elevation_deg=orbit_elevation_deg,
-                    orbit_radius_scale=orbit_radius_scale,
-                    target_hw=panel_hw,
-                )
-                frames.append(frame)
     return frames
 
 
@@ -275,10 +317,13 @@ def main():
     parser.add_argument("--checkpoint-step", type=int, default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--sample-index", type=int, default=0)
+    parser.add_argument("--random-samples", action="store_true")
+    parser.add_argument("--random-seed", type=int, default=0)
+    parser.add_argument("--random-pool-size", type=int, default=256)
     parser.add_argument("--num-samples", type=int, default=20)
     parser.add_argument("--max-batches", type=int, default=None)
     parser.add_argument("--fps", type=int, default=4)
-    parser.add_argument("--orbit-mode", choices=("fixed", "spin"), default="fixed")
+    parser.add_argument("--orbit-mode", choices=("fixed", "spin", "sweep"), default="fixed")
     parser.add_argument("--orbit-frames", type=int, default=24)
     parser.add_argument("--orbit-azimuth", type=float, default=35.0)
     parser.add_argument("--orbit-elevation", type=float, default=28.0)
@@ -302,12 +347,26 @@ def main():
     model.set_world_model_image_fusion(True)
 
     step_name = checkpoint_path.parent.name
-    output_dir = Path(args.output_dir) / f"future_rollout_step{step_name}_{args.orbit_mode}_samples_{args.sample_index}_{args.sample_index + args.num_samples - 1}"
+    sample_desc = (
+        f"random_samples_seed{args.random_seed}_{args.num_samples}"
+        if args.random_samples
+        else f"samples_{args.sample_index}_{args.sample_index + args.num_samples - 1}"
+    )
+    output_dir = Path(args.output_dir) / f"future_rollout_step{step_name}_{args.orbit_mode}_{sample_desc}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    selected_samples = _collect_selected_samples(loader, device, args.sample_index, args.num_samples)
+    if args.random_samples:
+        selected_samples = _collect_random_samples(
+            loader,
+            device,
+            args.num_samples,
+            max_pool_size=args.random_pool_size,
+            seed=args.random_seed,
+        )
+    else:
+        selected_samples = _collect_selected_samples(loader, device, args.sample_index, args.num_samples)
     if not selected_samples:
-        raise IndexError(f"No samples found from sample_index={args.sample_index}")
+        raise IndexError("No samples found for export")
 
     for observation, actions, sample_idx in selected_samples:
         with torch.no_grad():
