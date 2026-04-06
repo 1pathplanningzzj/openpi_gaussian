@@ -267,6 +267,66 @@ class StaticGaussianHead(nn.Module):
         return result
 
 
+class FutureDepthHead(nn.Module):
+    """Predict coarse future depth directly from shared geometry features."""
+
+    def __init__(self, future_prediction_horizon: int, downsample_factor: int = 2, model_dim: int = 128):
+        super().__init__()
+        self.downsample_factor = max(1, int(downsample_factor))
+        self.model_dim = model_dim
+        self.horizon_proj = nn.Embedding(max(1, int(future_prediction_horizon)), model_dim)
+        self.input_proj = nn.Sequential(
+            nn.Conv2d(128, model_dim, kernel_size=3, padding=1, bias=True),
+            nn.GroupNorm(min(32, model_dim), model_dim),
+            nn.GELU(),
+        )
+        self.refine_block = nn.Sequential(
+            nn.Conv2d(model_dim, model_dim, kernel_size=3, padding=1, bias=True),
+            nn.GroupNorm(min(32, model_dim), model_dim),
+            nn.GELU(),
+            nn.Conv2d(model_dim, model_dim, kernel_size=3, padding=1, bias=True),
+            nn.GroupNorm(min(32, model_dim), model_dim),
+            nn.GELU(),
+        )
+        self.scale_proj = nn.Linear(model_dim, model_dim)
+        self.shift_proj = nn.Linear(model_dim, model_dim)
+        self.depth_head = nn.Sequential(
+            nn.Conv2d(model_dim, model_dim, 3, padding=1, bias=True),
+            nn.GroupNorm(min(32, model_dim), model_dim),
+            nn.GELU(),
+            nn.Conv2d(model_dim, 1, 3, padding=1),
+        )
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.xavier_uniform_(module.weight, gain=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        nn.init.zeros_(self.scale_proj.weight)
+        nn.init.zeros_(self.scale_proj.bias)
+        nn.init.zeros_(self.shift_proj.weight)
+        nn.init.zeros_(self.shift_proj.bias)
+
+    def forward(self, shared_features: torch.Tensor, horizon_idx: int = 0) -> torch.Tensor:
+        batch_size = shared_features.shape[0]
+        feat = self.input_proj(shared_features)
+        horizon_idx = max(0, min(int(horizon_idx), self.horizon_proj.num_embeddings - 1))
+        horizon_ids = torch.full((batch_size,), horizon_idx, device=shared_features.device, dtype=torch.long)
+        horizon_embed = self.horizon_proj(horizon_ids)
+        horizon_scale = self.scale_proj(horizon_embed).view(batch_size, self.model_dim, 1, 1)
+        horizon_shift = self.shift_proj(horizon_embed).view(batch_size, self.model_dim, 1, 1)
+        refined = self.refine_block(feat)
+        feat = feat + refined * (1.0 + horizon_scale) + horizon_shift
+        depth_logits = self.depth_head(feat)
+        if self.downsample_factor > 1:
+            depth_logits = F.avg_pool2d(
+                depth_logits,
+                kernel_size=self.downsample_factor,
+                stride=self.downsample_factor,
+                ceil_mode=False,
+            )
+        return 8.0 * torch.sigmoid(depth_logits)
+
+
 class VelocityGaussianHead(nn.Module):
     """Decode shared features into a per-Gaussian shared velocity field."""
 
@@ -353,6 +413,9 @@ class GaussianDecoder(nn.Module):
         slot_assignment_temperature: float = 1.0,
         slot_translation_scale: float | None = None,
         slot_rotation_scale: float = 1.0,
+        use_future_depth_aux: bool = False,
+        future_depth_aux_downsample: int = 2,
+        use_future_motion_gate: bool = False,
     ):
         super().__init__()
         self.token_dim = token_dim
@@ -369,6 +432,9 @@ class GaussianDecoder(nn.Module):
         self.slot_assignment_temperature = float(slot_assignment_temperature)
         self.slot_translation_scale = float(slot_translation_scale if slot_translation_scale is not None else velocity_world_model_scale)
         self.slot_rotation_scale = float(slot_rotation_scale)
+        self.use_future_depth_aux = bool(use_future_depth_aux)
+        self.future_depth_aux_downsample = max(1, int(future_depth_aux_downsample))
+        self.use_future_motion_gate = bool(use_future_motion_gate)
 
         # Horizon embedding helps the decoder distinguish t+1 vs t+H.
         self.horizon_embed = nn.Embedding(self.future_prediction_horizon, token_dim)
@@ -385,6 +451,10 @@ class GaussianDecoder(nn.Module):
             img_dim=3,
             predict_depth=predict_depth,
         )
+        self.future_depth_head = FutureDepthHead(
+            future_prediction_horizon=self.future_prediction_horizon,
+            downsample_factor=self.future_depth_aux_downsample,
+        ) if self.use_future_depth_aux else None
 
         if use_velocity_future_gaussians:
             self.velocity_head = VelocityGaussianHead(
@@ -459,6 +529,19 @@ class GaussianDecoder(nn.Module):
             z,
             horizon_idx=horizon_idx,
         )
+
+    def predict_future_depth_aux(
+        self,
+        shared_state: dict[str, torch.Tensor | int],
+        *,
+        horizon_idx: int = 0,
+    ) -> torch.Tensor | None:
+        if self.future_depth_head is None:
+            return None
+        shared_features = shared_state.get("shared_features")
+        if not isinstance(shared_features, torch.Tensor):
+            return None
+        return self.future_depth_head(shared_features, horizon_idx=horizon_idx)
 
     def _decode_static_from_shared(
         self,
@@ -666,21 +749,22 @@ class GaussianDecoder(nn.Module):
 
         nu_xyz_map = motion_outputs["nu_xyz_map"].to(dtype=xyz0.dtype)
         motion_gate = None
-        future_motion_prior = getattr(current_observation, "future_motion_prior", None)
-        if isinstance(future_motion_prior, dict):
-            motion_prior = future_motion_prior.get("agent_image")
-            if motion_prior is not None:
-                if motion_prior.ndim == 3:
-                    motion_prior = motion_prior.unsqueeze(1)
-                motion_prior = F.interpolate(
-                    motion_prior.to(device=nu_xyz_map.device, dtype=nu_xyz_map.dtype),
-                    size=nu_xyz_map.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                ).clamp_(0.0, 1.0)
-                gate_floor = 0.1
-                motion_gate = gate_floor + (1.0 - gate_floor) * motion_prior
-                nu_xyz_map = nu_xyz_map * motion_gate
+        if self.use_future_motion_gate:
+            future_motion_prior = getattr(current_observation, "future_motion_prior", None)
+            if isinstance(future_motion_prior, dict):
+                motion_prior = future_motion_prior.get("agent_image")
+                if motion_prior is not None:
+                    if motion_prior.ndim == 3:
+                        motion_prior = motion_prior.unsqueeze(1)
+                    motion_prior = F.interpolate(
+                        motion_prior.to(device=nu_xyz_map.device, dtype=nu_xyz_map.dtype),
+                        size=nu_xyz_map.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).clamp_(0.0, 1.0)
+                    gate_floor = 0.1
+                    motion_gate = gate_floor + (1.0 - gate_floor) * motion_prior
+                    nu_xyz_map = nu_xyz_map * motion_gate
         nu_xyz = nu_xyz_map.permute(0, 2, 3, 1).reshape(B, Npts, 3)
         nu_xyz = torch.where(torch.isnan(nu_xyz) | torch.isinf(nu_xyz), torch.zeros_like(nu_xyz), nu_xyz)
         raw_delta = nu_xyz * float(velocity_time_factor)
