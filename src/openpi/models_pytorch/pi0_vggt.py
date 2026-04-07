@@ -501,23 +501,24 @@ class GaussianAdapter(nn.Module):
             return None
         return self.forward(inputs)[0]
 
-    def prepare_inputs(self, observation, device, batch_size, is_training: bool = None):
+    def prepare_inputs(self, observation, device, batch_size, is_training: bool = None, preferred_camera_name: str | None = None, force_num_frames: int | None = None):
         """Helper to prepare inputs for VGGT encoder from observation.
         VGGT expects [Batch_size, S (frames), 3, H, W]
 
-        Strategy: use packed context frames from agent view only.
-        - Agent view is more stable and suitable for temporal modeling
-        - Wrist view is excluded from VGGT encoding (but still used in 2D encoders like SigLIP)
-        - Multiple packed context frames allow VGGT's global attention to establish cross-frame geometry relationships
+        Strategy: use packed context frames from one selected camera view.
 
         Args:
             is_training: If True, uses num_frames. If False, uses inference_num_frames.
                         If None, auto-detects from model.training.
+            preferred_camera_name: Optional exact camera key to use for VGGT encoding.
+                If omitted, falls back to the first non-wrist main view.
+            force_num_frames: Optional explicit frame count override. Useful for single-frame
+                teacher/current-view paths that should not be auto-padded to inference_num_frames.
         """
         if not self.use_gaussian:
             return None
-        
-        # Find agent view image key
+
+        # Find camera view image key
         # Observation is a dataclass with .images attribute (dict)
         if not hasattr(observation, 'images'):
             # Fallback: try to_dict() if it's an Observation object
@@ -529,38 +530,52 @@ class GaussianAdapter(nn.Module):
                 return None
         else:
             images_dict = observation.images
-        
-        # Filter for agent view (exclude wrist)
-        # Common agent view keys: "base_0_rgb", "agent_image", "agentview_image", etc.
-        # Wrist keys: "left_wrist_0_rgb", "right_wrist_0_rgb", "wrist_image", etc.
-        agent_images = {}
-        for key in images_dict.keys():
-            key_lower = key.lower()
-            # Exclude wrist views
-            if "wrist" not in key_lower:
-                # Accept keys that are agent views (base, agent, etc.) or contain _image/_rgb
-                if key == "image" or any(prefix in key_lower for prefix in ["base", "agent", "sideview"]) or \
-                   "_image" in key_lower or "_rgb" in key_lower:
-                    agent_images[key] = images_dict[key]
-        
-        if not agent_images:
-            # Log available keys for debugging
-            available_keys = list(images_dict.keys())
-            logging.warning(f"No agent view images found for VGGT encoding. Available keys: {available_keys}")
-            return None
-        
-        # Use the first agent view found (typically "agent_image" or "agentview_image" or "base_0_rgb")
-        agent_key = list(agent_images.keys())[0]
-        
-        # Get agent view image
-        img = agent_images[agent_key]
-        logging.debug(f"Using agent view for VGGT: {agent_key}, shape: {img.shape}, ndim: {img.ndim}")
+
+        selected_key = None
+        if preferred_camera_name is not None:
+            preferred_lower = preferred_camera_name.lower()
+            for key in images_dict.keys():
+                if key.lower() == preferred_lower:
+                    selected_key = key
+                    break
+            if selected_key is None:
+                logging.warning(
+                    "Requested preferred VGGT camera %s but available keys are %s",
+                    preferred_camera_name,
+                    list(images_dict.keys()),
+                )
+                return None
+        else:
+            # Default fallback: first non-wrist main camera.
+            candidate_images = {}
+            for key in images_dict.keys():
+                key_lower = key.lower()
+                if "wrist" in key_lower or "bravo" in key_lower:
+                    continue
+                if (
+                    key == "image"
+                    or any(prefix in key_lower for prefix in ["base", "agent", "sideview", "exterior", "high", "cam_high"])
+                    or "_image" in key_lower
+                    or "_rgb" in key_lower
+                ):
+                    candidate_images[key] = images_dict[key]
+
+            if not candidate_images:
+                available_keys = list(images_dict.keys())
+                logging.warning(f"No main-view images found for VGGT encoding. Available keys: {available_keys}")
+                return None
+            selected_key = list(candidate_images.keys())[0]
+
+        img = images_dict[selected_key]
+        logging.debug(f"Using camera view for VGGT: {selected_key}, shape: {img.shape}, ndim: {img.ndim}")
         # Determine number of frames to use
         # Auto-detect training mode if not specified
         if is_training is None:
             is_training = self.training if hasattr(self, 'training') else True
         
-        if is_training:
+        if force_num_frames is not None:
+            target_num_frames = max(1, int(force_num_frames))
+        elif is_training:
             target_num_frames = self.num_frames
         else:
             target_num_frames = self.inference_num_frames
@@ -755,7 +770,8 @@ class GaussianAdapter(nn.Module):
 
         return mta_features if mta_features else None
 
-    def forward(self, gaussian_inputs, text_embedding=None, return_gaussian_params=False, return_raw_tokens=False, return_mta_features=False, step=None, visualize=False):
+    def forward(self, gaussian_inputs, text_embedding=None, return_gaussian_params=False, return_raw_tokens=False, return_mta_features=False, raw_tokens_layer_idx: int | None = None, return_unprojected_raw_tokens: bool = False, step=None, visualize=False):
+
         """
         Processes gaussian inputs and returns embeddings.
         Input:
@@ -763,7 +779,8 @@ class GaussianAdapter(nn.Module):
             text_embedding: [B, D] Optional text embedding for LGPD.
             return_gaussian_params: If True, also return decoded Gaussian parameters from VGGT.
             return_raw_tokens: If True, also return raw tokens before pooling (for VAE supervision).
-            return_mta_features: If True, also return per-layer MTA patch tokens.
+            raw_tokens_layer_idx: If set, return patch tokens from that exact VGGT layer index before temporal pooling.
+            return_unprojected_raw_tokens: If True, return frozen raw encoder-layer patch tokens without self.proj.
             step: Current training step (for visualization)
             visualize: If True and step % 100 == 0, save visualization
         Returns:
@@ -833,7 +850,24 @@ class GaussianAdapter(nn.Module):
         # Strategy: Enhanced temporal encoding with 3D Conv + Causal Attention
 
         # === Priority 3: Multi-scale Feature Extraction ===
-        if hasattr(self, 'use_multi_scale') and self.use_multi_scale:
+        if raw_tokens_layer_idx is not None:
+            if not isinstance(aggregated_tokens_list, (list, tuple)):
+                raise ValueError("raw_tokens_layer_idx requires aggregated_tokens_list to be a list/tuple of per-layer features")
+            resolved_layer_idx = raw_tokens_layer_idx
+            if resolved_layer_idx < 0:
+                resolved_layer_idx = len(aggregated_tokens_list) + resolved_layer_idx
+            if resolved_layer_idx < 0 or resolved_layer_idx >= len(aggregated_tokens_list):
+                raise ValueError(
+                    f"raw_tokens_layer_idx={raw_tokens_layer_idx} is out of range for {len(aggregated_tokens_list)} VGGT layers"
+                )
+            raw_tokens = aggregated_tokens_list[resolved_layer_idx]
+            B, S, N_patches, D = raw_tokens.shape
+            if hasattr(self.encoder, 'aggregator') and hasattr(self.encoder.aggregator, 'patch_start_idx'):
+                patch_start_idx_val = self.encoder.aggregator.patch_start_idx
+                if N_patches > 1369:
+                    raw_tokens = raw_tokens[:, :, patch_start_idx_val:]
+                    B, S, N_patches, D = raw_tokens.shape
+        elif hasattr(self, 'use_multi_scale') and self.use_multi_scale:
             # Extract features from layers [11, 17, 23]
             multi_scale_features = []
             for idx, layer_idx in enumerate(self.layer_indices):
@@ -1024,6 +1058,9 @@ class GaussianAdapter(nn.Module):
         
         # LGPD is disabled in this configuration; pass through tokens unchanged.
         
+        if return_unprojected_raw_tokens:
+            return gaussian_embs, g_mask, raw_tokens.detach().to(torch.float32)
+
         # Prepare return values
         if return_gaussian_params and return_raw_tokens and return_mta_features:
             raw_tokens_proj = None

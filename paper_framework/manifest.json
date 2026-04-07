@@ -1,0 +1,35 @@
+{
+  "dataset_root": "/home/zijianzhang/openpi/data_subsets/libero_tasks_0_9_with_depth",
+  "parquet_path": "/home/zijianzhang/openpi/data_subsets/libero_tasks_0_9_with_depth/data/chunk-000/episode_000000.parquet",
+  "episode_index": 0,
+  "task_index": 0,
+  "task_name": "put the white mug on the left plate and put the yellow and white mug on the right plate",
+  "num_frames": 214,
+  "current_frame": 109,
+  "past_offsets": [
+    10,
+    5,
+    0
+  ],
+  "future_count": 5,
+  "labels": [
+    "t-10",
+    "t-5",
+    "t",
+    "t+1",
+    "t+2",
+    "t+3",
+    "t+4",
+    "t+5"
+  ],
+  "frame_indices": [
+    99,
+    104,
+    109,
+    110,
+    111,
+    112,
+    113,
+    114
+  ]
+}

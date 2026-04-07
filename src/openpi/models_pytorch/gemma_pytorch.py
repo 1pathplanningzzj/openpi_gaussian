@@ -109,9 +109,11 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        output_hidden_states: bool = False,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
+        hidden_states_history = [] if output_hidden_states and inputs_embeds[0] is not None and inputs_embeds[1] is not None else None
         if inputs_embeds[1] is None:
             prefix_output = self.paligemma.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
@@ -252,6 +254,8 @@ class PaliGemmaWithExpertModel(nn.Module):
 
             # Process all layers with gradient checkpointing if enabled
             for layer_idx in range(num_layers):
+                if hidden_states_history is not None:
+                    hidden_states_history.append([inputs_embeds[0], inputs_embeds[1]])
                 if use_gradient_checkpointing:
                     inputs_embeds = torch.utils.checkpoint.checkpoint(
                         compute_layer_complete,
@@ -287,8 +291,11 @@ class PaliGemmaWithExpertModel(nn.Module):
             else:
                 outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)
 
-            prefix_output = outputs_embeds[0]
-            suffix_output = outputs_embeds[1]
+            prefix_output, suffix_output = outputs_embeds
+            if hidden_states_history is not None:
+                hidden_states_history.append([prefix_output, suffix_output])
             prefix_past_key_values = None
 
+        if hidden_states_history is not None:
+            return [prefix_output, suffix_output], prefix_past_key_values, hidden_states_history
         return [prefix_output, suffix_output], prefix_past_key_values

@@ -532,6 +532,16 @@ def train_loop(config: _config.TrainConfig):
     stage2_render_weight = getattr(config, "stage2_render_weight", 0.2)
     stage3_render_weight = getattr(config, "stage3_render_weight", 0.1)
     stage4_render_weight = getattr(config, "stage4_render_weight", stage3_render_weight)
+    stage4_action_focused = bool(
+        getattr(config, "stage4_freeze_world_model", False)
+        or getattr(config, "stage4_disable_world_model_losses", False)
+        or getattr(config, "stage4_disable_alignment", False)
+    )
+    stage4_label = (
+        "Stage 4 (Action-focused fine-tuning)"
+        if stage4_action_focused
+        else "Stage 4 (Joint training)"
+    )
     use_four_stage = stage3_steps > stage2_steps > stage1_steps > 0
     use_three_stage = stage1_steps > 0 and stage2_steps > stage1_steps
     staged_training_enabled = stage1_steps > 0
@@ -735,7 +745,7 @@ def train_loop(config: _config.TrainConfig):
                 f"Stage 3 (Image-fusion world-model): steps {stage2_steps}-{stage3_steps}, render_weight={stage3_render_weight}, action=off"
             )
             logging.info(
-                f"Stage 4 (Joint training): steps {stage3_steps}-{config.num_train_steps}, render_weight={stage4_render_weight}, action=on"
+                f"{stage4_label}: steps {stage3_steps}-{config.num_train_steps}, render_weight={stage4_render_weight}, action=on"
             )
         elif use_three_stage:
             logging.info(
@@ -800,7 +810,7 @@ def train_loop(config: _config.TrainConfig):
                     4,
                     stage4_render_weight,
                     is_main=is_main,
-                    label="=== Stage 4 Active: Joint training (action=on) ===",
+                    label=f"=== {stage4_label} Active: action=on ===",
                 )
         elif use_three_stage and step < stage1_steps:
             if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:

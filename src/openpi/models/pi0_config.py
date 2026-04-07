@@ -35,6 +35,17 @@ class Pi0Config(_model.BaseModelConfig):
     state_use_quantile_norm: bool | None = None
     # Whether to use 3D Gaussian Splatting Encoder as additional conditioning
     use_gaussian: bool = False
+    # Spatial Forcing / aligned-current-token controls.
+    use_current_vggt_teacher_align: bool = True
+    use_current_gaussian_tokens_in_prefix: bool = False
+    use_future_motion_tokens_in_prefix: bool = True
+    enable_current_aligned_decode: bool = True
+    vla_layers_align: int = 12
+    vggt_layers_align: int = -1
+    current_decode_view: str = "agent"
+    align_loss_coeff_main_current: float = 0.05
+    align_loss_coeff_wrist_current: float = 0.02
+    action_warmup_steps: int = 10_000
     # Whether to use single-frame mode for VGGT (only use current frame t, not t-2, t-1)
     # This removes temporal history and tests if temporal context is necessary
     # When True: VGGT uses [t] only (1 frame)

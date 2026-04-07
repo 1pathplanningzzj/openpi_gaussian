@@ -8,107 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
-    a1 = d6[..., 0:3]
-    a2 = d6[..., 3:6]
-    b1 = F.normalize(a1, dim=-1)
-    b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
-    b2 = F.normalize(b2, dim=-1)
-    b3 = torch.cross(b1, b2, dim=-1)
-    return torch.stack((b1, b2, b3), dim=-2)
-
-
-def matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
-    m00 = matrix[..., 0, 0]
-    m01 = matrix[..., 0, 1]
-    m02 = matrix[..., 0, 2]
-    m10 = matrix[..., 1, 0]
-    m11 = matrix[..., 1, 1]
-    m12 = matrix[..., 1, 2]
-    m20 = matrix[..., 2, 0]
-    m21 = matrix[..., 2, 1]
-    m22 = matrix[..., 2, 2]
-
-    trace = m00 + m11 + m22
-    q = torch.zeros(*matrix.shape[:-2], 4, device=matrix.device, dtype=matrix.dtype)
-
-    mask_trace = trace > 0.0
-    if mask_trace.any():
-        s = torch.sqrt(trace[mask_trace] + 1.0) * 2.0
-        q_trace = q[mask_trace]
-        q_trace[..., 0] = 0.25 * s
-        q_trace[..., 1] = (m21[mask_trace] - m12[mask_trace]) / s
-        q_trace[..., 2] = (m02[mask_trace] - m20[mask_trace]) / s
-        q_trace[..., 3] = (m10[mask_trace] - m01[mask_trace]) / s
-        q[mask_trace] = q_trace
-
-    mask_x = (~mask_trace) & (m00 > m11) & (m00 > m22)
-    if mask_x.any():
-        s = torch.sqrt(1.0 + m00[mask_x] - m11[mask_x] - m22[mask_x]) * 2.0
-        q_x = q[mask_x]
-        q_x[..., 0] = (m21[mask_x] - m12[mask_x]) / s
-        q_x[..., 1] = 0.25 * s
-        q_x[..., 2] = (m01[mask_x] + m10[mask_x]) / s
-        q_x[..., 3] = (m02[mask_x] + m20[mask_x]) / s
-        q[mask_x] = q_x
-
-    mask_y = (~mask_trace) & (~mask_x) & (m11 > m22)
-    if mask_y.any():
-        s = torch.sqrt(1.0 + m11[mask_y] - m00[mask_y] - m22[mask_y]) * 2.0
-        q_y = q[mask_y]
-        q_y[..., 0] = (m02[mask_y] - m20[mask_y]) / s
-        q_y[..., 1] = (m01[mask_y] + m10[mask_y]) / s
-        q_y[..., 2] = 0.25 * s
-        q_y[..., 3] = (m12[mask_y] + m21[mask_y]) / s
-        q[mask_y] = q_y
-
-    mask_z = (~mask_trace) & (~mask_x) & (~mask_y)
-    if mask_z.any():
-        s = torch.sqrt(1.0 + m22[mask_z] - m00[mask_z] - m11[mask_z]) * 2.0
-        q_z = q[mask_z]
-        q_z[..., 0] = (m10[mask_z] - m01[mask_z]) / s
-        q_z[..., 1] = (m02[mask_z] + m20[mask_z]) / s
-        q_z[..., 2] = (m12[mask_z] + m21[mask_z]) / s
-        q_z[..., 3] = 0.25 * s
-        q[mask_z] = q_z
-
-    q = q / (q.norm(dim=-1, keepdim=True) + 1e-8)
-    return q
-
-
-def quaternion_to_matrix(quat: torch.Tensor) -> torch.Tensor:
-    quat = quat / (quat.norm(dim=-1, keepdim=True) + 1e-8)
-    w, x, y, z = quat.unbind(dim=-1)
-
-    ww, xx, yy, zz = w * w, x * x, y * y, z * z
-    wx, wy, wz = w * x, w * y, w * z
-    xy, xz, yz = x * y, x * z, y * z
-
-    return torch.stack(
-        [
-            torch.stack([ww + xx - yy - zz, 2 * (xy - wz), 2 * (xz + wy)], dim=-1),
-            torch.stack([2 * (xy + wz), ww - xx + yy - zz, 2 * (yz - wx)], dim=-1),
-            torch.stack([2 * (xz - wy), 2 * (yz + wx), ww - xx - yy + zz], dim=-1),
-        ],
-        dim=-2,
-    )
-
-
-def quaternion_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
-    w1, x1, y1, z1 = q1.unbind(dim=-1)
-    w2, x2, y2, z2 = q2.unbind(dim=-1)
-    out = torch.stack(
-        [
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        ],
-        dim=-1,
-    )
-    return out / (out.norm(dim=-1, keepdim=True) + 1e-8)
-
-
 class _UpsampleBlock(nn.Module): 
     """ConvTranspose upsample block with GroupNorm + GELU + residual."""
 
@@ -823,10 +722,7 @@ class GaussianDecoder(nn.Module):
             "nu_xyz": nu_xyz,
             "slot_probs": None,
             "slot_usage": None,
-            "slot_entropy": None,
-            "slot_balance_loss": None,
             "slot_trans_reg": motion_outputs["velocity_reg"],
-            "slot_rot_reg": None,
             "slot_trans": None,
             "slot_rot_6d": None,
             "slot_pivots": None,

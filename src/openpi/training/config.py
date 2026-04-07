@@ -613,6 +613,9 @@ class TrainConfig:
     stage1_freeze_velocity_head: bool = True
     stage2_freeze_static_head: bool = True
     stage2_shared_backbone_lr_scale: float = 0.25
+    stage4_freeze_world_model: bool = False
+    stage4_disable_world_model_losses: bool = False
+    stage4_disable_alignment: bool = False
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -878,13 +881,13 @@ _CONFIGS = [
             # Using depth-augmented dataset with fixed LeRobot data loading
             base_config=DataConfig(
                 prompt_from_task=True,
-                dataset_root="/home/zijianzhang/openpi/data_subsets/libero_tasks_0_9_with_depth",
-                flow_root="/home/zijianzhang/openpi/data_subsets/flow_sidecars_raft_tasks_0_9",
+                dataset_root="/data/zijianzhang/LIBERA/data_with_depth",
+                flow_root="/data/zijianzhang/LIBERA/flow_sidecars_raft",
             ),
             extra_delta_transform=False,
         ),
         # batch_size=256,
-        batch_size=16,  # Global batch size; with 4 GPUs this becomes 4 samples per GPU
+        batch_size=16,  # Reduced global batch size to fit world-model future decode/render
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -906,6 +909,10 @@ _CONFIGS = [
         stage4_render_weight=0.05,  # Lower render weight once joint action/VLM training is enabled
         stage1_freeze_velocity_head=False,  # Train static and dynamic branches together during stage1
         stage2_freeze_static_head=False,  # Keep current-frame/static branch trainable during stage2 world-model-only training
+        stage4_freeze_world_model=True,  # After 15k, stop updating decoder heads and keep optimization action-focused
+        stage4_disable_world_model_losses=True,  # After 15k, skip world-model supervision and render/depth/flow losses
+        stage4_disable_alignment=True,  # After 15k, freeze alignment heads and stop teacher-alignment supervision
+        wandb_enabled=True,
         stage2_shared_backbone_lr_scale=0.25,
     ),
     #
