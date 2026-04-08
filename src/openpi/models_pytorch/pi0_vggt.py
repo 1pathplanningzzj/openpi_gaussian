@@ -765,7 +765,8 @@ class GaussianAdapter(nn.Module):
 
         return mta_features if mta_features else None
 
-    def forward(self, gaussian_inputs, text_embedding=None, return_gaussian_params=False, return_raw_tokens=False, return_mta_features=False, step=None, visualize=False):
+    def forward(self, gaussian_inputs, text_embedding=None, return_gaussian_params=False, return_raw_tokens=False, return_mta_features=False, raw_tokens_layer_idx: int | None = None, return_unprojected_raw_tokens: bool = False, step=None, visualize=False):
+
         """
         Processes gaussian inputs and returns embeddings.
         Input:
@@ -773,7 +774,8 @@ class GaussianAdapter(nn.Module):
             text_embedding: [B, D] Optional text embedding for LGPD.
             return_gaussian_params: If True, also return decoded Gaussian parameters from VGGT.
             return_raw_tokens: If True, also return raw tokens before pooling (for VAE supervision).
-            return_mta_features: If True, also return per-layer MTA patch tokens.
+            raw_tokens_layer_idx: If set, return patch tokens from that exact VGGT layer index before temporal pooling.
+            return_unprojected_raw_tokens: If True, return frozen raw encoder-layer patch tokens without self.proj.
             step: Current training step (for visualization)
             visualize: If True and step % 100 == 0, save visualization
         Returns:
@@ -843,7 +845,24 @@ class GaussianAdapter(nn.Module):
         # Strategy: Enhanced temporal encoding with 3D Conv + Causal Attention
 
         # === Priority 3: Multi-scale Feature Extraction ===
-        if hasattr(self, 'use_multi_scale') and self.use_multi_scale:
+        if raw_tokens_layer_idx is not None:
+            if not isinstance(aggregated_tokens_list, (list, tuple)):
+                raise ValueError("raw_tokens_layer_idx requires aggregated_tokens_list to be a list/tuple of per-layer features")
+            resolved_layer_idx = raw_tokens_layer_idx
+            if resolved_layer_idx < 0:
+                resolved_layer_idx = len(aggregated_tokens_list) + resolved_layer_idx
+            if resolved_layer_idx < 0 or resolved_layer_idx >= len(aggregated_tokens_list):
+                raise ValueError(
+                    f"raw_tokens_layer_idx={raw_tokens_layer_idx} is out of range for {len(aggregated_tokens_list)} VGGT layers"
+                )
+            raw_tokens = aggregated_tokens_list[resolved_layer_idx]
+            B, S, N_patches, D = raw_tokens.shape
+            if hasattr(self.encoder, 'aggregator') and hasattr(self.encoder.aggregator, 'patch_start_idx'):
+                patch_start_idx_val = self.encoder.aggregator.patch_start_idx
+                if N_patches > 1369:
+                    raw_tokens = raw_tokens[:, :, patch_start_idx_val:]
+                    B, S, N_patches, D = raw_tokens.shape
+        elif hasattr(self, 'use_multi_scale') and self.use_multi_scale:
             # Extract features from layers [11, 17, 23]
             multi_scale_features = []
             for idx, layer_idx in enumerate(self.layer_indices):
@@ -1034,6 +1053,9 @@ class GaussianAdapter(nn.Module):
         
         # LGPD is disabled in this configuration; pass through tokens unchanged.
         
+        if return_unprojected_raw_tokens:
+            return gaussian_embs, g_mask, raw_tokens.detach().to(torch.float32)
+
         # Prepare return values
         if return_gaussian_params and return_raw_tokens and return_mta_features:
             raw_tokens_proj = None

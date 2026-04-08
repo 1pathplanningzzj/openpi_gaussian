@@ -609,6 +609,9 @@ class TrainConfig:
     stage1_freeze_velocity_head: bool = True
     stage2_freeze_static_head: bool = True
     stage2_shared_backbone_lr_scale: float = 0.25
+    stage4_freeze_world_model: bool = False
+    stage4_disable_world_model_losses: bool = False
+    stage4_disable_alignment: bool = False
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -880,7 +883,7 @@ _CONFIGS = [
             extra_delta_transform=False,
         ),
         # batch_size=256,
-        batch_size=16,  # Global batch size; with 4 GPUs this becomes 4 samples per GPU
+        batch_size=16,  # Reduced global batch size to fit world-model future decode/render
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,

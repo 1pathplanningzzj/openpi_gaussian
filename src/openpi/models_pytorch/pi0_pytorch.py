@@ -253,7 +253,7 @@ class PI0Pytorch(nn.Module):
 
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0404_lpips_future_5_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0406_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -498,6 +498,22 @@ class PI0Pytorch(nn.Module):
                 param.requires_grad = True
             logging.info("Unfroze Gaussian Adapter")
 
+    def freeze_world_model_decoder(self):
+        """Freeze the full Gaussian decoder without touching the Gaussian adapter."""
+        if self.world_model is None:
+            return
+        for param in self.world_model.parameters():
+            param.requires_grad = False
+        logging.info("Froze full world-model decoder")
+
+    def unfreeze_world_model_decoder(self):
+        """Unfreeze the full Gaussian decoder before applying per-head stage settings."""
+        if self.world_model is None:
+            return
+        for param in self.world_model.parameters():
+            param.requires_grad = True
+        logging.info("Unfroze full world-model decoder")
+
     def _set_module_requires_grad(self, module: nn.Module | None, enabled: bool) -> bool:
         """Enable or disable gradients for a module if it exists."""
         if module is None:
@@ -556,6 +572,66 @@ class PI0Pytorch(nn.Module):
             setter(enabled)
             logging.info("Set world-model image fusion to %s", "enabled" if enabled else "disabled")
 
+    def freeze_alignment_modules(self):
+        """Freeze lightweight alignment heads used for teacher alignment / current geometry decode."""
+        frozen_any = False
+        for module_name in ("current_geometry_adapter", "current_align_projector"):
+            module = getattr(self, module_name, None)
+            if self._set_module_requires_grad(module, False):
+                frozen_any = True
+        if frozen_any:
+            logging.info("Froze current alignment modules")
+
+    def unfreeze_alignment_modules(self):
+        """Unfreeze lightweight alignment heads used before Stage 4 action-focused tuning."""
+        unfrozen_any = False
+        for module_name in ("current_geometry_adapter", "current_align_projector"):
+            module = getattr(self, module_name, None)
+            if self._set_module_requires_grad(module, True):
+                unfrozen_any = True
+        if unfrozen_any:
+            logging.info("Unfroze current alignment modules")
+
+    def set_alignment_runtime(self, enabled: bool):
+        """Enable or disable alignment losses / hidden-state extraction at runtime."""
+        if enabled:
+            self.use_current_vggt_teacher_align = self._base_use_current_vggt_teacher_align
+            self.enable_current_aligned_decode = self._base_enable_current_aligned_decode
+        else:
+            self.use_current_vggt_teacher_align = False
+            self.enable_current_aligned_decode = False
+        logging.info(
+            "Set alignment runtime to %s (teacher_align=%s, aligned_decode=%s)",
+            "enabled" if enabled else "disabled",
+            self.use_current_vggt_teacher_align,
+            self.enable_current_aligned_decode,
+        )
+
+    def set_world_supervision_enabled(self, enabled: bool, *, render_weight: float):
+        """Enable or disable world-model supervision losses for the current stage."""
+        self._world_supervision_enabled = bool(enabled)
+        if enabled:
+            self.render_loss_weight = float(render_weight)
+            self.depth_loss_weight = float(self._base_depth_loss_weight)
+            self.future_depth_aux_loss_weight = float(self._base_future_depth_aux_loss_weight)
+            self.flow_loss_weight = float(self._base_flow_loss_weight)
+            self.current_frame_recon_loss_weight = float(self._base_current_frame_recon_loss_weight)
+        else:
+            self.render_loss_weight = 0.0
+            self.depth_loss_weight = 0.0
+            self.future_depth_aux_loss_weight = 0.0
+            self.flow_loss_weight = 0.0
+            self.current_frame_recon_loss_weight = 0.0
+        logging.info(
+            "Set world supervision to %s | render=%.4f depth=%.4f future_depth=%.4f flow=%.4f current_recon=%.4f",
+            "enabled" if enabled else "disabled",
+            self.render_loss_weight,
+            self.depth_loss_weight,
+            self.future_depth_aux_loss_weight,
+            self.flow_loss_weight,
+            self.current_frame_recon_loss_weight,
+        )
+
     def freeze_prefix_vlm_backbone(self):
         """Freeze the full PaliGemma prefix backbone while keeping custom world-token modules trainable."""
         self._set_module_requires_grad(self.paligemma_with_expert.paligemma, False)
@@ -579,7 +655,7 @@ class PI0Pytorch(nn.Module):
             # Stage 1: representation/world-model only, image fusion always on, action off.
             self.set_world_loss_enabled(True, render_weight=render_weight)
             self.freeze_action_expert()
-            self.freeze_prefix_vlm_backbone()
+            self.unfreeze_prefix_vlm_backbone()
             self.set_world_model_image_fusion(True)
             self.unfreeze_shared_backbone()
             self.unfreeze_static_head()
@@ -593,6 +669,17 @@ class PI0Pytorch(nn.Module):
             self.freeze_static_head()
             self.freeze_velocity_head()
             self.unfreeze_action_expert()
+            if self._stage4_freeze_world_model:
+                self.freeze_world_model_decoder()
+            else:
+                self.unfreeze_shared_backbone()
+                self.unfreeze_static_head()
+                self.unfreeze_velocity_head()
+            if self._stage4_disable_world_model_losses:
+                self.set_world_supervision_enabled(False, render_weight=0.0)
+            if self._stage4_disable_alignment:
+                self.freeze_alignment_modules()
+                self.set_alignment_runtime(False)
         else:
             raise ValueError(f"Unsupported stage: {stage}")
 
@@ -617,6 +704,8 @@ class PI0Pytorch(nn.Module):
             "shared_backbone": _module_trainable(getattr(self.world_model, "shared_backbone", None)),
             "static_head": _module_trainable(getattr(self.world_model, "static_head", None)),
             "velocity_head": _module_trainable(getattr(self.world_model, "velocity_head", None)),
+            "align_projector": _module_trainable(getattr(self, "current_align_projector", None)),
+            "geometry_adapter": _module_trainable(getattr(self, "current_geometry_adapter", None)),
         }
 
     def _get_action_mlp_modules(self):
@@ -676,6 +765,34 @@ class PI0Pytorch(nn.Module):
             )
         return func(*args, **kwargs)
 
+    def _get_training_stage(self, step: int | None) -> int:
+        if step is None:
+            return 4
+        stage1_steps = int(getattr(self.config, "stage1_steps", 0))
+        stage2_steps = int(getattr(self.config, "stage2_steps", 0))
+        stage3_steps = int(getattr(self.config, "stage3_steps", 0))
+        if stage1_steps > 0 and step < stage1_steps:
+            return 1
+        if stage2_steps > 0 and step < stage2_steps:
+            return 2
+        if stage3_steps > 0 and step < stage3_steps:
+            return 3
+        return 4
+
+    def _apply_training_stage_if_needed(self, step: int | None) -> int:
+        stage = self._get_training_stage(step)
+        if self._active_training_stage == stage:
+            return stage
+        render_weight = float(getattr(self.config, f"stage{stage}_render_weight", self.render_loss_weight))
+        self.apply_world_model_stage(
+            stage,
+            render_weight,
+            freeze_velocity_head=bool(getattr(self.config, "stage1_freeze_velocity_head", True)),
+            freeze_static_head=bool(getattr(self.config, "stage2_freeze_static_head", True)),
+        )
+        self._active_training_stage = stage
+        logging.info("Applied training stage %s with render_weight=%s", stage, render_weight)
+        return stage
 
     def _create_2d_sinusoidal_encoding(self, height, width, embed_dim):
         """Create 2D sinusoidal positional encoding for spatial grid.
@@ -713,8 +830,187 @@ class PI0Pytorch(nn.Module):
 
         return pe
 
+
+    def _camera_role(self, camera_name: str) -> str:
+        name = camera_name.lower()
+        if "wrist" in name or "bravo" in name:
+            return "wrist"
+        return "main"
+
+    def _camera_decode_alias(self, camera_name: str) -> str:
+        name = camera_name.lower()
+        if "wrist" in name or "bravo" in name:
+            return "wrist"
+        if name == "image" or "agent" in name or "base" in name:
+            return "agent"
+        if "high" in name or "exterior" in name or "sideview" in name:
+            return name
+        return name
+
+    def _resolve_current_decode_camera_name(self, observation) -> str | None:
+        if observation is None or not hasattr(observation, "images"):
+            return None
+        candidates: list[tuple[str, str]] = []
+        for key in observation.images.keys():
+            role = self._camera_role(key)
+            if role != "main":
+                continue
+            alias = self._camera_decode_alias(key)
+            candidates.append((alias, key))
+        if not candidates:
+            return None
+        for alias, key in candidates:
+            if alias == self.current_decode_view or key.lower() == self.current_decode_view:
+                return key
+        for alias, key in candidates:
+            if alias == "agent":
+                return key
+        return candidates[0][1]
+
+    def _get_teacher_observation(self, preprocessed_observation):
+        source_observation = self._get_motion_weight_source_observation(preprocessed_observation)
+        if source_observation is None:
+            return None
+        current_steps = self._get_temporal_observation_length(source_observation)
+        if current_steps > 0:
+            return self._slice_temporal_observation(source_observation, current_steps - 1)
+        return source_observation
+
+    def _get_teacher_tokens_for_camera(
+        self,
+        teacher_observation,
+        device: torch.device,
+        batch_size: int,
+        camera_name: str,
+        target_dim: int,
+    ) -> torch.Tensor | None:
+        gaussian_inputs = self._prepare_gaussian_inputs(
+            teacher_observation,
+            device,
+            batch_size,
+            is_training=False,
+            preferred_camera_name=camera_name,
+            force_num_frames=1,
+        )
+        if gaussian_inputs is None:
+            return None
+        teacher_result = self.gaussian_adapter(
+            gaussian_inputs,
+            return_unprojected_raw_tokens=True,
+            raw_tokens_layer_idx=self.vggt_layers_align,
+        )
+        if len(teacher_result) != 3:
+            return None
+        _, _, teacher_raw_tokens = teacher_result
+        if teacher_raw_tokens is None or teacher_raw_tokens.ndim != 4:
+            return None
+        teacher_frame_index = teacher_raw_tokens.shape[1] - 1
+        return teacher_raw_tokens[:, teacher_frame_index, :, :target_dim].detach().to(torch.float32)
+
+
+    def _pool_tokens_to_match(self, source_tokens: torch.Tensor, target_tokens: torch.Tensor) -> torch.Tensor:
+        if source_tokens.shape[1] == target_tokens.shape[1]:
+            return source_tokens
+        src_grid = int(math.isqrt(source_tokens.shape[1]))
+        tgt_grid = int(math.isqrt(target_tokens.shape[1]))
+        if src_grid * src_grid != source_tokens.shape[1] or tgt_grid * tgt_grid != target_tokens.shape[1]:
+            raise ValueError(
+                f"Cannot pool non-square token counts source={source_tokens.shape[1]} target={target_tokens.shape[1]}"
+            )
+        source_grid = source_tokens.transpose(1, 2).reshape(source_tokens.shape[0], source_tokens.shape[2], src_grid, src_grid)
+        pooled = F.adaptive_avg_pool2d(source_grid, (tgt_grid, tgt_grid))
+        return pooled.reshape(source_tokens.shape[0], source_tokens.shape[2], tgt_grid * tgt_grid).transpose(1, 2)
+
+    def _extract_current_aligned_tokens(
+        self,
+        prefix_hidden: torch.Tensor,
+        preprocessed_observation,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, object]]:
+        debug_info: dict[str, object] = {
+            "student_shapes": {},
+            "teacher_shapes": {},
+            "selected_view": None,
+            "selected_view_shape": None,
+            "selected_geometry_shape": None,
+            "teacher_camera": None,
+        }
+        if not self.use_current_vggt_teacher_align or not self._last_prefix_image_ranges:
+            return prefix_hidden.new_zeros((), dtype=torch.float32), None, debug_info
+
+        teacher_observation = self._get_teacher_observation(preprocessed_observation)
+        if teacher_observation is None:
+            return prefix_hidden.new_zeros((), dtype=torch.float32), None, debug_info
+
+        alignment_loss = prefix_hidden.new_zeros((), dtype=torch.float32)
+        main_losses: list[torch.Tensor] = []
+        wrist_losses: list[torch.Tensor] = []
+        current_main_view = None
+        current_main_tokens = None
+
+        for camera_info in self._last_prefix_image_ranges:
+            name = str(camera_info["name"])
+            start = int(camera_info["start"])
+            tokens_per_frame = int(camera_info["tokens_per_frame"])
+            current_frame = int(camera_info["current_frame_index"])
+            role = str(camera_info["role"])
+            current_start = start + current_frame * tokens_per_frame
+            current_end = current_start + tokens_per_frame
+            if current_end > prefix_hidden.shape[1]:
+                continue
+
+            student_tokens = prefix_hidden[:, current_start:current_end, :].to(torch.float32)
+            teacher_tokens = self._get_teacher_tokens_for_camera(
+                teacher_observation,
+                prefix_hidden.device,
+                prefix_hidden.shape[0],
+                name,
+                prefix_hidden.shape[-1],
+            )
+            if teacher_tokens is not None:
+                teacher_tokens = self._pool_tokens_to_match(teacher_tokens, student_tokens)
+                projected_student = self.current_align_projector(student_tokens)
+                camera_loss = 1.0 - F.cosine_similarity(
+                    F.normalize(projected_student, dim=-1),
+                    F.normalize(teacher_tokens, dim=-1),
+                    dim=-1,
+                ).mean()
+                if role == "wrist":
+                    wrist_losses.append(camera_loss)
+                else:
+                    main_losses.append(camera_loss)
+                debug_info["teacher_shapes"][name] = tuple(teacher_tokens.shape)
+            else:
+                debug_info["teacher_shapes"][name] = None
+                if role == "wrist":
+                    wrist_losses.append(prefix_hidden.new_zeros((), dtype=torch.float32))
+
+            debug_info["student_shapes"][name] = tuple(student_tokens.shape)
+
+            alias = self._camera_decode_alias(name)
+            if current_main_view is None and role == "main":
+                current_main_view = name
+                current_main_tokens = student_tokens
+            if role == "main" and (alias == self.current_decode_view or name.lower() == self.current_decode_view):
+                current_main_view = name
+                current_main_tokens = student_tokens
+                debug_info["teacher_camera"] = name
+
+        if main_losses:
+            alignment_loss = alignment_loss + self.align_loss_coeff_main_current * torch.stack(main_losses).mean()
+        if wrist_losses:
+            alignment_loss = alignment_loss + self.align_loss_coeff_wrist_current * torch.stack(wrist_losses).mean()
+
+        debug_info["selected_view"] = current_main_view
+        if current_main_tokens is None or not self.enable_current_aligned_decode:
+            return alignment_loss, None, debug_info
+
+        debug_info["selected_view_shape"] = tuple(current_main_tokens.shape)
+        current_geometry_tokens = self.current_geometry_adapter(current_main_tokens)
+        debug_info["selected_geometry_shape"] = tuple(current_geometry_tokens.shape)
+        return alignment_loss, current_geometry_tokens, debug_info
+
     def _temporal_context_labels(self) -> list[str]:
-        labels = []
+        labels: list[str] = []
         for offset in self.temporal_context_offsets:
             if offset == 0:
                 labels.append("t")
@@ -775,10 +1071,13 @@ class PI0Pytorch(nn.Module):
         additive_mask = additive_mask.masked_fill(~att_2d_masks, min_dtype)
         return additive_mask[:, None, :, :]
 
+    def _get_current_frame_index(self, image_tensor: torch.Tensor) -> int:
+        if image_tensor.ndim == 5:
+            return max(0, image_tensor.shape[1] - 1)
+        return 0
+
     def _preprocess_observation(self, observation, train: bool = True):
         """Helper method to preprocess observation."""
-
-        # Check if single-frame mode is enabled
         use_single_frame_mode = getattr(self.config, "use_single_frame_mode", False)
 
         # --- Handle Future Split for 3DGS World Model ---
@@ -1386,10 +1685,7 @@ class PI0Pytorch(nn.Module):
         depth_map = gaussian_params.pop("depth_map", None)
         depth_delta_map = gaussian_params.pop("depth_delta_map", None)
         raw_delta_xyz = gaussian_params.pop("raw_delta_xyz", None)
-        slot_entropy = gaussian_params.pop("slot_entropy", None)
-        slot_balance_loss = gaussian_params.pop("slot_balance_loss", None)
         slot_trans_reg = gaussian_params.pop("slot_trans_reg", None)
-        slot_rot_reg = gaussian_params.pop("slot_rot_reg", None)
         slot_usage = gaussian_params.pop("slot_usage", None)
         gaussian_params.pop("slot_probs", None)
         gaussian_params.pop("slot_logits", None)
@@ -1411,10 +1707,7 @@ class PI0Pytorch(nn.Module):
                 slot_usage_str = ", ".join(f"{value:.4f}" for value in slot_usage.float().mean(dim=0).detach().cpu().tolist())
                 logging.info(
                     f"Step {step}{time_suffix}: Slot Motion Diagnostics | "
-                    f"entropy={slot_entropy.item() if slot_entropy is not None else float('nan'):.6f}, "
-                    f"balance={slot_balance_loss.item() if slot_balance_loss is not None else float('nan'):.6f}, "
                     f"trans_reg={slot_trans_reg.item() if slot_trans_reg is not None else float('nan'):.6f}, "
-                    f"rot_reg={slot_rot_reg.item() if slot_rot_reg is not None else float('nan'):.6f}, "
                     f"usage=[{slot_usage_str}]"
                 )
 
@@ -1444,15 +1737,9 @@ class PI0Pytorch(nn.Module):
             if torch.isfinite(flow_loss):
                 total_loss = total_loss + self.flow_loss_weight * flow_loss
 
-        if slot_entropy is not None and torch.isfinite(slot_entropy) and self.slot_entropy_loss_weight > 0.0:
-            total_loss = total_loss + self.slot_entropy_loss_weight * slot_entropy.to(total_loss.dtype)
-        if slot_balance_loss is not None and torch.isfinite(slot_balance_loss) and self.slot_balance_loss_weight > 0.0:
-            total_loss = total_loss + self.slot_balance_loss_weight * slot_balance_loss.to(total_loss.dtype)
         if self.slot_transform_reg_weight > 0.0:
             if slot_trans_reg is not None and torch.isfinite(slot_trans_reg):
                 total_loss = total_loss + self.slot_transform_reg_weight * slot_trans_reg.to(total_loss.dtype)
-            if slot_rot_reg is not None and torch.isfinite(slot_rot_reg):
-                total_loss = total_loss + self.slot_transform_reg_weight * slot_rot_reg.to(total_loss.dtype)
 
         for key, value in gaussian_params.items():
             if torch.is_tensor(value) and (torch.isnan(value).any() or torch.isinf(value).any()):
@@ -1835,35 +2122,18 @@ class PI0Pytorch(nn.Module):
             return lang_emb * math.sqrt(lang_emb_dim)
 
         lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
-        
+
         # Handle temporal dimension in lang_emb if present
         # lang_emb might be [B, SeqLen, D] or [B, T, SeqLen, D]
         # For concatenation with other embeddings, we need [B, SeqLen, D] or [B, T*SeqLen, D]
-        lang_emb_original = lang_emb
-        lang_masks_original = lang_masks
         if lang_emb.ndim == 4:  # [B, T, SeqLen, D] - has temporal dimension
             B, T, S, D = lang_emb.shape
-            # Flatten temporal and sequence dimensions: [B, T, SeqLen, D] -> [B, T*SeqLen, D]
-            # Use reshape (not view): lang_masks may be non-contiguous after expand/slice.
             lang_emb = lang_emb.reshape(B, T * S, D)  # [B, T*SeqLen, D]
             lang_masks = lang_masks.reshape(B, T * S)  # [B, T*SeqLen]
-            # For text embedding pooling, use original shape
-            lang_emb_for_pooling = lang_emb_original
-            lang_masks_for_pooling = lang_masks_original
-        else:
-            lang_emb_for_pooling = lang_emb
-            lang_masks_for_pooling = lang_masks
-        
-        # --- 3D Gaussian Encoder ---
-        # Delegated to Adapter. LGPD is disabled in this configuration so we do not
-        # compute a separate pooled text_embedding for the Gaussian adapter.
-        text_embedding = None
 
-        # --- Get World Tokens from GaussianAdapter (NEW) ---
+        text_embedding = None
         world_tokens = None
         world_mask = None
-        # World tokens removed — redundant with Gaussian tokens (300).
-        # The block below is intentionally empty; kept for code structure clarity.
 
         gaussian_embs = None
         g_mask = None
@@ -1906,20 +2176,18 @@ class PI0Pytorch(nn.Module):
 
         gaussian_embs_for_prefix = None
         g_mask_for_prefix = None
-        if (
-            gaussian_embs is not None
-            and self.use_world_tokens_in_prefix
-            and self.static_gaussian_token_count > 0
-            and gaussian_embs.shape[1] >= self.static_gaussian_token_count
-        ):
-            # Keep only the current-frame Gaussian tokens (last context slot) in the prefix.
-            # This mirrors the original current-frame decode semantics used by AD-FFgsStudio:
-            # current/static reconstruction should come from current features, not future motion queries.
-            gaussian_embs_for_prefix = gaussian_embs[:, -self.static_gaussian_token_count :, :]
-            g_mask_for_prefix = g_mask[:, -self.static_gaussian_token_count :]
-        else:
-            gaussian_embs_for_prefix = gaussian_embs
-            g_mask_for_prefix = g_mask
+        if self.use_current_gaussian_tokens_in_prefix:
+            if (
+                gaussian_embs is not None
+                and self.use_world_tokens_in_prefix
+                and self.static_gaussian_token_count > 0
+                and gaussian_embs.shape[1] >= self.static_gaussian_token_count
+            ):
+                gaussian_embs_for_prefix = gaussian_embs[:, -self.static_gaussian_token_count :, :]
+                g_mask_for_prefix = g_mask[:, -self.static_gaussian_token_count :]
+            else:
+                gaussian_embs_for_prefix = gaussian_embs
+                g_mask_for_prefix = g_mask
 
         if gaussian_embs_for_prefix is not None:
             _append_segment('gaussian', gaussian_embs_for_prefix, g_mask_for_prefix, att_value=0)
@@ -1929,31 +2197,32 @@ class PI0Pytorch(nn.Module):
 
         # Process images
         total_img_tokens = 0
-        for img, img_mask in zip(images, img_masks, strict=True):
-            # Handle temporal dimension: [B, T, H, W, C] or [B, H, W, C]
+        image_token_offset = 0
+        image_names = list(getattr(motion_prior_observation, "images", {}).keys()) if motion_prior_observation is not None else []
+        if not image_names:
+            image_names = [f"image_{idx}" for idx in range(len(images))]
+        for idx, (img, img_mask) in enumerate(zip(images, img_masks, strict=True)):
+            camera_name = image_names[idx] if idx < len(image_names) else f"image_{idx}"
             has_temporal = img.ndim == 5
+            current_frame_index = self._get_current_frame_index(img)
             if has_temporal:
-                B, T = img.shape[0], img.shape[1]
-                # Flatten temporal dimension: [B, T, H, W, C] -> [B*T, H, W, C]
-                img_flat = img.reshape(B * T, *img.shape[2:])  # [B*T, H, W, C]
-                # Encode all frames at once
-                def image_embed_func(img_flat):
-                    return self.paligemma_with_expert.embed_image(img_flat)
+                img_current = img[:, current_frame_index]
+                if img_mask.ndim == 2:
+                    img_mask_current = img_mask[:, current_frame_index]
+                else:
+                    img_mask_current = img_mask
 
-                img_emb_flat = self._apply_checkpoint(image_embed_func, img_flat)
-                # img_emb_flat: [B*T, N, D] where N is number of image tokens
-                num_img_embs = img_emb_flat.shape[1]
-                # Reshape back: [B*T, N, D] -> [B, T, N, D]
-                img_emb = img_emb_flat.reshape(B, T, num_img_embs, img_emb_flat.shape[-1])
-                # Flatten time and token dimensions: [B, T, N, D] -> [B, T*N, D]
-                img_emb = img_emb.reshape(B, T * num_img_embs, img_emb_flat.shape[-1])
+                def image_embed_func(img_current):
+                    return self.paligemma_with_expert.embed_image(img_current)
 
-                # Handle mask: [B, T] -> expand to [B, T*N]
-                img_mask_expanded = img_mask.unsqueeze(-1).expand(-1, -1, num_img_embs)  # [B, T, N]
-                img_mask_flat = img_mask_expanded.reshape(B, T * num_img_embs)  # [B, T*N]
-                n_tokens = T * num_img_embs
+                img_emb = self._apply_checkpoint(image_embed_func, img_current)
+                bsize, num_img_embs = img_emb.shape[:2]
+                img_mask_flat = img_mask_current[:, None].expand(bsize, num_img_embs)
+                n_tokens = num_img_embs
+                tokens_per_frame = num_img_embs
+                prefix_num_frames = 1
+                prefix_current_frame_index = 0
             else:
-                # No temporal dimension: [B, H, W, C]
                 def image_embed_func(img):
                     return self.paligemma_with_expert.embed_image(img)
 
@@ -1961,6 +2230,9 @@ class PI0Pytorch(nn.Module):
                 bsize, num_img_embs = img_emb.shape[:2]
                 img_mask_flat = img_mask[:, None].expand(bsize, num_img_embs)
                 n_tokens = num_img_embs
+                tokens_per_frame = num_img_embs
+                prefix_num_frames = 1
+                prefix_current_frame_index = 0
 
             _append_segment(f'image_{total_img_tokens}', img_emb, img_mask_flat, att_value=0)
             total_img_tokens += n_tokens
@@ -1982,7 +2254,7 @@ class PI0Pytorch(nn.Module):
             device = pad_masks[0].device if pad_masks else next(self.parameters()).device
             future_dtype = self.future_query_tokens.dtype
 
-            delta_q = self.future_query_tokens.expand(B, -1, -1)  # [B, 1024, D]
+            delta_q = self.future_query_tokens.expand(B, -1, -1)
             segment_lengths['debug_delta_q_shape'] = tuple(delta_q.shape)
             if mta_features is not None:
                 segment_lengths['debug_mta_shapes'] = {
@@ -2024,7 +2296,7 @@ class PI0Pytorch(nn.Module):
                         f"MTA feature frame count mismatch (expected {expected_frames}, got {', '.join(frame_mismatches)})"
                     )
 
-                motion_tokens = self.future_query_to_mta(delta_q)  # [B, 1024, 512]
+                motion_tokens = self.future_query_to_mta(delta_q)
                 motion_tokens = motion_tokens.unsqueeze(1).expand(-1, expected_frames, -1, -1)
                 motion_tokens = self.future_mta_encoder(motion_tokens, layer_features)
                 ta_current = motion_tokens[:, expected_frames - 1]
@@ -2050,8 +2322,6 @@ class PI0Pytorch(nn.Module):
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
-
-        # Get batch size from the first dimension of the concatenated tensors
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
@@ -2138,16 +2408,33 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def _prepare_gaussian_inputs(self, observation, device, batch_size, is_training=None):
+    def _prepare_gaussian_inputs(
+        self,
+        observation,
+        device,
+        batch_size,
+        is_training=None,
+        preferred_camera_name: str | None = None,
+        force_num_frames: int | None = None,
+    ):
         """Helper to prepare inputs for 3DGS encoder from observation.
-        
+
         Args:
             is_training: If True, uses training mode (more frames). If False, uses inference mode (fewer frames).
                         If None, auto-detects from model.training.
+            preferred_camera_name: Optional exact camera key for VGGT encoding.
+            force_num_frames: Optional explicit frame count override for cases like single-frame teacher alignment.
         """
         if is_training is None:
             is_training = self.training
-        return self.gaussian_adapter.prepare_inputs(observation, device, batch_size, is_training=is_training)
+        return self.gaussian_adapter.prepare_inputs(
+            observation,
+            device,
+            batch_size,
+            is_training=is_training,
+            preferred_camera_name=preferred_camera_name,
+            force_num_frames=force_num_frames,
+        )
 
     def _get_camera_params_for_view(self, view_name, device, batch_size):
         """Get camera parameters for specific view (agent or wrist)."""
@@ -2797,15 +3084,32 @@ class PI0Pytorch(nn.Module):
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        (prefix_out, _), _ = self.paligemma_with_expert.forward(
-            attention_mask=att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
-        )
-
+        output_hidden_states = self.use_current_vggt_teacher_align or self.enable_current_aligned_decode
+        current_visual_geometry_tokens = None
+        if output_hidden_states:
+            (prefix_out, _), _, hidden_states_history = self._run_prefix_backbone(
+                prefix_embs,
+                suffix_embs,
+                att_2d_masks_4d,
+                position_ids,
+                adarms_cond,
+                output_hidden_states=True,
+            )
+            if hidden_states_history is not None and len(hidden_states_history) > self.vla_layers_align:
+                prefix_hidden, _ = hidden_states_history[self.vla_layers_align]
+                _, current_visual_geometry_tokens, _ = self._extract_current_aligned_tokens(
+                    prefix_hidden,
+                    preprocessed_observation,
+                )
+        else:
+            (prefix_out, _), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
         z_current_static_tokens = None
         z_future_pred_tokens = None
         gaussian_slice = self._get_segment_slice(segment_info, "gaussian")
@@ -2831,12 +3135,10 @@ class PI0Pytorch(nn.Module):
         if current_target is None:
             current_target = preprocessed_observation
 
-        current_recon_tokens = z_current_static_tokens if z_current_static_tokens is not None else z_future_pred_tokens
-        current_decoder_state = (
-            self._build_world_decoder_state(current_recon_tokens, step=None)
-            if z_current_static_tokens is not None
-            else decoder_state
-        )
+        current_recon_tokens = current_visual_geometry_tokens
+        if current_recon_tokens is None:
+            current_recon_tokens = z_current_static_tokens if z_current_static_tokens is not None else z_future_pred_tokens
+        current_decoder_state = self._build_world_decoder_state(current_recon_tokens, step=None)
         _, static_template_raw = self._compute_current_frame_recon_loss(
             current_recon_tokens,
             current_target,
@@ -2962,12 +3264,34 @@ class PI0Pytorch(nn.Module):
             renders["sweep"] = self.gaussian_renderer(params_single, sweep_camera).float()
         return renders
 
-    def forward(self, observation, actions, noise=None, time=None, step=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state, future_observation, preprocessed_observation = self._preprocess_observation(observation, train=True)
+    def _run_prefix_backbone(
+        self,
+        prefix_embs: torch.Tensor,
+        suffix_embs: torch.Tensor,
+        att_2d_masks_4d: torch.Tensor,
+        position_ids: torch.Tensor,
+        adarms_cond,
+        *,
+        output_hidden_states: bool = False,
+    ):
+        return self.paligemma_with_expert.forward(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+            output_hidden_states=output_hidden_states,
+        )
 
-        # Move LPIPS to the correct device if initialized
-        if self.lpips_fn is not None and hasattr(self.lpips_fn, 'net'):
+    def forward(self, observation, actions, noise=None, time=None, step=None) -> Tensor:
+        """Do a full training forward pass and compute the loss."""
+        self._apply_training_stage_if_needed(step)
+        images, img_masks, lang_tokens, lang_masks, state, future_observation, preprocessed_observation = self._preprocess_observation(
+            observation, train=True
+        )
+
+        if self.lpips_fn is not None and hasattr(self.lpips_fn, "net"):
             device = actions.device
             if next(self.lpips_fn.parameters()).device != device:
                 self.lpips_fn = self.lpips_fn.to(device)
@@ -2981,21 +3305,24 @@ class PI0Pytorch(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        
-        # Prepare Gaussian Inputs
-        # IMPORTANT: Use the preprocessed observation (with temporal dimension preserved) for VGGT
-        # The original observation passed to forward() may not have the correct temporal structure
-        # after _preprocess_observation processing. We need to reconstruct it from the processed data.
-        gaussian_inputs = None
-        # Check against adapter flag
-        if self.gaussian_adapter.use_gaussian:
-            # FIX: Use preprocessed_observation instead of original observation
-            # The preprocessed_observation has temporal dimension preserved, while original observation may have been modified
-            gaussian_inputs = self._prepare_gaussian_inputs(preprocessed_observation, actions.device, actions.shape[0])
 
-        # Get prefix embeddings with segment lengths for extracting future tokens
+        selected_decode_camera = self._resolve_current_decode_camera_name(preprocessed_observation)
+        teacher_observation = self._get_teacher_observation(preprocessed_observation)
+        gaussian_inputs = None
+        if self.gaussian_adapter.use_gaussian:
+            gaussian_inputs = self._prepare_gaussian_inputs(
+                preprocessed_observation,
+                actions.device,
+                actions.shape[0],
+            )
+
+
         prefix_result = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, gaussian_inputs=gaussian_inputs,
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            gaussian_inputs=gaussian_inputs,
             return_segment_lengths=self.use_world_tokens_in_prefix,
             motion_prior_observation=preprocessed_observation,
         )
@@ -3029,42 +3356,73 @@ class PI0Pytorch(nn.Module):
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
+        output_hidden_states = self.use_current_vggt_teacher_align or self.enable_current_aligned_decode
+        if output_hidden_states:
+            (prefix_out, suffix_out), _, hidden_states_history = self._run_prefix_backbone(
+                prefix_embs,
+                suffix_embs,
+                att_2d_masks_4d,
+                position_ids,
+                adarms_cond,
+                output_hidden_states=True,
             )
-            return prefix_out, suffix_out
+        else:
+            (prefix_out, suffix_out), _ = self._apply_checkpoint(
+                self._run_prefix_backbone,
+                prefix_embs,
+                suffix_embs,
+                att_2d_masks_4d,
+                position_ids,
+                adarms_cond,
+                output_hidden_states=False,
+            )
+            hidden_states_history = None
 
-        prefix_out, suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
+        align_loss = prefix_out.new_zeros((), dtype=torch.float32)
+        current_visual_geometry_tokens = None
+        current_align_debug: dict[str, object] = {}
+        if output_hidden_states and hidden_states_history is not None and len(hidden_states_history) > self.vla_layers_align:
+            prefix_hidden, _ = hidden_states_history[self.vla_layers_align]
+            align_loss, current_visual_geometry_tokens, current_align_debug = self._extract_current_aligned_tokens(
+                prefix_hidden,
+                preprocessed_observation,
+            )
+            if step is not None and step % 400 == 0:
+                student_shapes = current_align_debug.get("student_shapes", {})
+                teacher_shapes = current_align_debug.get("teacher_shapes", {})
+                logging.info(
+                    f"Step {step}: Current Align Debug | "
+                    f"selected_view={current_align_debug.get('selected_view')}, "
+                    f"selected_view_shape={current_align_debug.get('selected_view_shape')}, "
+                    f"selected_geometry_shape={current_align_debug.get('selected_geometry_shape')}, "
+                    f"student_shapes={student_shapes}, teacher_shapes={teacher_shapes}, "
+                    f"align_loss={align_loss.item():.6f}"
+                )
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         suffix_out = self.action_out_proj(suffix_out)
-        
-        # Base Action Loss (Flow Matching)
-        if self._action_loss_enabled:
+
+        action_warmup_active = step is not None and step < self.action_warmup_steps
+        action_loss_enabled = self._action_loss_enabled and not action_warmup_active
+        if action_loss_enabled:
             loss = F.mse_loss(suffix_out, u_t)
         else:
-            # Use suffix_out * 0 to keep grad_fn alive even when action loss is disabled,
-            # so backward() won't fail if render/depth branches are skipped for a batch.
             loss = (suffix_out * 0).sum()
-        
-        # --- Extract Future Frame Tokens from Prefix Output (NEW) ---
+
+        if step is not None and step % 400 == 0:
+            logging.info(
+                f"Step {step}: Action loss schedule | enabled={action_loss_enabled}, "
+                f"warmup_steps={self.action_warmup_steps}, action_branch_trainable={self._action_loss_enabled}"
+            )
+
+        if torch.isfinite(align_loss):
+            loss = loss + align_loss.to(loss.dtype)
+
         z_current_static_tokens = None
         z_t1_pred_tokens = None
         z_future_pred_tokens = None
@@ -3087,8 +3445,6 @@ class PI0Pytorch(nn.Module):
                     f"future_start={future_start}, future_end={future_end}, "
                     f"segment_ranges={segment_info.get('ranges', {})}"
                 )
-
-            if step is not None and step % 400 == 0:
                 logging.info(
                     f"Step {step}: Future Motion Token Stats | "
                     f"abs_mean={z_t1_pred_tokens.float().abs().mean().item():.6f}, "
@@ -3096,7 +3452,12 @@ class PI0Pytorch(nn.Module):
                     "mode=direct motion-aware velocity token"
                 )
 
-        if self.use_world_tokens_in_prefix and z_future_pred_tokens is not None and future_observation is not None:
+        if (
+            self._world_supervision_enabled
+            and self.use_world_tokens_in_prefix
+            and z_future_pred_tokens is not None
+            and future_observation is not None
+        ):
             available_future_steps = self._get_temporal_observation_length(future_observation)
             rollout_horizon = min(self.future_prediction_horizon, available_future_steps or 1)
             world_model_loss = torch.zeros((), dtype=torch.float32, device=loss.device)
@@ -3111,14 +3472,18 @@ class PI0Pytorch(nn.Module):
             if current_target is None:
                 current_target = preprocessed_observation
 
-            current_recon_tokens = z_current_static_tokens if z_current_static_tokens is not None else z_future_pred_tokens
+            current_recon_tokens = current_visual_geometry_tokens
+            current_recon_source = "aligned_current_tokens"
+            if current_recon_tokens is None and z_current_static_tokens is not None:
+                current_recon_tokens = z_current_static_tokens
+                current_recon_source = "current_gaussian_tokens_fallback"
+            elif current_recon_tokens is None:
+                current_recon_tokens = z_future_pred_tokens
+                current_recon_source = "future_tokens_fallback"
+
             if current_recon_tokens is not None:
                 try:
-                    current_decoder_state = (
-                        self._build_world_decoder_state(current_recon_tokens, step=step)
-                        if z_current_static_tokens is not None
-                        else decoder_state
-                    )
+                    current_decoder_state = self._build_world_decoder_state(current_recon_tokens, step=step)
                     current_template_loss, static_template_raw = self._compute_current_frame_recon_loss(
                         current_recon_tokens,
                         current_target,
@@ -3139,11 +3504,10 @@ class PI0Pytorch(nn.Module):
                     if step is not None and step % 400 == 0:
                         logging.info(
                             f"Step {step}: Current Frame Static Recon = {current_template_loss.item():.6f}, "
-                            f"weight={self.current_frame_recon_loss_weight}, "
-                            f"source={'current_gaussian_tokens' if z_current_static_tokens is not None else 'future_tokens_fallback'}"
+                            f"weight={self.current_frame_recon_loss_weight}, source={current_recon_source}"
                         )
-                except Exception as e:
-                    logging.warning(f"Current-frame static reconstruction failed: {e}")
+                except Exception as error:
+                    logging.warning(f"Current-frame static reconstruction failed: {error}")
                     static_template = None
 
             if rollout_horizon > 0:
@@ -3178,7 +3542,11 @@ class PI0Pytorch(nn.Module):
                         else future_observation
                     )
                     offset0 = self.future_prediction_offsets[0] if self.future_prediction_offsets else 1
-                    offseth = self.future_prediction_offsets[horizon_idx] if horizon_idx < len(self.future_prediction_offsets) else (horizon_idx + 1)
+                    offseth = (
+                        self.future_prediction_offsets[horizon_idx]
+                        if horizon_idx < len(self.future_prediction_offsets)
+                        else (horizon_idx + 1)
+                    )
                     velocity_time_factor = float(offseth) / float(offset0) if offset0 else 1.0
                     horizon_suffix = f"_tplus{offseth}_pred_vlm"
                     horizon_loss = self._compute_world_model_frame_loss(
@@ -3218,23 +3586,26 @@ class PI0Pytorch(nn.Module):
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        """Do a full inference forward and compute the action."""
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state, _, preprocessed_observation = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, _, preprocessed_observation = self._preprocess_observation(
+            observation, train=False
+        )
 
         gaussian_inputs = None
         if self.gaussian_adapter.use_gaussian:
-            # For inference, use inference mode (fewer frames, more flexible)
-            # Use preprocessed_observation to ensure temporal dimension is preserved
             gaussian_inputs = self._prepare_gaussian_inputs(preprocessed_observation, device, bsize, is_training=False)
 
-        # Get prefix embeddings (with segment lengths if using world tokens)
         prefix_result = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, gaussian_inputs=gaussian_inputs,
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            gaussian_inputs=gaussian_inputs,
             return_segment_lengths=self.use_world_tokens_in_prefix,
             motion_prior_observation=preprocessed_observation,
         )
@@ -3246,7 +3617,6 @@ class PI0Pytorch(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
@@ -3272,8 +3642,6 @@ class PI0Pytorch(nn.Module):
                 x_t,
                 expanded_time,
             )
-
-            # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             timestep += dt
         return x_t
