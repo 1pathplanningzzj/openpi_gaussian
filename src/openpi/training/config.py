@@ -596,13 +596,9 @@ class TrainConfig:
 
     # Stage schedule:
     # - Stage 1: [0, stage1_steps)
-    #   Static-focused world-model warmup, image fusion off, action/VLM frozen.
-    # - Stage 2: [stage1_steps, stage2_steps)
-    #   Velocity-focused world-model training, image fusion off, action/VLM frozen.
-    # - Stage 3: [stage2_steps, stage3_steps)
-    #   Image-fusion world-model training, image fusion on, action/VLM still frozen.
-    # - Stage 4: [stage3_steps, ...)
-    #   Joint training, image fusion on, action/VLM unfrozen.
+    #   Representation/world-model-only training, image fusion on, action/VLM frozen.
+    # - Stage 2: [stage1_steps, ...)
+    #   Action-only training, image fusion stays on, world-model params frozen and world losses off.
     stage1_steps: int = 0
     stage2_steps: int = 0
     stage3_steps: int = 0
@@ -878,8 +874,8 @@ _CONFIGS = [
             # Using depth-augmented dataset with fixed LeRobot data loading
             base_config=DataConfig(
                 prompt_from_task=True,
-                dataset_root="/home/zijianzhang/openpi/data_subsets/libero_tasks_0_9_with_depth",
-                flow_root="/home/zijianzhang/openpi/data_subsets/flow_sidecars_raft_tasks_0_9",
+                dataset_root="/data/zijianzhang/LIBERA/data_with_depth",
+                flow_root="/data/zijianzhang/LIBERA/flow_sidecars_raft",
             ),
             extra_delta_transform=False,
         ),
@@ -897,16 +893,16 @@ _CONFIGS = [
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
         save_interval=1000,  # Save more frequently to make resume easier during long experiments
-        stage1_steps=2_000,  # Stage 1: warm up current-frame + near-future world-model, action/VLM off
-        stage2_steps=10_000,  # Stage 2: velocity-focused world-model training, image fusion still off
-        stage3_steps=15_000,  # Stage 3: turn on image fusion, keep action/VLM frozen until 15k
-        stage1_render_weight=0.2,  # Moderate render supervision during world-model-only warmup
-        stage2_render_weight=0.2,  # Keep current/future frame supervision strong while action is still frozen
-        stage3_render_weight=0.2,  # Keep render/depth/flow supervision strong during image-fusion-only stage
-        stage4_render_weight=0.05,  # Lower render weight once joint action/VLM training is enabled
+        stage1_steps=15_000,  # Stage 1: world-model-only representation training until 15k
+        stage2_steps=0,  # Unused in the simplified 2-stage schedule
+        stage3_steps=0,  # Unused in the simplified 2-stage schedule
+        stage1_render_weight=0.2,  # Keep world-model supervision on during stage1
+        stage2_render_weight=0.0,  # Stage 2 disables world losses at runtime
+        stage3_render_weight=0.0,  # Unused in the simplified 2-stage schedule
+        stage4_render_weight=0.0,  # Unused in the simplified 2-stage schedule
         stage1_freeze_velocity_head=False,  # Train static and dynamic branches together during stage1
-        stage2_freeze_static_head=False,  # Keep current-frame/static branch trainable during stage2 world-model-only training
-        stage2_shared_backbone_lr_scale=0.25,
+        stage2_freeze_static_head=False,  # Unused in the simplified 2-stage schedule
+        stage2_shared_backbone_lr_scale=0.0,
     ),
     #
     # Fine-tuning Aloha configs.

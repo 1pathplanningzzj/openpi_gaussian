@@ -1,0 +1,36 @@
+{
+  "dataset_root": "/home/zijianzhang/openpi/data_subsets/libero_tasks_0_9_with_depth",
+  "parquet_path": "/home/zijianzhang/openpi/data_subsets/libero_tasks_0_9_with_depth/data/chunk-000/episode_000016.parquet",
+  "episode_index": 16,
+  "task_index": 8,
+  "task_name": "put the black bowl in the bottom drawer of the cabinet and close it",
+  "num_frames": 248,
+  "current_frame": 45,
+  "current_frame_brightness": 135.43359375,
+  "past_offsets": [
+    10,
+    5,
+    0
+  ],
+  "future_count": 5,
+  "labels": [
+    "t-10",
+    "t-5",
+    "t",
+    "t+1",
+    "t+2",
+    "t+3",
+    "t+4",
+    "t+5"
+  ],
+  "frame_indices": [
+    35,
+    40,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50
+  ]
+}

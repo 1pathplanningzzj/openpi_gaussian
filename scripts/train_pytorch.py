@@ -417,28 +417,11 @@ def _stage_lr_scales(config: _config.TrainConfig, stage: int) -> dict[str, float
             "wm_velocity_head": 1.0,
         }
     if stage == 2:
-        world_lr_scale = float(getattr(config, "stage2_shared_backbone_lr_scale", 1.0))
         return {
             "default": 1.0,
-            "wm_shared_backbone": world_lr_scale,
-            "wm_static_head": world_lr_scale,
-            "wm_velocity_head": world_lr_scale,
-        }
-    if stage == 3:
-        world_lr_scale = float(getattr(config, "stage2_shared_backbone_lr_scale", 1.0))
-        return {
-            "default": 1.0,
-            "wm_shared_backbone": world_lr_scale,
-            "wm_static_head": world_lr_scale,
-            "wm_velocity_head": world_lr_scale,
-        }
-    if stage == 4:
-        world_lr_scale = float(getattr(config, "stage2_shared_backbone_lr_scale", 1.0))
-        return {
-            "default": 1.0,
-            "wm_shared_backbone": world_lr_scale,
-            "wm_static_head": world_lr_scale,
-            "wm_velocity_head": world_lr_scale,
+            "wm_shared_backbone": 0.0,
+            "wm_static_head": 0.0,
+            "wm_velocity_head": 0.0,
         }
     raise ValueError(f"Unsupported stage: {stage}")
 
@@ -453,22 +436,22 @@ def _apply_stage_state(
     is_main: bool,
     label: str,
 ):
-    raw_model.apply_world_model_stage(
-        stage,
-        render_weight,
-        freeze_velocity_head=bool(getattr(config, "stage1_freeze_velocity_head", True)),
-        freeze_static_head=bool(getattr(config, "stage2_freeze_static_head", True)),
-    )
+    raw_model.apply_world_model_stage(stage, render_weight)
     _set_optimizer_lr_scales(optimizer, _stage_lr_scales(config, stage))
     raw_model._stage_applied = stage
 
     if is_main:
         trainability = raw_model.get_stage_trainability_summary() if hasattr(raw_model, "get_stage_trainability_summary") else {}
         lr_scales = {pg.get("name", f"group_{idx}"): float(pg.get("lr_scale", 1.0)) for idx, pg in enumerate(optimizer.param_groups)}
+        static_head = getattr(getattr(raw_model, "world_model", None), "static_head", None)
+        image_fusion_enabled = getattr(static_head, "use_image_fusion", "n/a") if static_head is not None else "n/a"
         logging.info(
-            "%s | render_weight=%.4f | lr_scales=%s | trainable=%s",
+            "%s | render_weight=%.4f | image_fusion=%s | action_loss=%s | world_losses=%s | lr_scales=%s | trainable=%s",
             label,
             render_weight,
+            image_fusion_enabled,
+            getattr(raw_model, "_action_loss_enabled", "n/a"),
+            getattr(raw_model, "_world_loss_enabled", "n/a"),
             lr_scales,
             trainability,
         )
@@ -525,6 +508,11 @@ def train_loop(config: _config.TrainConfig):
 
     # Staged training changes which branches participate in backward across steps,
     # which is incompatible with DDP static_graph mode.
+    # Stage schedule:
+    # - Stage 1: [0, stage1_steps)
+    #   Representation/world-model training only, image fusion on, action off.
+    # - Stage 2: [stage1_steps, ...)
+    #   Action-only training, image fusion stays on, world-model params frozen and world losses off.
     stage1_steps = getattr(config, "stage1_steps", 0)
     stage2_steps = getattr(config, "stage2_steps", 0)
     stage3_steps = getattr(config, "stage3_steps", 0)
@@ -532,8 +520,6 @@ def train_loop(config: _config.TrainConfig):
     stage2_render_weight = getattr(config, "stage2_render_weight", 0.2)
     stage3_render_weight = getattr(config, "stage3_render_weight", 0.1)
     stage4_render_weight = getattr(config, "stage4_render_weight", stage3_render_weight)
-    use_four_stage = stage3_steps > stage2_steps > stage1_steps > 0
-    use_three_stage = stage1_steps > 0 and stage2_steps > stage1_steps
     staged_training_enabled = stage1_steps > 0
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
@@ -723,42 +709,18 @@ def train_loop(config: _config.TrainConfig):
     )
 
     if staged_training_enabled and is_main:
-        logging.info(f"=== Staged Training Enabled ===")
-        if use_four_stage:
-            logging.info(
-                f"Stage 1 (Static-focused): steps 0-{stage1_steps}, render_weight={stage1_render_weight}, action=off"
-            )
-            logging.info(
-                f"Stage 2 (Velocity-focused): steps {stage1_steps}-{stage2_steps}, render_weight={stage2_render_weight}, action=off"
-            )
-            logging.info(
-                f"Stage 3 (Image-fusion world-model): steps {stage2_steps}-{stage3_steps}, render_weight={stage3_render_weight}, action=off"
-            )
-            logging.info(
-                f"Stage 4 (Joint training): steps {stage3_steps}-{config.num_train_steps}, render_weight={stage4_render_weight}, action=on"
-            )
-        elif use_three_stage:
-            logging.info(
-                f"Stage 1 (Static-focused): steps 0-{stage1_steps}, render_weight={stage1_render_weight}, action=off"
-            )
-            logging.info(
-                f"Stage 2 (Velocity-focused): steps {stage1_steps}-{stage2_steps}, render_weight={stage2_render_weight}, action=off"
-            )
-            logging.info(
-                f"Stage 3 (Joint training): steps {stage2_steps}-{config.num_train_steps}, render_weight={stage3_render_weight}, action=on"
-            )
-        else:
-            logging.info(
-                f"Stage 1 (Legacy early stage): steps 0-{stage1_steps}, render_weight={stage1_render_weight}, action=off"
-            )
-            logging.info(
-                f"Stage 2 (Legacy joint stage): steps {stage1_steps}-{config.num_train_steps}, render_weight={stage2_render_weight}, action=on"
-            )
+        logging.info("=== Staged Training Enabled ===")
+        logging.info(
+            f"Stage 1 (Representation/world-model): steps 0-{stage1_steps}, render_weight={stage1_render_weight}, image_fusion=on, action=off, world_losses=on"
+        )
+        logging.info(
+            f"Stage 2 (Action-only): steps {stage1_steps}-{config.num_train_steps}, render_weight=0.0 (configured stage2={stage2_render_weight}), image_fusion=on, action=on, world_losses=off"
+        )
 
     def _apply_stage_for_step(step: int):
         if not staged_training_enabled:
             return
-        if use_four_stage and step < stage1_steps:
+        if step < stage1_steps:
             if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
                 _apply_stage_state(
                     raw_model,
@@ -767,95 +729,18 @@ def train_loop(config: _config.TrainConfig):
                     1,
                     stage1_render_weight,
                     is_main=is_main,
-                    label="=== Stage 1 Active: Static-focused world-model training (action=off) ===",
-                )
-        elif use_four_stage and step < stage2_steps:
-            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 2:
-                _apply_stage_state(
-                    raw_model,
-                    optim,
-                    config,
-                    2,
-                    stage2_render_weight,
-                    is_main=is_main,
-                    label="=== Stage 2 Active: Velocity-focused world-model training (action=off) ===",
-                )
-        elif use_four_stage and step < stage3_steps:
-            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 3:
-                _apply_stage_state(
-                    raw_model,
-                    optim,
-                    config,
-                    3,
-                    stage3_render_weight,
-                    is_main=is_main,
-                    label="=== Stage 3 Active: Image-fusion world-model training (action=off) ===",
-                )
-        elif use_four_stage:
-            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 4:
-                _apply_stage_state(
-                    raw_model,
-                    optim,
-                    config,
-                    4,
-                    stage4_render_weight,
-                    is_main=is_main,
-                    label="=== Stage 4 Active: Joint training (action=on) ===",
-                )
-        elif use_three_stage and step < stage1_steps:
-            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
-                _apply_stage_state(
-                    raw_model,
-                    optim,
-                    config,
-                    1,
-                    stage1_render_weight,
-                    is_main=is_main,
-                    label="=== Stage 1 Active: Static-focused world-model training (action=off) ===",
-                )
-        elif use_three_stage and step < stage2_steps:
-            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 2:
-                _apply_stage_state(
-                    raw_model,
-                    optim,
-                    config,
-                    2,
-                    stage2_render_weight,
-                    is_main=is_main,
-                    label="=== Stage 2 Active: Velocity-focused world-model training (action=off) ===",
-                )
-        elif use_three_stage:
-            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 3:
-                _apply_stage_state(
-                    raw_model,
-                    optim,
-                    config,
-                    3,
-                    stage3_render_weight,
-                    is_main=is_main,
-                    label="=== Stage 3 Active: Joint training (action=on) ===",
-                )
-        elif step < stage1_steps:
-            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 1:
-                _apply_stage_state(
-                    raw_model,
-                    optim,
-                    config,
-                    1,
-                    stage1_render_weight,
-                    is_main=is_main,
-                    label="=== Stage 1 Active: Legacy early stage (action=off) ===",
+                    label="=== Stage 1 Active: Representation/world-model training (image_fusion=on, action=off, world_losses=on) ===",
                 )
         else:
-            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 3:
+            if not hasattr(raw_model, '_stage_applied') or raw_model._stage_applied != 2:
                 _apply_stage_state(
                     raw_model,
                     optim,
                     config,
-                    3,
+                    2,
                     stage2_render_weight,
                     is_main=is_main,
-                    label="=== Stage 2 Started: Legacy joint stage (action=on) ===",
+                    label="=== Stage 2 Active: Action-only training (image_fusion=on, action=on, world_losses=off) ===",
                 )
 
     _apply_stage_for_step(global_step)

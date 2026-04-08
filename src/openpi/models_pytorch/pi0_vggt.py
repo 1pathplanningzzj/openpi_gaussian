@@ -501,23 +501,27 @@ class GaussianAdapter(nn.Module):
             return None
         return self.forward(inputs)[0]
 
-    def prepare_inputs(self, observation, device, batch_size, is_training: bool = None):
+    def prepare_inputs(self, observation, device, batch_size, is_training: bool = None, view_type: str = "agent", current_frame_only: bool = False):
         """Helper to prepare inputs for VGGT encoder from observation.
         VGGT expects [Batch_size, S (frames), 3, H, W]
 
-        Strategy: use packed context frames from agent view only.
-        - Agent view is more stable and suitable for temporal modeling
-        - Wrist view is excluded from VGGT encoding (but still used in 2D encoders like SigLIP)
-        - Multiple packed context frames allow VGGT's global attention to establish cross-frame geometry relationships
+        Strategy:
+        - Agent path (default): use packed context frames from agent view only.
+        - Wrist path: optionally select wrist view and, when requested, only keep the current frame.
 
         Args:
             is_training: If True, uses num_frames. If False, uses inference_num_frames.
                         If None, auto-detects from model.training.
+            view_type: Which logical camera family to use: "agent" or "wrist".
+            current_frame_only: If True, keep only the current frame (last available context slot).
         """
         if not self.use_gaussian:
             return None
-        
-        # Find agent view image key
+
+        view_type = str(view_type).lower()
+        if view_type not in {"agent", "wrist"}:
+            raise ValueError(f"Unsupported view_type={view_type!r}; expected 'agent' or 'wrist'")
+
         # Observation is a dataclass with .images attribute (dict)
         if not hasattr(observation, 'images'):
             # Fallback: try to_dict() if it's an Observation object
@@ -529,45 +533,45 @@ class GaussianAdapter(nn.Module):
                 return None
         else:
             images_dict = observation.images
-        
-        # Filter for agent view (exclude wrist)
-        # Common agent view keys: "base_0_rgb", "agent_image", "agentview_image", etc.
-        # Wrist keys: "left_wrist_0_rgb", "right_wrist_0_rgb", "wrist_image", etc.
-        agent_images = {}
+
+        selected_images = {}
         for key in images_dict.keys():
             key_lower = key.lower()
-            # Exclude wrist views
-            if "wrist" not in key_lower:
-                # Accept keys that are agent views (base, agent, etc.) or contain _image/_rgb
+            is_wrist_key = "wrist" in key_lower
+            if view_type == "agent":
+                if is_wrist_key:
+                    continue
                 if key == "image" or any(prefix in key_lower for prefix in ["base", "agent", "sideview"]) or \
                    "_image" in key_lower or "_rgb" in key_lower:
-                    agent_images[key] = images_dict[key]
-        
-        if not agent_images:
-            # Log available keys for debugging
+                    selected_images[key] = images_dict[key]
+            else:
+                if is_wrist_key:
+                    selected_images[key] = images_dict[key]
+
+        if not selected_images:
             available_keys = list(images_dict.keys())
-            logging.warning(f"No agent view images found for VGGT encoding. Available keys: {available_keys}")
+            logging.warning(f"No {view_type} view images found for VGGT encoding. Available keys: {available_keys}")
             return None
-        
-        # Use the first agent view found (typically "agent_image" or "agentview_image" or "base_0_rgb")
-        agent_key = list(agent_images.keys())[0]
-        
-        # Get agent view image
-        img = agent_images[agent_key]
-        logging.debug(f"Using agent view for VGGT: {agent_key}, shape: {img.shape}, ndim: {img.ndim}")
+
+        selected_key = list(selected_images.keys())[0]
+        img = selected_images[selected_key]
+        logging.debug(f"Using {view_type} view for VGGT: {selected_key}, shape: {img.shape}, ndim: {img.ndim}")
         # Determine number of frames to use
         # Auto-detect training mode if not specified
         if is_training is None:
             is_training = self.training if hasattr(self, 'training') else True
-        
+
         if is_training:
             target_num_frames = self.num_frames
         else:
             target_num_frames = self.inference_num_frames
-            
+        if current_frame_only:
+            target_num_frames = 1
+            is_training = False
+
         # Use the image size defined in the encoder if available, otherwise default to 518 (VGGT standard)
         target_size = getattr(self.encoder, "img_size", 518)
-        
+
         # Handle Temporal Dimension
         # Goal: Extract packed context frames from the front of the temporal slots.
         # Layout is expected to be [context..., future...], so current frame is always the
@@ -579,13 +583,19 @@ class GaussianAdapter(nn.Module):
             if img.shape[-1] == 3:  # [B, T, H, W, C]
                 img = img.permute(0, 1, 4, 2, 3)  # [B, T, C, H, W]
 
-            if T >= target_num_frames:
+            if current_frame_only:
+                if T <= 0:
+                    logging.error(f"No temporal frames available for {view_type} current-frame selection")
+                    return None
+                current_idx = T - 1
+                img = img[:, current_idx:current_idx + 1]
+            elif T >= target_num_frames:
                 img = img[:, :target_num_frames]
             else:
                 if not is_training:
                     if T > 0 and target_num_frames > T:
                         logging.warning(
-                            f"Inference: padding VGGT agent view from T={T} to T={target_num_frames} "
+                            f"Inference: padding VGGT {view_type} view from T={T} to T={target_num_frames} "
                             f"by repeating frames (MTA expects same temporal length as training)."
                         )
                         pad_n = target_num_frames - T
@@ -614,18 +624,18 @@ class GaussianAdapter(nn.Module):
             # Check if channel last
             if img.shape[-1] == 3:  # [B, H, W, C]
                 img = img.permute(0, 3, 1, 2)  # [B, C, H, W]
-            
+
             # Single frame handling
-            if not is_training:
+            if not is_training or current_frame_only:
                 img = img.unsqueeze(1)  # [B, 1, C, H, W]
                 if target_num_frames > 1:
                     logging.warning(
-                        f"Inference: agent view is single-frame but model expects T={target_num_frames}; "
+                        f"Inference: {view_type} view is single-frame but model expects T={target_num_frames}; "
                         f"repeating the current frame for VGGT/MTA (prefer feeding a true multi-frame stack)."
                     )
                     img = img.repeat(1, target_num_frames, 1, 1, 1)
                 else:
-                    logging.debug("Inference: Using single frame for VGGT")
+                    logging.debug(f"Inference: Using single frame for VGGT ({view_type})")
             else:
                 # Training mode
                 if target_num_frames == 1:
@@ -644,7 +654,7 @@ class GaussianAdapter(nn.Module):
         else:
             logging.error(f"Unexpected image shape: {img.shape}. Expected 4D [B, C, H, W] or 5D [B, T, C, H, W]")
             return None
-        
+
         # Now img is [B, target_num_frames, C, H, W]
         # Process each frame: normalize and resize
         processed_frames = []
@@ -663,17 +673,17 @@ class GaussianAdapter(nn.Module):
                     frame = (frame + 1.0) / 2.0
                 elif frame_max > 1.5:
                     frame = frame / 255.0
-            
+
             # Resize
             if frame.shape[-2:] != (target_size, target_size):
-                frame = F.interpolate(frame, size=(target_size, target_size), 
+                frame = F.interpolate(frame, size=(target_size, target_size),
                                     mode='bilinear', align_corners=False)
-            
+
             processed_frames.append(frame)
-        
+
         # Stack frames: [B, target_num_frames, C, H, W]
         imgs_stacked = torch.stack(processed_frames, dim=1)
-        
+
         # Fix NaN: Check and sanitize input images before passing to VGGT encoder
         # This is critical because NaN in input will propagate through the entire model
         if torch.isnan(imgs_stacked).any() or torch.isinf(imgs_stacked).any():
@@ -684,13 +694,13 @@ class GaussianAdapter(nn.Module):
                 torch.zeros_like(imgs_stacked),
                 imgs_stacked
             )
-        
+
         # Clamp to valid range [0, 1] for normalized images
         imgs_stacked = torch.clamp(imgs_stacked, min=0.0, max=1.0)
-        
+
         mode_str = "training" if is_training else "inference"
-        logging.debug(f"VGGT input shape: {imgs_stacked.shape} (agent view, {target_num_frames} frames, {mode_str})")
-             
+        logging.debug(f"VGGT input shape: {imgs_stacked.shape} ({view_type} view, {target_num_frames} frames, {mode_str})")
+
         return imgs_stacked.to(device)
 
     def _extract_layer_mta_features(self, aggregated_tokens_list) -> Optional[Dict[int, torch.Tensor]]:

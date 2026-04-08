@@ -284,7 +284,14 @@ class PI0Pytorch(nn.Module):
         
         # Current frame reconstruction loss weight
         self.current_frame_recon_loss_weight = getattr(config, "current_frame_recon_loss_weight", 0.5)
-        
+        self._base_current_frame_recon_loss_weight = float(self.current_frame_recon_loss_weight)
+        self._base_render_loss_weight = float(getattr(config, "render_loss_weight", 0.1))
+        self._base_depth_loss_weight = float(getattr(config, "depth_loss_weight", 0.1))
+        self._base_future_depth_aux_loss_weight = float(getattr(config, "future_depth_aux_loss_weight", 0.0))
+        self._base_flow_loss_weight = float(getattr(config, "flow_loss_weight", 0.0))
+        self._world_loss_enabled = True
+        self._world_loss_multiplier = 1.0
+
         # --- World Model Tokens in Prefix (NEW Architecture) ---
         # Add future query tokens to prefix for unified VLM processing
         self.use_world_tokens_in_prefix = getattr(config, "use_world_model", False) and use_gaussian
@@ -407,12 +414,12 @@ class PI0Pytorch(nn.Module):
             self.use_sinusoidal_spatial = False
 
         # Initialize render loss weight (can be changed dynamically for staged training)
-        self.render_loss_weight = getattr(config, "render_loss_weight", 0.1)  # 降低render loss权重，让action loss主导
-        self.depth_loss_weight = getattr(config, "depth_loss_weight", 0.1)
+        self.render_loss_weight = self._base_render_loss_weight  # 降低render loss权重，让action loss主导
+        self.depth_loss_weight = self._base_depth_loss_weight
         self.use_future_depth_aux = bool(getattr(config, "use_future_depth_aux", False))
-        self.future_depth_aux_loss_weight = float(getattr(config, "future_depth_aux_loss_weight", 0.0))
+        self.future_depth_aux_loss_weight = self._base_future_depth_aux_loss_weight
         self.future_depth_aux_downsample = max(1, int(getattr(config, "future_depth_aux_downsample", 2)))
-        self.flow_loss_weight = float(getattr(config, "flow_loss_weight", 0.0))
+        self.flow_loss_weight = self._base_flow_loss_weight
         self.flow_loss_type = str(getattr(config, "flow_loss_type", "smooth_l1")).lower()
         self.flow_first_horizon_only = bool(getattr(config, "flow_first_horizon_only", True))
         raw_flow_horizon_weights = getattr(config, "flow_horizon_weights", None)
@@ -567,45 +574,24 @@ class PI0Pytorch(nn.Module):
         freeze_velocity_head: bool = True,
         freeze_static_head: bool = True,
     ):
-        """Apply staged trainability for action/world-model branches."""
-        self.set_render_loss_weight(render_weight)
+        """Apply the simplified 2-stage trainability schedule for action/world-model branches."""
         if stage == 1:
-            # Stage 1: static-focused world-model training, action off.
-            self.freeze_action_expert()
-            self.freeze_prefix_vlm_backbone()
-            self.set_world_model_image_fusion(False)
-            self.unfreeze_shared_backbone()
-            self.unfreeze_static_head()
-            if freeze_velocity_head:
-                self.freeze_velocity_head()
-            else:
-                self.unfreeze_velocity_head()
-        elif stage == 2:
-            # Stage 2: velocity-focused world-model training, action still off.
-            self.freeze_action_expert()
-            self.freeze_prefix_vlm_backbone()
-            self.set_world_model_image_fusion(False)
-            self.unfreeze_shared_backbone()
-            self.unfreeze_velocity_head()
-            if freeze_static_head:
-                self.freeze_static_head()
-            else:
-                self.unfreeze_static_head()
-        elif stage == 3:
-            # Stage 3: image-fusion world-model training, action/VLM still frozen.
+            # Stage 1: representation/world-model only, image fusion always on, action off.
+            self.set_world_loss_enabled(True, render_weight=render_weight)
             self.freeze_action_expert()
             self.freeze_prefix_vlm_backbone()
             self.set_world_model_image_fusion(True)
             self.unfreeze_shared_backbone()
             self.unfreeze_static_head()
             self.unfreeze_velocity_head()
-        elif stage == 4:
-            # Stage 4: joint training, action on and full world model trainable.
+        elif stage == 2:
+            # Stage 2: action-only, keep image fusion on but freeze world-model parameters.
+            self.set_world_loss_enabled(False, render_weight=render_weight)
             self.unfreeze_prefix_vlm_backbone()
             self.set_world_model_image_fusion(True)
-            self.unfreeze_shared_backbone()
-            self.unfreeze_static_head()
-            self.unfreeze_velocity_head()
+            self.freeze_shared_backbone()
+            self.freeze_static_head()
+            self.freeze_velocity_head()
             self.unfreeze_action_expert()
         else:
             raise ValueError(f"Unsupported stage: {stage}")
@@ -660,10 +646,27 @@ class PI0Pytorch(nn.Module):
         self._action_loss_enabled = True
         logging.info("Unfroze Action Expert + projections, enabled action loss")
 
-    def set_render_loss_weight(self, weight: float):
-        """Dynamically set render loss weight for stage-based training."""
-        self.render_loss_weight = weight
-        logging.info(f"Set render_loss_weight = {weight}")
+    def set_world_loss_enabled(self, enabled: bool, render_weight: float | None = None):
+        """Enable or disable world-model supervision while preserving configured base weights."""
+        self._world_loss_enabled = bool(enabled)
+        self._world_loss_multiplier = 1.0 if enabled else 0.0
+        target_render_weight = self._base_render_loss_weight if render_weight is None else float(render_weight)
+        self.render_loss_weight = target_render_weight * self._world_loss_multiplier
+        self.depth_loss_weight = self._base_depth_loss_weight * self._world_loss_multiplier
+        self.future_depth_aux_loss_weight = self._base_future_depth_aux_loss_weight * self._world_loss_multiplier
+        self.flow_loss_weight = self._base_flow_loss_weight * self._world_loss_multiplier
+        self.current_frame_recon_loss_weight = (
+            self._base_current_frame_recon_loss_weight * self._world_loss_multiplier
+        )
+        logging.info(
+            "Set world-model supervision %s | current=%.4f render=%.4f depth=%.4f flow=%.4f future_depth_aux=%.4f",
+            "enabled" if enabled else "disabled",
+            self.current_frame_recon_loss_weight,
+            self.render_loss_weight,
+            self.depth_loss_weight,
+            self.flow_loss_weight,
+            self.future_depth_aux_loss_weight,
+        )
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -1786,24 +1789,44 @@ class PI0Pytorch(nn.Module):
             return total_loss, gaussian_params
         return total_loss
 
+    def _get_segment_slice(self, segment_info: dict | None, name: str) -> tuple[int, int] | None:
+        if not segment_info:
+            return None
+        segment_ranges = segment_info.get("ranges", {})
+        segment_range = segment_ranges.get(name)
+        if segment_range is None:
+            return None
+        return int(segment_range[0]), int(segment_range[1])
+
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, gaussian_inputs=None,
         return_segment_lengths=False, motion_prior_observation=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
-        
+
         NEW: Also includes world tokens and future query tokens if enabled.
-        
+
         Returns:
             If return_segment_lengths=False: (embs, pad_masks, att_masks)
-            If return_segment_lengths=True: (embs, pad_masks, att_masks, segment_lengths)
-                where segment_lengths is a dict with keys: 'gaussian', 'images', 'language', 'world', 'future'
+            If return_segment_lengths=True: (embs, pad_masks, att_masks, segment_info)
+                where segment_info contains lengths/ranges for gaussian, gaussian_wrist,
+                images, language, world, and future segments.
         """
         embs = []
         pad_masks = []
         att_masks = []
         segment_lengths = {}  # Track lengths of each segment for extracting future tokens later
+        segment_ranges = {}
+
+        def _append_segment(name: str, emb: torch.Tensor, mask: torch.Tensor, att_value: int = 0):
+            start = sum(t.shape[1] for t in embs) if embs else 0
+            embs.append(emb)
+            pad_masks.append(mask)
+            seg_len = emb.shape[1]
+            att_masks.extend([att_value] * seg_len)
+            segment_lengths[name] = seg_len
+            segment_ranges[name] = (start, start + seg_len)
         
         # Process language tokens first to get text embedding for LGPD
         def lang_embed_func(lang_tokens):
@@ -1855,6 +1878,32 @@ class PI0Pytorch(nn.Module):
         else:
             gaussian_embs, g_mask = gaussian_result
 
+        wrist_gaussian_embs_for_prefix = None
+        wrist_g_mask_for_prefix = None
+        if motion_prior_observation is not None and self.gaussian_adapter.use_gaussian:
+            batch_size = lang_tokens.shape[0] if lang_tokens is not None else None
+            if batch_size is None and gaussian_inputs is not None:
+                batch_size = gaussian_inputs.shape[0]
+            if batch_size is None:
+                batch_size = 1
+            wrist_gaussian_inputs = self.gaussian_adapter.prepare_inputs(
+                motion_prior_observation,
+                device=lang_emb.device,
+                batch_size=batch_size,
+                is_training=False,
+                view_type="wrist",
+                current_frame_only=True,
+            )
+            if wrist_gaussian_inputs is not None:
+                wrist_gaussian_result = self.gaussian_adapter(
+                    wrist_gaussian_inputs,
+                    text_embedding=text_embedding,
+                    return_mta_features=False,
+                )
+                wrist_gaussian_embs, wrist_g_mask = wrist_gaussian_result
+                wrist_gaussian_embs_for_prefix = wrist_gaussian_embs
+                wrist_g_mask_for_prefix = wrist_g_mask
+
         gaussian_embs_for_prefix = None
         g_mask_for_prefix = None
         if (
@@ -1873,12 +1922,10 @@ class PI0Pytorch(nn.Module):
             g_mask_for_prefix = g_mask
 
         if gaussian_embs_for_prefix is not None:
-             embs.append(gaussian_embs_for_prefix)
-             pad_masks.append(g_mask_for_prefix)
-             # Attention: only current-t 3DGS tokens enter the VLM prefix; earlier frames stay in MTA only.
-             g_len = gaussian_embs_for_prefix.shape[1]
-             att_masks += [0] * g_len
-             segment_lengths['gaussian'] = g_len
+            _append_segment('gaussian', gaussian_embs_for_prefix, g_mask_for_prefix, att_value=0)
+
+        if wrist_gaussian_embs_for_prefix is not None and wrist_g_mask_for_prefix is not None:
+            _append_segment('gaussian_wrist', wrist_gaussian_embs_for_prefix, wrist_g_mask_for_prefix, att_value=0)
 
         # Process images
         total_img_tokens = 0
@@ -1915,34 +1962,21 @@ class PI0Pytorch(nn.Module):
                 img_mask_flat = img_mask[:, None].expand(bsize, num_img_embs)
                 n_tokens = num_img_embs
 
-            embs.append(img_emb)
-            pad_masks.append(img_mask_flat)
+            _append_segment(f'image_{total_img_tokens}', img_emb, img_mask_flat, att_value=0)
             total_img_tokens += n_tokens
-
-            # Create attention masks so that image tokens attend to each other
-            if has_temporal:
-                # For temporal images, each time frame's tokens attend to each other
-                att_masks += [0] * (T * num_img_embs)
-            else:
-                att_masks += [0] * num_img_embs
-        segment_lengths['images'] = total_img_tokens
+        if total_img_tokens > 0:
+            first_image_start = min(segment_ranges[name][0] for name in segment_ranges if name.startswith('image_'))
+            last_image_end = max(segment_ranges[name][1] for name in segment_ranges if name.startswith('image_'))
+            segment_lengths['images'] = total_img_tokens
+            segment_ranges['images'] = (first_image_start, last_image_end)
 
         # Append language tokens (already computed)
-        embs.append(lang_emb)
-        pad_masks.append(lang_masks)
+        _append_segment('language', lang_emb, lang_masks, att_value=0)
 
-        # full attention between image and language inputs
-        num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
-        segment_lengths['language'] = num_lang_embs
-        
         # --- Add World Tokens (NEW) ---
         if world_tokens is not None:
-            embs.append(world_tokens)
-            pad_masks.append(world_mask)
-            # World tokens can attend to all previous tokens (images, language, gaussian)
-            att_masks += [0] * self.world_token_count
-        
+            _append_segment('world', world_tokens, world_mask, att_value=0)
+
         if self.use_world_tokens_in_prefix and self.future_query_tokens is not None:
             B = pad_masks[0].shape[0] if pad_masks else 1
             device = pad_masks[0].device if pad_masks else next(self.parameters()).device
@@ -1998,21 +2032,20 @@ class PI0Pytorch(nn.Module):
             else:
                 raise RuntimeError("MTA-only future token path requires mta_features and MTA modules")
 
-            spatial_pos = self.future_spatial_pos.reshape(1, self.future_token_count, -1)  # [1, 256, D]
+            spatial_pos = self.future_spatial_pos.reshape(1, self.future_token_count, -1)
             if hasattr(self, 'use_sinusoidal_spatial') and self.use_sinusoidal_spatial:
-                sinusoidal_pos = self.future_spatial_sinusoidal.reshape(1, self.future_token_count, -1)  # [1, 256, D]
+                sinusoidal_pos = self.future_spatial_sinusoidal.reshape(1, self.future_token_count, -1)
                 spatial_pos = spatial_pos + sinusoidal_pos
 
             future_tokens = future_tokens + spatial_pos.to(future_tokens.dtype)
             future_mask = torch.ones(B, self.future_token_count, dtype=torch.bool, device=device)
 
+            start = sum(t.shape[1] for t in embs) if embs else 0
             embs.append(future_tokens)
             pad_masks.append(future_mask)
-            # Coupled mask: first future token creates a causal boundary (att=1),
-            # remaining future tokens are bidirectional among themselves (att=0).
-            # Effect: future tokens can see all context, but context cannot see future tokens.
-            att_masks += [1] + [0] * (self.future_token_count - 1)
+            att_masks.extend([1] + [0] * (self.future_token_count - 1))
             segment_lengths['future'] = self.future_token_count
+            segment_ranges['future'] = (start, start + self.future_token_count)
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -2023,7 +2056,7 @@ class PI0Pytorch(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         if return_segment_lengths:
-            return embs, pad_masks, att_masks, segment_lengths
+            return embs, pad_masks, att_masks, {"lengths": segment_lengths, "ranges": segment_ranges}
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, state, noisy_actions, timestep):
@@ -2744,7 +2777,7 @@ class PI0Pytorch(nn.Module):
             return_segment_lengths=True,
             motion_prior_observation=preprocessed_observation,
         )
-        prefix_embs, prefix_pad_masks, prefix_att_masks, segment_lengths = prefix_result
+        prefix_embs, prefix_pad_masks, prefix_att_masks, segment_info = prefix_result
 
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
             state,
@@ -2775,21 +2808,14 @@ class PI0Pytorch(nn.Module):
 
         z_current_static_tokens = None
         z_future_pred_tokens = None
-        if 'gaussian' in segment_lengths:
-            gaussian_end = segment_lengths['gaussian']
-            if gaussian_end > 0:
-                z_current_static_tokens = prefix_out[:, :gaussian_end, :]
-        if 'future' in segment_lengths:
-            future_start = 0
-            if 'gaussian' in segment_lengths:
-                future_start += segment_lengths['gaussian']
-            if 'images' in segment_lengths:
-                future_start += segment_lengths['images']
-            if 'language' in segment_lengths:
-                future_start += segment_lengths['language']
-            if 'world' in segment_lengths:
-                future_start += segment_lengths['world']
-            future_end = future_start + segment_lengths['future']
+        gaussian_slice = self._get_segment_slice(segment_info, "gaussian")
+        if gaussian_slice is not None:
+            gaussian_start, gaussian_end = gaussian_slice
+            if gaussian_end > gaussian_start:
+                z_current_static_tokens = prefix_out[:, gaussian_start:gaussian_end, :]
+        future_slice = self._get_segment_slice(segment_info, "future")
+        if future_slice is not None:
+            future_start, future_end = future_slice
             z_future_pred_tokens = prefix_out[:, future_start:future_end, :]
 
         if z_future_pred_tokens is None:
@@ -2974,11 +3000,12 @@ class PI0Pytorch(nn.Module):
             motion_prior_observation=preprocessed_observation,
         )
         if self.use_world_tokens_in_prefix:
-            prefix_embs, prefix_pad_masks, prefix_att_masks, segment_lengths = prefix_result
+            prefix_embs, prefix_pad_masks, prefix_att_masks, segment_info = prefix_result
         else:
             prefix_embs, prefix_pad_masks, prefix_att_masks = prefix_result
-            segment_lengths = {}
+            segment_info = {"lengths": {}, "ranges": {}}
 
+        segment_lengths = segment_info.get("lengths", {})
         if step is not None and step % 400 == 0 and self.use_world_tokens_in_prefix:
             delta_q_shape = segment_lengths.get("debug_delta_q_shape")
             debug_mta_shapes = segment_lengths.get("debug_mta_shapes", {})
@@ -3042,22 +3069,14 @@ class PI0Pytorch(nn.Module):
         z_t1_pred_tokens = None
         z_future_pred_tokens = None
         per_step_delta = None
-        if self.use_world_tokens_in_prefix and 'gaussian' in segment_lengths:
-            gaussian_end = segment_lengths['gaussian']
-            if gaussian_end > 0:
-                z_current_static_tokens = prefix_out[:, :gaussian_end, :]
-        if self.use_world_tokens_in_prefix and 'future' in segment_lengths:
-            future_start = 0
-            if 'gaussian' in segment_lengths:
-                future_start += segment_lengths['gaussian']
-            if 'images' in segment_lengths:
-                future_start += segment_lengths['images']
-            if 'language' in segment_lengths:
-                future_start += segment_lengths['language']
-            if 'world' in segment_lengths:
-                future_start += segment_lengths['world']
-
-            future_end = future_start + segment_lengths['future']
+        gaussian_slice = self._get_segment_slice(segment_info, "gaussian")
+        if self.use_world_tokens_in_prefix and gaussian_slice is not None:
+            gaussian_start, gaussian_end = gaussian_slice
+            if gaussian_end > gaussian_start:
+                z_current_static_tokens = prefix_out[:, gaussian_start:gaussian_end, :]
+        future_slice = self._get_segment_slice(segment_info, "future")
+        if self.use_world_tokens_in_prefix and future_slice is not None:
+            future_start, future_end = future_slice
             z_t1_pred_tokens = prefix_out[:, future_start:future_end, :]
             z_future_pred_tokens = z_t1_pred_tokens
 
@@ -3066,7 +3085,7 @@ class PI0Pytorch(nn.Module):
                     f"Step {step}: Future Token Shapes | "
                     f"z_t1_pred_tokens.shape={tuple(z_t1_pred_tokens.shape)}, "
                     f"future_start={future_start}, future_end={future_end}, "
-                    f"segment_lengths={segment_lengths}"
+                    f"segment_ranges={segment_info.get('ranges', {})}"
                 )
 
             if step is not None and step % 400 == 0:
@@ -3220,9 +3239,10 @@ class PI0Pytorch(nn.Module):
             motion_prior_observation=preprocessed_observation,
         )
         if self.use_world_tokens_in_prefix:
-            prefix_embs, prefix_pad_masks, prefix_att_masks, segment_lengths = prefix_result
+            prefix_embs, prefix_pad_masks, prefix_att_masks, segment_info = prefix_result
         else:
             prefix_embs, prefix_pad_masks, prefix_att_masks = prefix_result
+            segment_info = {"lengths": {}, "ranges": {}}
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
