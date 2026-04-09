@@ -384,24 +384,60 @@ class RobocasaDataConfig(DataConfigFactory):
     Data configuration for Robocasa.
     """
 
+    action_sequence_keys: Sequence[str] = ("action",)
+    use_depth: bool = False
+    flow_root: str | None = None
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_mapping = {
+            "observation/image": "observation.images.robot0_agentview_left_image",
+            "observation/wrist_image": "observation.images.robot0_eye_in_hand_image",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+
+        if self.use_depth:
+            repack_mapping["observation/depth"] = "observation.depth"
+            repack_mapping["observation/wrist_depth"] = "observation.wrist_depth"
+
+        if self.flow_root is not None or (self.base_config is not None and self.base_config.flow_root is not None):
+            repack_mapping["episode_index"] = "episode_index"
+            repack_mapping["frame_index"] = "frame_index"
+
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
-                    {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
+                    repack_mapping
                 )
             ]
         )
 
+        effective_flow_root = self.flow_root
+        if effective_flow_root is None and self.base_config is not None:
+            effective_flow_root = self.base_config.flow_root
+
+        data_inputs: list = []
+        if self.use_depth:
+            data_inputs.append(
+                depth_transform.LoadDepthTransform(
+                    use_depth=True,
+                    depth_key="observation/depth",
+                    wrist_depth_key="observation/wrist_depth",
+                )
+            )
+        if effective_flow_root is not None:
+            data_inputs.append(
+                depth_transform.LoadFlowTransform(
+                    flow_root=effective_flow_root,
+                    future_horizon=max(1, int(getattr(model_config, "future_prediction_horizon", 1))),
+                )
+            )
+        data_inputs.append(robocasa_policy.RobocasaInputs(model_type=model_config.model_type))
+
         data_transforms = _transforms.Group(
-            inputs=[robocasa_policy.RobocasaInputs(model_type=model_config.model_type)],
+            inputs=data_inputs,
             outputs=[robocasa_policy.RobocasaOutputs()],
         )
 
@@ -412,6 +448,7 @@ class RobocasaDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -762,7 +799,24 @@ _CONFIGS = [
             action_dim=12,
         ),
         data=RobocasaDataConfig(
-            repo_id="your_username/robocasa_converted",
+            repo_id="DAVIAN-Robotics/robocasa-H50",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_robocasa_depth",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            max_token_len=128,
+            action_dim=12,
+        ),
+        data=RobocasaDataConfig(
+            repo_id="DAVIAN-Robotics/robocasa-H50",
+            use_depth=True,
             base_config=DataConfig(
                 prompt_from_task=True,
             ),

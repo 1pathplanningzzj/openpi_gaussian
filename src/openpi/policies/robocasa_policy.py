@@ -10,7 +10,7 @@ from openpi.models import model as _model
 def make_robocasa_example() -> dict:
     """Creates a random input example for the Robocasa policy."""
     return {
-        "observation/state": np.random.rand(9),  # 7 joints + 2 gripper?
+        "observation/state": np.random.rand(16),
         "observation/image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/wrist_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "prompt": "do something in robocasa",
@@ -18,11 +18,35 @@ def make_robocasa_example() -> dict:
 
 
 def _parse_image(image) -> np.ndarray:
+    if isinstance(image, dict):
+        if "bytes" in image:
+            from PIL import Image
+            import io
+
+            image = Image.open(io.BytesIO(image["bytes"]))
+            image = np.array(image)
+        else:
+            raise ValueError(f"Unexpected dict format for image: {image.keys()}")
+    elif isinstance(image, (list, tuple)) and len(image) > 0 and isinstance(image[0], dict):
+        from PIL import Image
+        import io
+
+        frames = []
+        for img_dict in image:
+            if "bytes" not in img_dict:
+                raise ValueError(f"Unexpected dict format for image: {img_dict.keys()}")
+            img = Image.open(io.BytesIO(img_dict["bytes"]))
+            frames.append(np.array(img))
+        image = np.stack(frames, axis=0)
+        return image
+
     image = np.asarray(image)
     if np.issubdtype(image.dtype, np.floating):
         image = (255 * image).astype(np.uint8)
-    if image.shape[0] == 3:
+    if image.ndim == 3 and image.shape[0] == 3:
         image = einops.rearrange(image, "c h w -> h w c")
+    elif image.ndim == 4 and image.shape[1] == 3:
+        image = einops.rearrange(image, "t c h w -> t h w c")
     return image
 
 
@@ -61,6 +85,14 @@ class RobocasaInputs(transforms.DataTransformFn):
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
+        if "observation/depth" in data:
+            inputs["depth"] = data["observation/depth"]
+
+        if "observation/flow_3d" in data:
+            inputs["flow_3d"] = data["observation/flow_3d"]
+        if "observation/flow_valid_mask" in data:
+            inputs["flow_valid_mask"] = data["observation/flow_valid_mask"]
 
         return inputs
 

@@ -270,6 +270,23 @@ def create_torch_dataset(
                 )
             break
 
+    wrist_depth_keys_to_try = ["wrist_depth", "observation.wrist_depth", "observation/wrist_depth"]
+    for wrist_depth_key in wrist_depth_keys_to_try:
+        if wrist_depth_key in dataset_meta.features:
+            if use_single_frame_mode:
+                delta_timestamps[wrist_depth_key] = [0.0, *future_image_offsets]
+                print(
+                    f"DEBUG: [Single-frame mode] Added wrist depth data with key: {wrist_depth_key} "
+                    f"({1 + future_prediction_horizon} frames for [t, {future_offset_labels}])"
+                )
+            else:
+                delta_timestamps[wrist_depth_key] = [*context_image_offsets, *future_image_offsets]
+                print(
+                    f"DEBUG: [Multi-frame mode] Added wrist depth data with key: {wrist_depth_key} "
+                    f"({len(context_image_offsets) + future_prediction_horizon} frames for [{context_offset_labels}, {future_offset_labels}])"
+                )
+            break
+
     print(f"DEBUG: delta_timestamps: {delta_timestamps}")
 
     dataset = lerobot_dataset.LeRobotDataset(

@@ -92,45 +92,72 @@ def load_depth_anything_v2(model_size='small', device='cuda'):
         model: Depth Anything V2 model
         transform: Image preprocessing transform
     """
-    try:
-        # Try to import depth_anything_v2
-        from depth_anything_v2.dpt import DepthAnythingV2
-    except ImportError:
-        print("Installing Depth Anything V2...")
-        os.system("pip install depth-anything-v2")
-        from depth_anything_v2.dpt import DepthAnythingV2
-
-    # Model configurations
-    model_configs = {
-        'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-        'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-        'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-    }
-
     size_map = {'small': 'vits', 'base': 'vitb', 'large': 'vitl'}
     encoder = size_map[model_size]
 
-    # Initialize model
-    model = DepthAnythingV2(**model_configs[encoder])
+    try:
+        from depth_anything_v2.dpt import DepthAnythingV2
 
-    # Load pretrained weights
-    checkpoint_urls = {
-        'vits': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth',
-        'vitb': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/depth_anything_v2_vitb.pth',
-        'vitl': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth',
+        # Model configurations
+        model_configs = {
+            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+        }
+
+        model = DepthAnythingV2(**model_configs[encoder])
+
+        checkpoint_urls = {
+            'vits': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth',
+            'vitb': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/depth_anything_v2_vitb.pth',
+            'vitl': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth',
+        }
+
+        checkpoint_path = f'/tmp/depth_anything_v2_{encoder}.pth'
+        if not os.path.exists(checkpoint_path):
+            print(f"Downloading {encoder} model...")
+            os.system(f"wget {checkpoint_urls[encoder]} -O {checkpoint_path}")
+
+        state_dict = torch.load(checkpoint_path, map_location='cpu')
+        model.load_state_dict(state_dict)
+        model = model.to(device).eval()
+        print(f"Loaded Depth Anything V2 ({model_size}) on {device} via depth_anything_v2 package")
+        return model
+    except ImportError:
+        pass
+
+    try:
+        from transformers import DepthAnythingForDepthEstimation
+    except ImportError as exc:
+        raise ImportError(
+            "Neither depth_anything_v2 nor transformers DepthAnythingForDepthEstimation is available."
+        ) from exc
+
+    repo_map = {
+        'small': 'depth-anything/Depth-Anything-V2-Small-hf',
+        'base': 'depth-anything/Depth-Anything-V2-Base-hf',
+        'large': 'depth-anything/Depth-Anything-V2-Large-hf',
     }
+    repo_id = repo_map[model_size]
 
-    checkpoint_path = f'/tmp/depth_anything_v2_{encoder}.pth'
-    if not os.path.exists(checkpoint_path):
-        print(f"Downloading {encoder} model...")
-        os.system(f"wget {checkpoint_urls[encoder]} -O {checkpoint_path}")
+    class _HFDepthAnythingWrapper(torch.nn.Module):
+        def __init__(self, hf_model: torch.nn.Module) -> None:
+            super().__init__()
+            self.hf_model = hf_model
 
-    state_dict = torch.load(checkpoint_path, map_location='cpu')
-    model.load_state_dict(state_dict)
-    model = model.to(device).eval()
+        def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+            return self.hf_model(pixel_values=pixel_values).predicted_depth
 
-    print(f"Loaded Depth Anything V2 ({model_size}) on {device}")
+    try:
+        hf_model = DepthAnythingForDepthEstimation.from_pretrained(repo_id, local_files_only=True)
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"Missing local Hugging Face cache for {repo_id}. "
+            f"Please download it first or install depth_anything_v2 weights."
+        ) from exc
 
+    model = _HFDepthAnythingWrapper(hf_model).to(device).eval()
+    print(f"Loaded Depth Anything V2 ({model_size}) on {device} via local Hugging Face cache")
     return model
 
 

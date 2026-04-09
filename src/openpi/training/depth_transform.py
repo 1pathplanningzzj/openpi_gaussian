@@ -14,15 +14,34 @@ class LoadDepthTransform:
     serialized float32 depth maps of shape (256, 256).
     """
 
-    def __init__(self, use_depth: bool = True, depth_key: str = "depth"):
+    def __init__(
+        self,
+        use_depth: bool = True,
+        depth_key: str = "depth",
+        wrist_depth_key: str = "wrist_depth",
+    ):
         """
         Args:
             use_depth: Whether to load depth data
             depth_key: Key name for the main camera depth in the parquet file
+            wrist_depth_key: Key name for the wrist camera depth in the parquet file
         """
         self.use_depth = use_depth
         self.depth_key = depth_key
-        self.wrist_depth_key = "wrist_depth"
+        self.wrist_depth_key = wrist_depth_key
+
+    def _decode_depth_map(self, depth_data, depth_shape: tuple[int, int] | None = None) -> np.ndarray:
+        if isinstance(depth_data, bytes):
+            depth_array = np.frombuffer(depth_data, dtype=np.float32)
+            if depth_shape is None:
+                side = int(round(np.sqrt(depth_array.size)))
+                if side * side != depth_array.size:
+                    raise ValueError(
+                        f"Cannot infer square depth shape from {depth_array.size} float32 values"
+                    )
+                depth_shape = (side, side)
+            return depth_array.reshape(depth_shape)
+        return np.array(depth_data, dtype=np.float32)
 
     def __call__(self, sample: dict) -> dict:
         """
@@ -47,23 +66,14 @@ class LoadDepthTransform:
                 # Multiple frames (expected: 4 frames [t-2, t-1, t, t+1])
                 depth_frames = []
                 for depth_data in depth_bytes:
-                    if isinstance(depth_data, bytes):
-                        depth_array = np.frombuffer(depth_data, dtype=np.float32)
-                        depth_map = depth_array.reshape(256, 256)
-                    else:
-                        depth_map = np.array(depth_data, dtype=np.float32)
-                    depth_frames.append(depth_map)
+                    depth_frames.append(self._decode_depth_map(depth_data))
 
                 # Stack frames: [T, H, W] -> [T, 1, H, W] (add channel dimension)
                 depth_tensor = torch.from_numpy(np.stack([f.copy() for f in depth_frames], axis=0))
                 depth_tensor = depth_tensor.unsqueeze(1)  # [T, H, W] -> [T, 1, H, W]
             else:
                 # Single frame (fallback)
-                if isinstance(depth_bytes, bytes):
-                    depth_array = np.frombuffer(depth_bytes, dtype=np.float32)
-                    depth_map = depth_array.reshape(256, 256)
-                else:
-                    depth_map = np.array(depth_bytes, dtype=np.float32)
+                depth_map = self._decode_depth_map(depth_bytes)
 
                 # [H, W] -> [1, 1, H, W]
                 depth_tensor = torch.from_numpy(depth_map.copy()).unsqueeze(0).unsqueeze(0)
@@ -77,23 +87,14 @@ class LoadDepthTransform:
                 # Multiple frames (expected: 4 frames [t-2, t-1, t, t+1])
                 depth_frames = []
                 for depth_data in wrist_depth_bytes:
-                    if isinstance(depth_data, bytes):
-                        depth_array = np.frombuffer(depth_data, dtype=np.float32)
-                        depth_map = depth_array.reshape(256, 256)
-                    else:
-                        depth_map = np.array(depth_data, dtype=np.float32)
-                    depth_frames.append(depth_map)
+                    depth_frames.append(self._decode_depth_map(depth_data))
 
                 # Stack frames: [T, H, W] -> [T, 1, H, W]
                 wrist_depth_tensor = torch.from_numpy(np.stack([f.copy() for f in depth_frames], axis=0))
                 wrist_depth_tensor = wrist_depth_tensor.unsqueeze(1)
             else:
                 # Single frame (fallback)
-                if isinstance(wrist_depth_bytes, bytes):
-                    depth_array = np.frombuffer(wrist_depth_bytes, dtype=np.float32)
-                    depth_map = depth_array.reshape(256, 256)
-                else:
-                    depth_map = np.array(wrist_depth_bytes, dtype=np.float32)
+                depth_map = self._decode_depth_map(wrist_depth_bytes)
 
                 wrist_depth_tensor = torch.from_numpy(depth_map.copy()).unsqueeze(0).unsqueeze(0)
 
