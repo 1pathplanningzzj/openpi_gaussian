@@ -501,22 +501,87 @@ class GaussianAdapter(nn.Module):
             return None
         return self.forward(inputs)[0]
 
-    def prepare_inputs(self, observation, device, batch_size, is_training: bool = None, view_type: str = "agent", current_frame_only: bool = False):
+    def _select_observation_image(
+        self,
+        images_dict,
+        view_type: str,
+        preferred_camera_name: str | None = None,
+    ):
+        """Resolve the image tensor to encode for VGGT."""
+        if preferred_camera_name is not None:
+            if preferred_camera_name in images_dict:
+                return preferred_camera_name, images_dict[preferred_camera_name]
+
+            preferred_lower = preferred_camera_name.lower()
+            for key, value in images_dict.items():
+                if key.lower() == preferred_lower:
+                    return key, value
+
+            available_keys = list(images_dict.keys())
+            logging.warning(
+                "Preferred camera %r not found for VGGT encoding. Available keys: %s",
+                preferred_camera_name,
+                available_keys,
+            )
+            return None, None
+
+        selected_images = {}
+        for key, value in images_dict.items():
+            key_lower = key.lower()
+            is_wrist_key = "wrist" in key_lower or "bravo" in key_lower
+            if view_type == "agent":
+                if is_wrist_key:
+                    continue
+                if key == "image" or any(prefix in key_lower for prefix in ["base", "agent", "sideview"]) or \
+                   "_image" in key_lower or "_rgb" in key_lower:
+                    selected_images[key] = value
+            else:
+                if is_wrist_key:
+                    selected_images[key] = value
+
+        if not selected_images:
+            available_keys = list(images_dict.keys())
+            logging.warning(f"No {view_type} view images found for VGGT encoding. Available keys: {available_keys}")
+            return None, None
+
+        selected_key = list(selected_images.keys())[0]
+        return selected_key, selected_images[selected_key]
+
+    def prepare_inputs(
+        self,
+        observation,
+        device,
+        batch_size,
+        is_training: bool = None,
+        view_type: str = "agent",
+        current_frame_only: bool = False,
+        preferred_camera_name: str | None = None,
+        force_num_frames: int | None = None,
+    ):
         """Helper to prepare inputs for VGGT encoder from observation.
         VGGT expects [Batch_size, S (frames), 3, H, W]
 
         Strategy:
         - Agent path (default): use packed context frames from agent view only.
         - Wrist path: optionally select wrist view and, when requested, only keep the current frame.
+        - Exact-camera path: when preferred_camera_name is set, select that camera directly.
 
         Args:
             is_training: If True, uses num_frames. If False, uses inference_num_frames.
                         If None, auto-detects from model.training.
             view_type: Which logical camera family to use: "agent" or "wrist".
             current_frame_only: If True, keep only the current frame (last available context slot).
+            preferred_camera_name: Optional exact camera key to use instead of view_type routing.
+            force_num_frames: Optional explicit frame-count override. When shrinking a temporal stack,
+                keeps the most recent frames so the current frame is preserved.
         """
         if not self.use_gaussian:
             return None
+
+        if force_num_frames is not None:
+            force_num_frames = int(force_num_frames)
+            if force_num_frames <= 0:
+                raise ValueError(f"force_num_frames must be positive, got {force_num_frames}")
 
         view_type = str(view_type).lower()
         if view_type not in {"agent", "wrist"}:
@@ -534,34 +599,23 @@ class GaussianAdapter(nn.Module):
         else:
             images_dict = observation.images
 
-        selected_images = {}
-        for key in images_dict.keys():
-            key_lower = key.lower()
-            is_wrist_key = "wrist" in key_lower
-            if view_type == "agent":
-                if is_wrist_key:
-                    continue
-                if key == "image" or any(prefix in key_lower for prefix in ["base", "agent", "sideview"]) or \
-                   "_image" in key_lower or "_rgb" in key_lower:
-                    selected_images[key] = images_dict[key]
-            else:
-                if is_wrist_key:
-                    selected_images[key] = images_dict[key]
-
-        if not selected_images:
-            available_keys = list(images_dict.keys())
-            logging.warning(f"No {view_type} view images found for VGGT encoding. Available keys: {available_keys}")
+        selected_key, img = self._select_observation_image(
+            images_dict,
+            view_type=view_type,
+            preferred_camera_name=preferred_camera_name,
+        )
+        if img is None:
             return None
-
-        selected_key = list(selected_images.keys())[0]
-        img = selected_images[selected_key]
-        logging.debug(f"Using {view_type} view for VGGT: {selected_key}, shape: {img.shape}, ndim: {img.ndim}")
+        selected_route = f"camera={selected_key}" if preferred_camera_name is not None else f"{view_type} view"
+        logging.debug(f"Using {selected_route} for VGGT: shape={img.shape}, ndim={img.ndim}")
         # Determine number of frames to use
         # Auto-detect training mode if not specified
         if is_training is None:
             is_training = self.training if hasattr(self, 'training') else True
 
-        if is_training:
+        if force_num_frames is not None:
+            target_num_frames = force_num_frames
+        elif is_training:
             target_num_frames = self.num_frames
         else:
             target_num_frames = self.inference_num_frames
@@ -590,7 +644,10 @@ class GaussianAdapter(nn.Module):
                 current_idx = T - 1
                 img = img[:, current_idx:current_idx + 1]
             elif T >= target_num_frames:
-                img = img[:, :target_num_frames]
+                if force_num_frames is not None:
+                    img = img[:, T - target_num_frames:T]
+                else:
+                    img = img[:, :target_num_frames]
             else:
                 if not is_training:
                     if T > 0 and target_num_frames > T:

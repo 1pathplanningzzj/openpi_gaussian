@@ -253,7 +253,7 @@ class PI0Pytorch(nn.Module):
 
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0406_lpips_future_5_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0410_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -281,6 +281,43 @@ class PI0Pytorch(nn.Module):
             unfreeze_decoder_only=unfreeze_vggt_decoder_only,
             use_lora=use_lora,
         )
+
+        # Current-frame alignment / prefix-token options.
+        self.use_current_gaussian_tokens_in_prefix = bool(
+            getattr(config, "use_current_gaussian_tokens_in_prefix", False)
+        )
+        self.vla_layers_align = int(getattr(config, "vla_layers_align", 12))
+        self.vggt_layers_align = int(getattr(config, "vggt_layers_align", -1))
+        self.action_warmup_steps = int(getattr(config, "action_warmup_steps", 0))
+        self.current_decode_view = str(getattr(config, "current_decode_view", "agent")).lower()
+        self.align_loss_coeff_main_current = float(getattr(config, "align_loss_coeff_main_current", 0.0))
+        self.align_loss_coeff_wrist_current = float(getattr(config, "align_loss_coeff_wrist_current", 0.0))
+        self._last_prefix_image_ranges: list[dict[str, object]] = []
+        self._stage2_world_loss_multiplier = float(getattr(config, "stage2_world_loss_multiplier", 0.0))
+        self._stage2_keep_world_model_trainable = bool(getattr(config, "stage2_keep_world_model_trainable", False))
+        self._stage4_freeze_world_model = bool(getattr(config, "stage4_freeze_world_model", False))
+        self._stage4_disable_world_model_losses = bool(getattr(config, "stage4_disable_world_model_losses", False))
+        self._stage4_disable_alignment = bool(getattr(config, "stage4_disable_alignment", False))
+        self._active_training_stage: int | None = None
+
+        # These lightweight alignment modules are optional; default to disabled until
+        # they are explicitly constructed by the relevant training branch.
+        self.current_align_projector = None
+        self.current_geometry_adapter = None
+        requested_teacher_align = bool(getattr(config, "use_current_vggt_teacher_align", False))
+        requested_aligned_decode = bool(getattr(config, "enable_current_aligned_decode", False))
+        self._base_use_current_vggt_teacher_align = requested_teacher_align
+        self._base_enable_current_aligned_decode = requested_aligned_decode
+        if self.current_align_projector is None or self.current_geometry_adapter is None:
+            if requested_teacher_align or requested_aligned_decode:
+                logging.warning(
+                    "Current-frame alignment requested but alignment modules are not initialized; "
+                    "disabling teacher alignment and aligned decode."
+                )
+            self._base_use_current_vggt_teacher_align = False
+            self._base_enable_current_aligned_decode = False
+        self.use_current_vggt_teacher_align = self._base_use_current_vggt_teacher_align
+        self.enable_current_aligned_decode = self._base_enable_current_aligned_decode
         
         # Current frame reconstruction loss weight
         self.current_frame_recon_loss_weight = getattr(config, "current_frame_recon_loss_weight", 0.5)
@@ -290,6 +327,7 @@ class PI0Pytorch(nn.Module):
         self._base_future_depth_aux_loss_weight = float(getattr(config, "future_depth_aux_loss_weight", 0.0))
         self._base_flow_loss_weight = float(getattr(config, "flow_loss_weight", 0.0))
         self._world_loss_enabled = True
+        self._world_supervision_enabled = True
         self._world_loss_multiplier = 1.0
 
         # --- World Model Tokens in Prefix (NEW Architecture) ---
@@ -610,6 +648,8 @@ class PI0Pytorch(nn.Module):
     def set_world_supervision_enabled(self, enabled: bool, *, render_weight: float):
         """Enable or disable world-model supervision losses for the current stage."""
         self._world_supervision_enabled = bool(enabled)
+        self._world_loss_enabled = bool(enabled)
+        self._world_loss_multiplier = 1.0 if enabled else 0.0
         if enabled:
             self.render_loss_weight = float(render_weight)
             self.depth_loss_weight = float(self._base_depth_loss_weight)
@@ -661,20 +701,26 @@ class PI0Pytorch(nn.Module):
             self.unfreeze_static_head()
             self.unfreeze_velocity_head()
         elif stage == 2:
-            # Stage 2: action-only, keep image fusion on but freeze world-model parameters.
-            self.set_world_loss_enabled(False, render_weight=render_weight)
+            # Stage 2: action-focused fine-tuning. Keep image fusion on and optionally
+            # retain weak world losses so spatial structure does not collapse.
+            self.set_world_loss_enabled(
+                self._stage2_world_loss_multiplier > 0.0,
+                render_weight=render_weight,
+                loss_multiplier=self._stage2_world_loss_multiplier,
+            )
             self.unfreeze_prefix_vlm_backbone()
             self.set_world_model_image_fusion(True)
-            self.freeze_shared_backbone()
-            self.freeze_static_head()
-            self.freeze_velocity_head()
             self.unfreeze_action_expert()
-            if self._stage4_freeze_world_model:
-                self.freeze_world_model_decoder()
-            else:
+            if self._stage2_keep_world_model_trainable:
                 self.unfreeze_shared_backbone()
                 self.unfreeze_static_head()
                 self.unfreeze_velocity_head()
+            elif self._stage4_freeze_world_model:
+                self.freeze_world_model_decoder()
+            else:
+                self.freeze_shared_backbone()
+                self.freeze_static_head()
+                self.freeze_velocity_head()
             if self._stage4_disable_world_model_losses:
                 self.set_world_supervision_enabled(False, render_weight=0.0)
             if self._stage4_disable_alignment:
@@ -735,21 +781,30 @@ class PI0Pytorch(nn.Module):
         self._action_loss_enabled = True
         logging.info("Unfroze Action Expert + projections, enabled action loss")
 
-    def set_world_loss_enabled(self, enabled: bool, render_weight: float | None = None):
+    def set_world_loss_enabled(
+        self,
+        enabled: bool,
+        render_weight: float | None = None,
+        loss_multiplier: float | None = None,
+    ):
         """Enable or disable world-model supervision while preserving configured base weights."""
         self._world_loss_enabled = bool(enabled)
-        self._world_loss_multiplier = 1.0 if enabled else 0.0
+        self._world_supervision_enabled = bool(enabled)
+        if enabled:
+            multiplier = 1.0 if loss_multiplier is None else max(0.0, float(loss_multiplier))
+        else:
+            multiplier = 0.0
+        self._world_loss_multiplier = multiplier
         target_render_weight = self._base_render_loss_weight if render_weight is None else float(render_weight)
-        self.render_loss_weight = target_render_weight * self._world_loss_multiplier
-        self.depth_loss_weight = self._base_depth_loss_weight * self._world_loss_multiplier
-        self.future_depth_aux_loss_weight = self._base_future_depth_aux_loss_weight * self._world_loss_multiplier
-        self.flow_loss_weight = self._base_flow_loss_weight * self._world_loss_multiplier
-        self.current_frame_recon_loss_weight = (
-            self._base_current_frame_recon_loss_weight * self._world_loss_multiplier
-        )
+        self.render_loss_weight = target_render_weight * multiplier
+        self.depth_loss_weight = self._base_depth_loss_weight * multiplier
+        self.future_depth_aux_loss_weight = self._base_future_depth_aux_loss_weight * multiplier
+        self.flow_loss_weight = self._base_flow_loss_weight * multiplier
+        self.current_frame_recon_loss_weight = self._base_current_frame_recon_loss_weight * multiplier
         logging.info(
-            "Set world-model supervision %s | current=%.4f render=%.4f depth=%.4f flow=%.4f future_depth_aux=%.4f",
+            "Set world-model supervision %s (multiplier=%.3f) | current=%.4f render=%.4f depth=%.4f flow=%.4f future_depth_aux=%.4f",
             "enabled" if enabled else "disabled",
+            multiplier,
             self.current_frame_recon_loss_weight,
             self.render_loss_weight,
             self.depth_loss_weight,
@@ -766,18 +821,13 @@ class PI0Pytorch(nn.Module):
         return func(*args, **kwargs)
 
     def _get_training_stage(self, step: int | None) -> int:
+        """Map training steps onto the simplified 2-stage PyTorch schedule."""
         if step is None:
-            return 4
+            return 2
         stage1_steps = int(getattr(self.config, "stage1_steps", 0))
-        stage2_steps = int(getattr(self.config, "stage2_steps", 0))
-        stage3_steps = int(getattr(self.config, "stage3_steps", 0))
         if stage1_steps > 0 and step < stage1_steps:
             return 1
-        if stage2_steps > 0 and step < stage2_steps:
-            return 2
-        if stage3_steps > 0 and step < stage3_steps:
-            return 3
-        return 4
+        return 2
 
     def _apply_training_stage_if_needed(self, step: int | None) -> int:
         stage = self._get_training_stage(step)

@@ -633,9 +633,9 @@ class TrainConfig:
 
     # Stage schedule:
     # - Stage 1: [0, stage1_steps)
-    #   Representation/world-model-only training, image fusion on, action/VLM frozen.
+    #   Representation/world-model-focused training, image fusion on, action/VLM frozen.
     # - Stage 2: [stage1_steps, ...)
-    #   Action-only training, image fusion stays on, world-model params frozen and world losses off.
+    #   Action-focused training, image fusion stays on, with optional weak world supervision.
     stage1_steps: int = 0
     stage2_steps: int = 0
     stage3_steps: int = 0
@@ -646,6 +646,8 @@ class TrainConfig:
     stage1_freeze_velocity_head: bool = True
     stage2_freeze_static_head: bool = True
     stage2_shared_backbone_lr_scale: float = 0.25
+    stage2_world_loss_multiplier: float = 0.0
+    stage2_keep_world_model_trainable: bool = False
     stage4_freeze_world_model: bool = False
     stage4_disable_world_model_losses: bool = False
     stage4_disable_alignment: bool = False
@@ -802,9 +804,28 @@ _CONFIGS = [
             repo_id="DAVIAN-Robotics/robocasa-H50",
             base_config=DataConfig(
                 prompt_from_task=True,
+                dataset_root="/data/zijianzhang/robocasa-H50-legacy-v4",
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_robocasa",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            max_token_len=128,
+            action_dim=32,
+        ),
+        data=RobocasaDataConfig(
+            repo_id="DAVIAN-Robotics/robocasa-H50",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dataset_root="/data/zijianzhang/robocasa-H50-legacy-v4",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
     ),
     TrainConfig(
@@ -819,9 +840,29 @@ _CONFIGS = [
             use_depth=True,
             base_config=DataConfig(
                 prompt_from_task=True,
+                dataset_root="/data/zijianzhang/robocasa-H50-legacy-v4",
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_depth",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            max_token_len=128,
+            action_dim=32,
+        ),
+        data=RobocasaDataConfig(
+            repo_id="DAVIAN-Robotics/robocasa-H50",
+            use_depth=True,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dataset_root="/data/zijianzhang/robocasa-H50-legacy-v4",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
     ),
     TrainConfig(
@@ -937,7 +978,7 @@ _CONFIGS = [
             extra_delta_transform=False,
         ),
         # batch_size=256,
-        batch_size=16,  # Reduced global batch size to fit world-model future decode/render
+        batch_size=16,  # Reduced global batch size further to avoid stage-2 world-model OOM
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -948,18 +989,20 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
-        num_train_steps=30_000,
+        num_train_steps=60_000,
         save_interval=1000,  # Save more frequently to make resume easier during long experiments
         stage1_steps=15_000,  # Stage 1: world-model-only representation training until 15k
         stage2_steps=0,  # Unused in the simplified 2-stage schedule
         stage3_steps=0,  # Unused in the simplified 2-stage schedule
         stage1_render_weight=0.2,  # Keep world-model supervision on during stage1
-        stage2_render_weight=0.0,  # Stage 2 disables world losses at runtime
+        stage2_render_weight=0.05,  # Keep a weak rendering/world signal during action-focused stage 2
         stage3_render_weight=0.0,  # Unused in the simplified 2-stage schedule
         stage4_render_weight=0.0,  # Unused in the simplified 2-stage schedule
         stage1_freeze_velocity_head=False,  # Train static and dynamic branches together during stage1
         stage2_freeze_static_head=False,  # Unused in the simplified 2-stage schedule
-        stage2_shared_backbone_lr_scale=0.0,
+        stage2_shared_backbone_lr_scale=0.25,  # Keep world-model param groups updating, but slower than action params
+        stage2_world_loss_multiplier=0.1,  # Keep low-weight current/future spatial supervision in stage 2
+        stage2_keep_world_model_trainable=True,  # Do not freeze the world model during action-focused fine-tuning
     ),
     #
     # Fine-tuning Aloha configs.
