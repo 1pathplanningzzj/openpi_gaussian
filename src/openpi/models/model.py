@@ -129,34 +129,34 @@ class Observation(Generic[ArrayT]):
 
         # First pass: Process Images to fix dimensions
         for key in data["image"]:
-            if data["image"][key].dtype == np.uint8:
-                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and isinstance(data["image"][key], torch.Tensor):
-                tensor = data["image"][key]
+            image = data["image"][key]
 
+            if isinstance(image, torch.Tensor):
                 # Convert uint8 to float32
-                if tensor.dtype == torch.uint8:
-                    tensor = tensor.to(torch.float32) / 255.0 * 2.0 - 1.0
+                if image.dtype == torch.uint8:
+                    image = image.to(torch.float32) / 255.0 * 2.0 - 1.0
 
                 # PyTorch uses [B, C, H, W] but Observation expects [B, H, W, C]
                 # Detect if tensor is in channels-first format and convert to channels-last
-                if tensor.ndim == 5:
-                    if tensor.shape[2] == 3:
+                if image.ndim == 5:
+                    if image.shape[2] == 3:
                         # [B, T, C, H, W] -> [B, T, H, W, C]
-                        tensor = tensor.permute(0, 1, 3, 4, 2)
+                        image = image.permute(0, 1, 3, 4, 2)
                     # Else assume already [B, T, H, W, C]
-                elif tensor.ndim == 4:
-                    if tensor.shape[1] == 3:
+                elif image.ndim == 4:
+                    if image.shape[1] == 3:
                         # [B, C, H, W] -> [B, H, W, C]
-                        tensor = tensor.permute(0, 2, 3, 1)
+                        image = image.permute(0, 2, 3, 1)
                     # Else assume already [B, H, W, C]
+            elif hasattr(image, "dtype") and image.dtype == np.uint8:
+                image = image.astype(np.float32) / 255.0 * 2.0 - 1.0
 
-                data["image"][key] = tensor
+            data["image"][key] = image
 
-                # Capture batch shape from first processed image tensor
-                # Excluding H,W,C, so take shape[:-3]
-                if batch_dims_from_images is None:
-                    batch_dims_from_images = tensor.shape[:-3]
+            # Capture batch shape from the first processed image array.
+            # Excluding H, W, C, so take shape[:-3].
+            if batch_dims_from_images is None and hasattr(image, "shape") and len(image.shape) >= 3:
+                batch_dims_from_images = image.shape[:-3]
 
         # Ensure image_masks are proper boolean tensors and match image dimensions
         for key in data["image_mask"]:
@@ -199,21 +199,41 @@ class Observation(Generic[ArrayT]):
             # We have a time dimension in images: batch_dims_from_images is likely (B, T)
             # Check prompt
             prompt = data.get("tokenized_prompt")
-            if prompt is not None and isinstance(prompt, torch.Tensor):
-               # If prompt is [B, L], but we need [B, T, L]
-               if prompt.ndim == len(batch_dims_from_images): # e.g. 2 vs 2, means (B, L) vs (B, T) - mismatch indim semantics but rank eq
-                   # Actually simple check: compare shape prefix
-                   # If prompt is (B, L) and images are (B, T, ...)
-                   # We want prompt to be (B, T, L)
-                   T = batch_dims_from_images[1]
-                   if prompt.shape[0] == batch_dims_from_images[0] and prompt.ndim == 2:
-                       data["tokenized_prompt"] = prompt.unsqueeze(1).expand(-1, T, -1)
+            if prompt is not None:
+                # If prompt is [B, L], but we need [B, T, L]
+                T = batch_dims_from_images[1]
+                if isinstance(prompt, torch.Tensor):
+                    if prompt.shape[0] == batch_dims_from_images[0] and prompt.ndim == 2:
+                        data["tokenized_prompt"] = prompt.unsqueeze(1).expand(-1, T, -1)
+                elif hasattr(prompt, "ndim") and prompt.shape[0] == batch_dims_from_images[0] and prompt.ndim == 2:
+                    if isinstance(prompt, np.ndarray):
+                        data["tokenized_prompt"] = np.broadcast_to(
+                            prompt[:, None, :], (prompt.shape[0], T, prompt.shape[1])
+                        )
+                    else:
+                        data["tokenized_prompt"] = jnp.broadcast_to(
+                            prompt[:, None, :], (prompt.shape[0], T, prompt.shape[1])
+                        )
 
             prompt_mask = data.get("tokenized_prompt_mask")
-            if prompt_mask is not None and isinstance(prompt_mask, torch.Tensor):
-               if prompt_mask.shape[0] == batch_dims_from_images[0] and prompt_mask.ndim == 2:
-                    T = batch_dims_from_images[1]
-                    data["tokenized_prompt_mask"] = prompt_mask.unsqueeze(1).expand(-1, T, -1)
+            if prompt_mask is not None:
+                T = batch_dims_from_images[1]
+                if isinstance(prompt_mask, torch.Tensor):
+                    if prompt_mask.shape[0] == batch_dims_from_images[0] and prompt_mask.ndim == 2:
+                        data["tokenized_prompt_mask"] = prompt_mask.unsqueeze(1).expand(-1, T, -1)
+                elif (
+                    hasattr(prompt_mask, "ndim")
+                    and prompt_mask.shape[0] == batch_dims_from_images[0]
+                    and prompt_mask.ndim == 2
+                ):
+                    if isinstance(prompt_mask, np.ndarray):
+                        data["tokenized_prompt_mask"] = np.broadcast_to(
+                            prompt_mask[:, None, :], (prompt_mask.shape[0], T, prompt_mask.shape[1])
+                        )
+                    else:
+                        data["tokenized_prompt_mask"] = jnp.broadcast_to(
+                            prompt_mask[:, None, :], (prompt_mask.shape[0], T, prompt_mask.shape[1])
+                        )
 
         # Handle state with temporal dimension and dtype
         # If images have temporal dimension [B, T_img, ...], state might have different temporal dimension [B, T_state, s]

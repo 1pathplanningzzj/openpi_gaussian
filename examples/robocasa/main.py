@@ -1,9 +1,12 @@
 import dataclasses
+import pathlib
 import logging
+from collections import deque
 
 import imageio
 import numpy as np
 from openpi_client import websocket_client_policy as _websocket_client_policy
+import robocasa  # noqa: F401  # Registers RoboCasa environments with robosuite.make
 import robosuite
 from robosuite.controllers import load_composite_controller_config
 import tyro
@@ -12,10 +15,59 @@ import tyro
 @dataclasses.dataclass
 class Args:
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 8010
     env_name: str = "PnPCounterToCab"
+    prompt: str | None = None
+    num_episodes: int = 20
     max_steps: int = 500
-    # Add other arguments as needed
+    replan_steps: int = 1
+    camera_height: int = 128
+    camera_width: int = 128
+    save_videos: bool = True
+    video_dir: str = "robocasa_eval_videos"
+
+
+DEFAULT_PROMPTS = {
+    "PnPCounterToCab": "pick and place from counter to cabinet",
+    "PnPCounterToSink": "pick and place from counter to sink",
+    "PnPMicrowaveToCounter": "pick and place from microwave to counter",
+    "PnPStoveToCounter": "pick and place from stove to counter",
+    "OpenSingleDoor": "open cabinet or microwave door",
+    "CloseDrawer": "close drawer",
+    "TurnOnMicrowave": "turn on microwave",
+    "TurnOnSinkFaucet": "turn on sink faucet",
+    "TurnOnStove": "turn on stove",
+    "ArrangeVegetables": "arrange vegetables on a cutting board",
+    "MicrowaveThawing": "place frozen food in microwave for thawing",
+    "RestockPantry": "restock cans in pantry",
+    "PreSoakPan": "prepare pan for washing",
+    "PrepareCoffee": "make coffee",
+}
+
+
+def _get_prompt(args: Args) -> str:
+    return args.prompt or DEFAULT_PROMPTS.get(args.env_name, args.env_name)
+
+
+def _get_state(obs: dict) -> np.ndarray:
+    """Match the 16-D mobile-manipulation state used by the RoboCasa training set."""
+    state_keys = [
+        "robot0_base_to_eef_pos",
+        "robot0_base_to_eef_quat",
+        "robot0_gripper_qpos",
+        "robot0_base_pos",
+        "robot0_base_quat",
+    ]
+    return np.concatenate([np.asarray(obs[key], dtype=np.float32).reshape(-1) for key in state_keys])
+
+
+def _is_success(env) -> bool:
+    if hasattr(env, "is_success"):
+        succ = env.is_success()
+        if isinstance(succ, dict):
+            return bool(succ.get("task", False))
+        return bool(succ)
+    return bool(env._check_success())
 
 
 def main(args: Args):
@@ -39,79 +91,92 @@ def main(args: Args):
         has_renderer=False,  # Set to True if you want to see the simulation window
         has_offscreen_renderer=True,
         use_camera_obs=True,
-        camera_names=["robot0_agentview_center", "robot0_eye_in_hand"],
-        camera_heights=256,
-        camera_widths=256,
+        camera_names=["robot0_agentview_left", "robot0_eye_in_hand"],
+        camera_heights=args.camera_height,
+        camera_widths=args.camera_width,
         reward_shaping=False,
         control_freq=20,
     )
+    prompt = _get_prompt(args)
+    logging.info("Using prompt: %s", prompt)
 
-    obs = env.reset()
-    logging.info("Environment reset. Starting inference loop...")
+    success_count = 0
+    if args.save_videos:
+        pathlib.Path(args.video_dir).mkdir(parents=True, exist_ok=True)
 
-    frames = []
+    for episode_idx in range(args.num_episodes):
+        obs = env.reset()
+        action_plan: deque[np.ndarray] = deque()
+        frames: list[np.ndarray] = []
+        episode_success = False
+        last_reward = 0.0
 
-    for step in range(args.max_steps):
-        # 1. Process observation data to match model input
-        # Note: OpenPI usually expects images to be uint8 [0, 255]
-        # Robosuite returns images in [0, 255] uint8 usually, but check if they are flipped.
-        # Robosuite images are often flipped vertically compared to standard CV2/PIL.
+        logging.info("Episode %d/%d started", episode_idx + 1, args.num_episodes)
 
-        agentview_img = obs["robot0_agentview_center_image"]
-        wrist_img = obs["robot0_eye_in_hand_image"]
+        for step in range(args.max_steps):
+            agentview_img = obs["robot0_agentview_left_image"]
+            wrist_img = obs["robot0_eye_in_hand_image"]
 
-        if step % 2 == 0:
-            # Robosuite images are upside down, verify if flipping is needed
-            # Usually for saving to video we might want to flip them to look correct
-            # if the raw output is inverted. Based on experience, robosuite offscreen
-            # render might need `np.flipud`.
-            # Let's try saving as is first, or flip if it looks upside down.
-            # agentview_img is (H, W, 3)
-            frames.append(np.flipud(agentview_img))
+            if args.save_videos:
+                frames.append(np.flipud(agentview_img))
 
-        # Flip images if necessary (Robosuite renders upside down by default in some versions)
-        # agentview_img = np.flipud(agentview_img)
-        # wrist_img = np.flipud(wrist_img)
+            request = {
+                "observation/image": agentview_img,
+                "observation/wrist_image": wrist_img,
+                "observation/state": _get_state(obs),
+                "prompt": prompt,
+            }
 
-        state = np.concatenate([obs["robot0_joint_pos"], obs["robot0_gripper_qpos"]])
+            if not action_plan:
+                response = client.infer(request)
+                action_chunk = np.asarray(response["actions"])
+                steps_to_use = min(len(action_chunk), max(1, args.replan_steps))
+                action_plan.extend(action_chunk[:steps_to_use])
 
-        # Construct request for Policy Server
-        request = {
-            "observation/image": agentview_img,
-            "observation/wrist_image": wrist_img,
-            "observation/state": state,
-            # Instruction should ideally come from the task definition or user input
-            "prompt": "put the object in the cabinet",
-        }
+            action = np.asarray(action_plan.popleft()).copy()
+            obs, reward, done, info = env.step(action)
+            last_reward = float(reward)
 
-        # 2. Get action from policy
-        # The client handles serialization/deserialization
-        # action is typically [chunk_size, action_dim], we need the first action [action_dim]
-        response = client.infer(request)
-        action = np.array(response["actions"][0])  # Take the first action and make writable
-        # logging.info(f"Received action shape: {action.shape}")
+            if step % 10 == 0:
+                logging.info("Episode %d step %d: reward=%.4f", episode_idx + 1, step, reward)
 
-        # 3. Execute action
-        # Note: OpenPI output actions might need denormalization if the model outputs normalized actions.
-        # However, if the policy server handles denormalization (which it often does if configured correctly),
-        # we can use the action directly.
-        # Also check if the action format (delta pos vs absolute pos) matches the controller config.
+            if _is_success(env):
+                episode_success = True
+                success_count += 1
+                logging.info("Episode %d succeeded at step %d", episode_idx + 1, step)
+                break
 
-        obs, reward, done, info = env.step(action)
+            if done:
+                logging.info("Episode %d terminated at step %d", episode_idx + 1, step)
+                break
 
-        if step % 10 == 0:
-            logging.info(f"Step {step}: Reward={reward}")
+        if args.save_videos and frames:
+            video_path = pathlib.Path(args.video_dir) / f"{args.env_name}_ep{episode_idx:03d}.mp4"
+            try:
+                imageio.mimsave(video_path, frames, fps=10)
+                logging.info("Saved rollout video to %s", video_path)
+            except Exception as exc:
+                logging.error("Failed to save video %s: %s", video_path, exc)
 
-        if done:
-            logging.info("Episode finished.")
-            break
+        running_rate = success_count / float(episode_idx + 1)
+        logging.info(
+            "Episode %d result | success=%s reward=%.4f running_success_rate=%d/%d=%.3f",
+            episode_idx + 1,
+            episode_success,
+            last_reward,
+            success_count,
+            episode_idx + 1,
+            running_rate,
+        )
 
-    logging.info(f"Saving video with {len(frames)} frames to output.mp4...")
-    try:
-        imageio.mimsave("output.mp4", frames, fps=10)
-        logging.info("Video saved successfully.")
-    except Exception as e:
-        logging.error(f"Failed to save video: {e}")
+    final_rate = success_count / float(max(1, args.num_episodes))
+    logging.info(
+        "Final success rate for %s: %d/%d = %.3f",
+        args.env_name,
+        success_count,
+        args.num_episodes,
+        final_rate,
+    )
 
     env.close()
 

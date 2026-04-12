@@ -79,6 +79,20 @@ class Policy(BasePolicy):
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
 
+        # Some eval pipelines provide temporal image history but only a single robot state.
+        # Repeat that state across the image horizon so Observation batch axes stay aligned.
+        if "state" in inputs and "image" in inputs and inputs["image"]:
+            first_img = next(iter(inputs["image"].values()))
+            state = inputs["state"]
+            if first_img.ndim == 5 and state.ndim == 2 and state.shape[0] == first_img.shape[0]:
+                horizon = first_img.shape[1]
+                if self._is_pytorch_model:
+                    inputs["state"] = state.unsqueeze(1).expand(-1, horizon, -1)
+                else:
+                    inputs["state"] = jnp.broadcast_to(
+                        state[:, None, :], (state.shape[0], horizon, state.shape[1])
+                    )
+
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
         if noise is not None:

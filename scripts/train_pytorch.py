@@ -417,11 +417,12 @@ def _stage_lr_scales(config: _config.TrainConfig, stage: int) -> dict[str, float
             "wm_velocity_head": 1.0,
         }
     if stage == 2:
+        world_lr_scale = max(0.0, float(getattr(config, "stage2_shared_backbone_lr_scale", 0.0)))
         return {
             "default": 1.0,
-            "wm_shared_backbone": 0.0,
-            "wm_static_head": 0.0,
-            "wm_velocity_head": 0.0,
+            "wm_shared_backbone": world_lr_scale,
+            "wm_static_head": world_lr_scale,
+            "wm_velocity_head": world_lr_scale,
         }
     raise ValueError(f"Unsupported stage: {stage}")
 
@@ -439,6 +440,7 @@ def _apply_stage_state(
     raw_model.apply_world_model_stage(stage, render_weight)
     _set_optimizer_lr_scales(optimizer, _stage_lr_scales(config, stage))
     raw_model._stage_applied = stage
+    raw_model._active_training_stage = stage
 
     if is_main:
         trainability = raw_model.get_stage_trainability_summary() if hasattr(raw_model, "get_stage_trainability_summary") else {}
@@ -599,6 +601,27 @@ def train_loop(config: _config.TrainConfig):
         object.__setattr__(model_cfg, "state_norm_stats", data_config.norm_stats.get("state") if data_config.norm_stats is not None else None)
         object.__setattr__(model_cfg, "state_use_quantile_norm", data_config.use_quantile_norm)
 
+    # Mirror stage-schedule controls from the TrainConfig onto the model config so the
+    # PyTorch model can apply the same runtime schedule inside forward/resume paths.
+    for attr in (
+        "stage1_steps",
+        "stage2_steps",
+        "stage3_steps",
+        "stage1_render_weight",
+        "stage2_render_weight",
+        "stage3_render_weight",
+        "stage4_render_weight",
+        "stage1_freeze_velocity_head",
+        "stage2_freeze_static_head",
+        "stage2_shared_backbone_lr_scale",
+        "stage2_world_loss_multiplier",
+        "stage2_keep_world_model_trainable",
+        "stage4_freeze_world_model",
+        "stage4_disable_world_model_losses",
+        "stage4_disable_alignment",
+    ):
+        object.__setattr__(model_cfg, attr, getattr(config, attr))
+
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
@@ -647,11 +670,16 @@ def train_loop(config: _config.TrainConfig):
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+        if os.path.isdir(config.pytorch_weight_path):
+            model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+        else:
+            model_path = config.pytorch_weight_path
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"PyTorch weight file not found: {model_path}")
         safetensors.torch.load_model(
             (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path, strict=False
         )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+        logging.info(f"Loaded PyTorch weights from {model_path}")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -709,12 +737,16 @@ def train_loop(config: _config.TrainConfig):
     )
 
     if staged_training_enabled and is_main:
+        stage2_world_loss_multiplier = getattr(config, "stage2_world_loss_multiplier", 0.0)
+        stage2_keep_world_model_trainable = getattr(config, "stage2_keep_world_model_trainable", False)
         logging.info("=== Staged Training Enabled ===")
         logging.info(
             f"Stage 1 (Representation/world-model): steps 0-{stage1_steps}, render_weight={stage1_render_weight}, image_fusion=on, action=off, world_losses=on"
         )
         logging.info(
-            f"Stage 2 (Action-only): steps {stage1_steps}-{config.num_train_steps}, render_weight=0.0 (configured stage2={stage2_render_weight}), image_fusion=on, action=on, world_losses=off"
+            f"Stage 2 (Action-focused): steps {stage1_steps}-{config.num_train_steps}, "
+            f"render_weight={stage2_render_weight}, world_loss_multiplier={stage2_world_loss_multiplier}, "
+            f"world_model_trainable={stage2_keep_world_model_trainable}, image_fusion=on, action=on"
         )
 
     def _apply_stage_for_step(step: int):
@@ -740,7 +772,7 @@ def train_loop(config: _config.TrainConfig):
                     2,
                     stage2_render_weight,
                     is_main=is_main,
-                    label="=== Stage 2 Active: Action-only training (image_fusion=on, action=on, world_losses=off) ===",
+                    label="=== Stage 2 Active: Action-focused training (image_fusion=on, action=on, weak world supervision) ===",
                 )
 
     _apply_stage_for_step(global_step)

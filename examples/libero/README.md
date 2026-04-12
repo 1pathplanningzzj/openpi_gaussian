@@ -1,5 +1,42 @@
 # LIBERO Benchmark
 
+# 鲁棒性评估脚本
+
+下面这 5 个脚本是分开的鲁棒性实验入口，建议都从仓库根目录 `/home/zijianzhang/openpi` 运行。
+
+- `robust_eval_light.py`：光照扰动。每个 episode 开始时随机修改场景灯光的位置、方向、ambient / diffuse / specular。
+- `robust_eval_texture.py`：物体纹理扰动。每个 episode 开始时修改目标物体的 texture / 材质颜色，用来测试视觉外观变化下的鲁棒性。
+- `robust_eval_init_pose.py`：物体初始位姿扰动。注意这里改的是任务相关物体的初始位置和朝向，不是机械臂。
+- `robust_eval_init_force.py`：起始外力扰动。episode 刚开始时对目标物体施加持续若干步的外力 / 力矩扰动。
+- `robust_eval_mid_force.py`：过程外力扰动。rollout 进行到指定步数后，再对目标物体施加外力扰动，测试执行过程中的抗扰能力。
+
+```bash
+# 1) 光照扰动：随机变化灯光位置 / 方向 / 强度
+PYTHONPATH=/home/zijianzhang/openpi:/home/zijianzhang/openpi/third_party/libero \
+/home/zijianzhang/openpi/examples/libero/.venv/bin/python \
+examples/libero/robust_eval_light.py --light-position-jitter-m 0.2
+
+# 2) 纹理扰动：修改目标物体的 texture / 材质外观
+PYTHONPATH=/home/zijianzhang/openpi:/home/zijianzhang/openpi/third_party/libero \
+/home/zijianzhang/openpi/examples/libero/.venv/bin/python \
+examples/libero/robust_eval_texture.py --texture-variation swap
+
+# 3) 物体初始位姿扰动：随机平移和 yaw 旋转目标物体
+PYTHONPATH=/home/zijianzhang/openpi:/home/zijianzhang/openpi/third_party/libero \
+/home/zijianzhang/openpi/examples/libero/.venv/bin/python \
+examples/libero/robust_eval_init_pose.py --initial-perturb-xy-m 0.03 --initial-perturb-yaw-deg 15
+
+# 4) 起始外力扰动：episode 开始时对目标物体施加外力
+PYTHONPATH=/home/zijianzhang/openpi:/home/zijianzhang/openpi/third_party/libero \
+/home/zijianzhang/openpi/examples/libero/.venv/bin/python \
+examples/libero/robust_eval_init_force.py --initial-force-xy-n 2.5 --initial-force-duration-steps 5
+
+# 5) 过程外力扰动：rollout 中途对目标物体施加外力
+PYTHONPATH=/home/zijianzhang/openpi:/home/zijianzhang/openpi/third_party/libero \
+/home/zijianzhang/openpi/examples/libero/.venv/bin/python \
+examples/libero/robust_eval_mid_force.py --mid-force-xy-n 1.5 --mid-force-after-steps 40
+```
+
 This example runs the LIBERO benchmark: https://github.com/Lifelong-Robot-Learning/LIBERO
 
 Note: When updating requirements.txt in this directory, there is an additional flag `--extra-index-url https://download.pytorch.org/whl/cu113` that must be added to the `uv pip compile` command.
@@ -128,7 +165,7 @@ python examples/libero/main.py \
     --args.csv-filename with_3d_takeover.csv
 ```
 
-注意：tyro CLI 需要使用 `--args.` 前缀来访问嵌套参数。
+注意：`examples/libero/main.py` 这类脚本仍然需要使用 `--args.` 前缀来访问嵌套参数；上面的 `robust_eval_*.py` 五个脚本不需要这个前缀。
 
 ## 有关渲染的配置
 
@@ -151,5 +188,3 @@ sudo apt install -y \
 
 # 对于无头服务器，如果 EGL 不可用，可以安装 OSMesa：
 sudo apt install -y libosmesa6-dev
-
-
