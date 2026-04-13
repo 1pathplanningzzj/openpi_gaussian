@@ -618,7 +618,6 @@ def train_loop(config: _config.TrainConfig):
         "stage2_keep_world_model_trainable",
         "stage4_freeze_world_model",
         "stage4_disable_world_model_losses",
-        "stage4_disable_alignment",
     ):
         object.__setattr__(model_cfg, attr, getattr(config, attr))
 

@@ -650,7 +650,6 @@ class TrainConfig:
     stage2_keep_world_model_trainable: bool = False
     stage4_freeze_world_model: bool = False
     stage4_disable_world_model_losses: bool = False
-    stage4_disable_alignment: bool = False
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -990,7 +989,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=60_000,
-        save_interval=1000,  # Save more frequently to make resume easier during long experiments
+        save_interval=3000,  # Save every 3k steps to reduce checkpoint churn during long experiments
         stage1_steps=15_000,  # Stage 1: world-model-only representation training until 15k
         stage2_steps=0,  # Unused in the simplified 2-stage schedule
         stage3_steps=0,  # Unused in the simplified 2-stage schedule

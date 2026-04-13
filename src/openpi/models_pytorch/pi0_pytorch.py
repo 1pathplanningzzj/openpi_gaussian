@@ -253,7 +253,7 @@ class PI0Pytorch(nn.Module):
 
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0410_lpips_future_5_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0412_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)
@@ -282,43 +282,13 @@ class PI0Pytorch(nn.Module):
             use_lora=use_lora,
         )
 
-        # Current-frame alignment / prefix-token options.
-        self.use_current_gaussian_tokens_in_prefix = bool(
-            getattr(config, "use_current_gaussian_tokens_in_prefix", False)
-        )
-        self.vla_layers_align = int(getattr(config, "vla_layers_align", 12))
-        self.vggt_layers_align = int(getattr(config, "vggt_layers_align", -1))
         self.action_warmup_steps = int(getattr(config, "action_warmup_steps", 0))
-        self.current_decode_view = str(getattr(config, "current_decode_view", "agent")).lower()
-        self.align_loss_coeff_main_current = float(getattr(config, "align_loss_coeff_main_current", 0.0))
-        self.align_loss_coeff_wrist_current = float(getattr(config, "align_loss_coeff_wrist_current", 0.0))
-        self._last_prefix_image_ranges: list[dict[str, object]] = []
         self._stage2_world_loss_multiplier = float(getattr(config, "stage2_world_loss_multiplier", 0.0))
         self._stage2_keep_world_model_trainable = bool(getattr(config, "stage2_keep_world_model_trainable", False))
         self._stage4_freeze_world_model = bool(getattr(config, "stage4_freeze_world_model", False))
         self._stage4_disable_world_model_losses = bool(getattr(config, "stage4_disable_world_model_losses", False))
-        self._stage4_disable_alignment = bool(getattr(config, "stage4_disable_alignment", False))
         self._active_training_stage: int | None = None
 
-        # These lightweight alignment modules are optional; default to disabled until
-        # they are explicitly constructed by the relevant training branch.
-        self.current_align_projector = None
-        self.current_geometry_adapter = None
-        requested_teacher_align = bool(getattr(config, "use_current_vggt_teacher_align", False))
-        requested_aligned_decode = bool(getattr(config, "enable_current_aligned_decode", False))
-        self._base_use_current_vggt_teacher_align = requested_teacher_align
-        self._base_enable_current_aligned_decode = requested_aligned_decode
-        if self.current_align_projector is None or self.current_geometry_adapter is None:
-            if requested_teacher_align or requested_aligned_decode:
-                logging.warning(
-                    "Current-frame alignment requested but alignment modules are not initialized; "
-                    "disabling teacher alignment and aligned decode."
-                )
-            self._base_use_current_vggt_teacher_align = False
-            self._base_enable_current_aligned_decode = False
-        self.use_current_vggt_teacher_align = self._base_use_current_vggt_teacher_align
-        self.enable_current_aligned_decode = self._base_enable_current_aligned_decode
-        
         # Current frame reconstruction loss weight
         self.current_frame_recon_loss_weight = getattr(config, "current_frame_recon_loss_weight", 0.5)
         self._base_current_frame_recon_loss_weight = float(self.current_frame_recon_loss_weight)
@@ -610,41 +580,6 @@ class PI0Pytorch(nn.Module):
             setter(enabled)
             logging.info("Set world-model image fusion to %s", "enabled" if enabled else "disabled")
 
-    def freeze_alignment_modules(self):
-        """Freeze lightweight alignment heads used for teacher alignment / current geometry decode."""
-        frozen_any = False
-        for module_name in ("current_geometry_adapter", "current_align_projector"):
-            module = getattr(self, module_name, None)
-            if self._set_module_requires_grad(module, False):
-                frozen_any = True
-        if frozen_any:
-            logging.info("Froze current alignment modules")
-
-    def unfreeze_alignment_modules(self):
-        """Unfreeze lightweight alignment heads used before Stage 4 action-focused tuning."""
-        unfrozen_any = False
-        for module_name in ("current_geometry_adapter", "current_align_projector"):
-            module = getattr(self, module_name, None)
-            if self._set_module_requires_grad(module, True):
-                unfrozen_any = True
-        if unfrozen_any:
-            logging.info("Unfroze current alignment modules")
-
-    def set_alignment_runtime(self, enabled: bool):
-        """Enable or disable alignment losses / hidden-state extraction at runtime."""
-        if enabled:
-            self.use_current_vggt_teacher_align = self._base_use_current_vggt_teacher_align
-            self.enable_current_aligned_decode = self._base_enable_current_aligned_decode
-        else:
-            self.use_current_vggt_teacher_align = False
-            self.enable_current_aligned_decode = False
-        logging.info(
-            "Set alignment runtime to %s (teacher_align=%s, aligned_decode=%s)",
-            "enabled" if enabled else "disabled",
-            self.use_current_vggt_teacher_align,
-            self.enable_current_aligned_decode,
-        )
-
     def set_world_supervision_enabled(self, enabled: bool, *, render_weight: float):
         """Enable or disable world-model supervision losses for the current stage."""
         self._world_supervision_enabled = bool(enabled)
@@ -723,9 +658,6 @@ class PI0Pytorch(nn.Module):
                 self.freeze_velocity_head()
             if self._stage4_disable_world_model_losses:
                 self.set_world_supervision_enabled(False, render_weight=0.0)
-            if self._stage4_disable_alignment:
-                self.freeze_alignment_modules()
-                self.set_alignment_runtime(False)
         else:
             raise ValueError(f"Unsupported stage: {stage}")
 
@@ -750,8 +682,6 @@ class PI0Pytorch(nn.Module):
             "shared_backbone": _module_trainable(getattr(self.world_model, "shared_backbone", None)),
             "static_head": _module_trainable(getattr(self.world_model, "static_head", None)),
             "velocity_head": _module_trainable(getattr(self.world_model, "velocity_head", None)),
-            "align_projector": _module_trainable(getattr(self, "current_align_projector", None)),
-            "geometry_adapter": _module_trainable(getattr(self, "current_geometry_adapter", None)),
         }
 
     def _get_action_mlp_modules(self):
@@ -880,184 +810,6 @@ class PI0Pytorch(nn.Module):
 
         return pe
 
-
-    def _camera_role(self, camera_name: str) -> str:
-        name = camera_name.lower()
-        if "wrist" in name or "bravo" in name:
-            return "wrist"
-        return "main"
-
-    def _camera_decode_alias(self, camera_name: str) -> str:
-        name = camera_name.lower()
-        if "wrist" in name or "bravo" in name:
-            return "wrist"
-        if name == "image" or "agent" in name or "base" in name:
-            return "agent"
-        if "high" in name or "exterior" in name or "sideview" in name:
-            return name
-        return name
-
-    def _resolve_current_decode_camera_name(self, observation) -> str | None:
-        if observation is None or not hasattr(observation, "images"):
-            return None
-        candidates: list[tuple[str, str]] = []
-        for key in observation.images.keys():
-            role = self._camera_role(key)
-            if role != "main":
-                continue
-            alias = self._camera_decode_alias(key)
-            candidates.append((alias, key))
-        if not candidates:
-            return None
-        for alias, key in candidates:
-            if alias == self.current_decode_view or key.lower() == self.current_decode_view:
-                return key
-        for alias, key in candidates:
-            if alias == "agent":
-                return key
-        return candidates[0][1]
-
-    def _get_teacher_observation(self, preprocessed_observation):
-        source_observation = self._get_motion_weight_source_observation(preprocessed_observation)
-        if source_observation is None:
-            return None
-        current_steps = self._get_temporal_observation_length(source_observation)
-        if current_steps > 0:
-            return self._slice_temporal_observation(source_observation, current_steps - 1)
-        return source_observation
-
-    def _get_teacher_tokens_for_camera(
-        self,
-        teacher_observation,
-        device: torch.device,
-        batch_size: int,
-        camera_name: str,
-        target_dim: int,
-    ) -> torch.Tensor | None:
-        gaussian_inputs = self._prepare_gaussian_inputs(
-            teacher_observation,
-            device,
-            batch_size,
-            is_training=False,
-            preferred_camera_name=camera_name,
-            force_num_frames=1,
-        )
-        if gaussian_inputs is None:
-            return None
-        teacher_result = self.gaussian_adapter(
-            gaussian_inputs,
-            return_unprojected_raw_tokens=True,
-            raw_tokens_layer_idx=self.vggt_layers_align,
-        )
-        if len(teacher_result) != 3:
-            return None
-        _, _, teacher_raw_tokens = teacher_result
-        if teacher_raw_tokens is None or teacher_raw_tokens.ndim != 4:
-            return None
-        teacher_frame_index = teacher_raw_tokens.shape[1] - 1
-        return teacher_raw_tokens[:, teacher_frame_index, :, :target_dim].detach().to(torch.float32)
-
-
-    def _pool_tokens_to_match(self, source_tokens: torch.Tensor, target_tokens: torch.Tensor) -> torch.Tensor:
-        if source_tokens.shape[1] == target_tokens.shape[1]:
-            return source_tokens
-        src_grid = int(math.isqrt(source_tokens.shape[1]))
-        tgt_grid = int(math.isqrt(target_tokens.shape[1]))
-        if src_grid * src_grid != source_tokens.shape[1] or tgt_grid * tgt_grid != target_tokens.shape[1]:
-            raise ValueError(
-                f"Cannot pool non-square token counts source={source_tokens.shape[1]} target={target_tokens.shape[1]}"
-            )
-        source_grid = source_tokens.transpose(1, 2).reshape(source_tokens.shape[0], source_tokens.shape[2], src_grid, src_grid)
-        pooled = F.adaptive_avg_pool2d(source_grid, (tgt_grid, tgt_grid))
-        return pooled.reshape(source_tokens.shape[0], source_tokens.shape[2], tgt_grid * tgt_grid).transpose(1, 2)
-
-    def _extract_current_aligned_tokens(
-        self,
-        prefix_hidden: torch.Tensor,
-        preprocessed_observation,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, object]]:
-        debug_info: dict[str, object] = {
-            "student_shapes": {},
-            "teacher_shapes": {},
-            "selected_view": None,
-            "selected_view_shape": None,
-            "selected_geometry_shape": None,
-            "teacher_camera": None,
-        }
-        if not self.use_current_vggt_teacher_align or not self._last_prefix_image_ranges:
-            return prefix_hidden.new_zeros((), dtype=torch.float32), None, debug_info
-
-        teacher_observation = self._get_teacher_observation(preprocessed_observation)
-        if teacher_observation is None:
-            return prefix_hidden.new_zeros((), dtype=torch.float32), None, debug_info
-
-        alignment_loss = prefix_hidden.new_zeros((), dtype=torch.float32)
-        main_losses: list[torch.Tensor] = []
-        wrist_losses: list[torch.Tensor] = []
-        current_main_view = None
-        current_main_tokens = None
-
-        for camera_info in self._last_prefix_image_ranges:
-            name = str(camera_info["name"])
-            start = int(camera_info["start"])
-            tokens_per_frame = int(camera_info["tokens_per_frame"])
-            current_frame = int(camera_info["current_frame_index"])
-            role = str(camera_info["role"])
-            current_start = start + current_frame * tokens_per_frame
-            current_end = current_start + tokens_per_frame
-            if current_end > prefix_hidden.shape[1]:
-                continue
-
-            student_tokens = prefix_hidden[:, current_start:current_end, :].to(torch.float32)
-            teacher_tokens = self._get_teacher_tokens_for_camera(
-                teacher_observation,
-                prefix_hidden.device,
-                prefix_hidden.shape[0],
-                name,
-                prefix_hidden.shape[-1],
-            )
-            if teacher_tokens is not None:
-                teacher_tokens = self._pool_tokens_to_match(teacher_tokens, student_tokens)
-                projected_student = self.current_align_projector(student_tokens)
-                camera_loss = 1.0 - F.cosine_similarity(
-                    F.normalize(projected_student, dim=-1),
-                    F.normalize(teacher_tokens, dim=-1),
-                    dim=-1,
-                ).mean()
-                if role == "wrist":
-                    wrist_losses.append(camera_loss)
-                else:
-                    main_losses.append(camera_loss)
-                debug_info["teacher_shapes"][name] = tuple(teacher_tokens.shape)
-            else:
-                debug_info["teacher_shapes"][name] = None
-                if role == "wrist":
-                    wrist_losses.append(prefix_hidden.new_zeros((), dtype=torch.float32))
-
-            debug_info["student_shapes"][name] = tuple(student_tokens.shape)
-
-            alias = self._camera_decode_alias(name)
-            if current_main_view is None and role == "main":
-                current_main_view = name
-                current_main_tokens = student_tokens
-            if role == "main" and (alias == self.current_decode_view or name.lower() == self.current_decode_view):
-                current_main_view = name
-                current_main_tokens = student_tokens
-                debug_info["teacher_camera"] = name
-
-        if main_losses:
-            alignment_loss = alignment_loss + self.align_loss_coeff_main_current * torch.stack(main_losses).mean()
-        if wrist_losses:
-            alignment_loss = alignment_loss + self.align_loss_coeff_wrist_current * torch.stack(wrist_losses).mean()
-
-        debug_info["selected_view"] = current_main_view
-        if current_main_tokens is None or not self.enable_current_aligned_decode:
-            return alignment_loss, None, debug_info
-
-        debug_info["selected_view_shape"] = tuple(current_main_tokens.shape)
-        current_geometry_tokens = self.current_geometry_adapter(current_main_tokens)
-        debug_info["selected_geometry_shape"] = tuple(current_geometry_tokens.shape)
-        return alignment_loss, current_geometry_tokens, debug_info
 
     def _temporal_context_labels(self) -> list[str]:
         labels: list[str] = []
@@ -2137,18 +1889,17 @@ class PI0Pytorch(nn.Module):
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, gaussian_inputs=None,
-        return_segment_lengths=False, motion_prior_observation=None
+        return_segment_lengths=False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        """Embed images with SigLIP and language tokens with embedding layer to prepare
-        for PaliGemma transformer processing.
+        """Embed current RGB images and language tokens for prefix processing.
 
-        NEW: Also includes world tokens and future query tokens if enabled.
+        When world modeling is enabled, future motion-query tokens are also appended.
 
         Returns:
             If return_segment_lengths=False: (embs, pad_masks, att_masks)
             If return_segment_lengths=True: (embs, pad_masks, att_masks, segment_info)
-                where segment_info contains lengths/ranges for gaussian, gaussian_wrist,
-                images, language, world, and future segments.
+                where segment_info contains lengths/ranges for image segments,
+                language, optional world, and future segments.
         """
         embs = []
         pad_masks = []
@@ -2164,7 +1915,7 @@ class PI0Pytorch(nn.Module):
             att_masks.extend([att_value] * seg_len)
             segment_lengths[name] = seg_len
             segment_ranges[name] = (start, start + seg_len)
-        
+
         # Process language tokens first to get text embedding for LGPD
         def lang_embed_func(lang_tokens):
             lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
@@ -2185,107 +1936,41 @@ class PI0Pytorch(nn.Module):
         world_tokens = None
         world_mask = None
 
-        gaussian_embs = None
-        g_mask = None
         mta_features = None
-        gaussian_result = self.gaussian_adapter(
-            gaussian_inputs,
-            text_embedding=text_embedding,
-            return_mta_features=self.use_world_tokens_in_prefix,
-        )
         if self.use_world_tokens_in_prefix:
-            gaussian_embs, g_mask, mta_features = gaussian_result
-        else:
-            gaussian_embs, g_mask = gaussian_result
-
-        wrist_gaussian_embs_for_prefix = None
-        wrist_g_mask_for_prefix = None
-        if motion_prior_observation is not None and self.gaussian_adapter.use_gaussian:
-            batch_size = lang_tokens.shape[0] if lang_tokens is not None else None
-            if batch_size is None and gaussian_inputs is not None:
-                batch_size = gaussian_inputs.shape[0]
-            if batch_size is None:
-                batch_size = 1
-            wrist_gaussian_inputs = self.gaussian_adapter.prepare_inputs(
-                motion_prior_observation,
-                device=lang_emb.device,
-                batch_size=batch_size,
-                is_training=False,
-                view_type="wrist",
-                current_frame_only=True,
+            _, _, mta_features = self.gaussian_adapter(
+                gaussian_inputs,
+                text_embedding=text_embedding,
+                return_mta_features=True,
             )
-            if wrist_gaussian_inputs is not None:
-                wrist_gaussian_result = self.gaussian_adapter(
-                    wrist_gaussian_inputs,
-                    text_embedding=text_embedding,
-                    return_mta_features=False,
-                )
-                wrist_gaussian_embs, wrist_g_mask = wrist_gaussian_result
-                wrist_gaussian_embs_for_prefix = wrist_gaussian_embs
-                wrist_g_mask_for_prefix = wrist_g_mask
-
-        gaussian_embs_for_prefix = None
-        g_mask_for_prefix = None
-        if self.use_current_gaussian_tokens_in_prefix:
-            if (
-                gaussian_embs is not None
-                and self.use_world_tokens_in_prefix
-                and self.static_gaussian_token_count > 0
-                and gaussian_embs.shape[1] >= self.static_gaussian_token_count
-            ):
-                gaussian_embs_for_prefix = gaussian_embs[:, -self.static_gaussian_token_count :, :]
-                g_mask_for_prefix = g_mask[:, -self.static_gaussian_token_count :]
-            else:
-                gaussian_embs_for_prefix = gaussian_embs
-                g_mask_for_prefix = g_mask
-
-        if gaussian_embs_for_prefix is not None:
-            _append_segment('gaussian', gaussian_embs_for_prefix, g_mask_for_prefix, att_value=0)
-
-        if wrist_gaussian_embs_for_prefix is not None and wrist_g_mask_for_prefix is not None:
-            _append_segment('gaussian_wrist', wrist_gaussian_embs_for_prefix, wrist_g_mask_for_prefix, att_value=0)
 
         # Process images
         total_img_tokens = 0
-        image_token_offset = 0
-        image_names = list(getattr(motion_prior_observation, "images", {}).keys()) if motion_prior_observation is not None else []
-        if not image_names:
-            image_names = [f"image_{idx}" for idx in range(len(images))]
         for idx, (img, img_mask) in enumerate(zip(images, img_masks, strict=True)):
-            camera_name = image_names[idx] if idx < len(image_names) else f"image_{idx}"
             has_temporal = img.ndim == 5
             current_frame_index = self._get_current_frame_index(img)
             if has_temporal:
                 img_current = img[:, current_frame_index]
                 if img_mask.ndim == 2:
-                    img_mask_current = img_mask[:, current_frame_index]
+                    img_mask_flat = img_mask[:, current_frame_index][:, None]
                 else:
-                    img_mask_current = img_mask
+                    img_mask_flat = img_mask[:, None]
 
                 def image_embed_func(img_current):
                     return self.paligemma_with_expert.embed_image(img_current)
 
                 img_emb = self._apply_checkpoint(image_embed_func, img_current)
-                bsize, num_img_embs = img_emb.shape[:2]
-                img_mask_flat = img_mask_current[:, None].expand(bsize, num_img_embs)
-                n_tokens = num_img_embs
-                tokens_per_frame = num_img_embs
-                prefix_num_frames = 1
-                prefix_current_frame_index = 0
             else:
                 def image_embed_func(img):
                     return self.paligemma_with_expert.embed_image(img)
 
                 img_emb = self._apply_checkpoint(image_embed_func, img)
-                bsize, num_img_embs = img_emb.shape[:2]
-                img_mask_flat = img_mask[:, None].expand(bsize, num_img_embs)
-                n_tokens = num_img_embs
-                tokens_per_frame = num_img_embs
-                prefix_num_frames = 1
-                prefix_current_frame_index = 0
+                img_mask_flat = img_mask[:, None]
 
-            _append_segment(f'image_{total_img_tokens}', img_emb, img_mask_flat, att_value=0)
-            total_img_tokens += n_tokens
+            bsize, num_img_embs = img_emb.shape[:2]
+            img_mask_flat = img_mask_flat.expand(bsize, num_img_embs)
+            _append_segment(f'image_{idx}', img_emb, img_mask_flat, att_value=0)
+            total_img_tokens += num_img_embs
         if total_img_tokens > 0:
             first_image_start = min(segment_ranges[name][0] for name in segment_ranges if name.startswith('image_'))
             last_image_end = max(segment_ranges[name][1] for name in segment_ranges if name.startswith('image_'))
@@ -3112,7 +2797,6 @@ class PI0Pytorch(nn.Module):
             lang_masks,
             gaussian_inputs=gaussian_inputs,
             return_segment_lengths=True,
-            motion_prior_observation=preprocessed_observation,
         )
         prefix_embs, prefix_pad_masks, prefix_att_masks, segment_info = prefix_result
 
@@ -3134,39 +2818,15 @@ class PI0Pytorch(nn.Module):
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        output_hidden_states = self.use_current_vggt_teacher_align or self.enable_current_aligned_decode
-        current_visual_geometry_tokens = None
-        if output_hidden_states:
-            (prefix_out, _), _, hidden_states_history = self._run_prefix_backbone(
-                prefix_embs,
-                suffix_embs,
-                att_2d_masks_4d,
-                position_ids,
-                adarms_cond,
-                output_hidden_states=True,
-            )
-            if hidden_states_history is not None and len(hidden_states_history) > self.vla_layers_align:
-                prefix_hidden, _ = hidden_states_history[self.vla_layers_align]
-                _, current_visual_geometry_tokens, _ = self._extract_current_aligned_tokens(
-                    prefix_hidden,
-                    preprocessed_observation,
-                )
-        else:
-            (prefix_out, _), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
-            )
-        z_current_static_tokens = None
+        (prefix_out, _), _ = self.paligemma_with_expert.forward(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+        )
         z_future_pred_tokens = None
-        gaussian_slice = self._get_segment_slice(segment_info, "gaussian")
-        if gaussian_slice is not None:
-            gaussian_start, gaussian_end = gaussian_slice
-            if gaussian_end > gaussian_start:
-                z_current_static_tokens = prefix_out[:, gaussian_start:gaussian_end, :]
         future_slice = self._get_segment_slice(segment_info, "future")
         if future_slice is not None:
             future_start, future_end = future_slice
@@ -3185,10 +2845,8 @@ class PI0Pytorch(nn.Module):
         if current_target is None:
             current_target = preprocessed_observation
 
-        current_recon_tokens = current_visual_geometry_tokens
-        if current_recon_tokens is None:
-            current_recon_tokens = z_current_static_tokens if z_current_static_tokens is not None else z_future_pred_tokens
-        current_decoder_state = self._build_world_decoder_state(current_recon_tokens, step=None)
+        current_recon_tokens = z_future_pred_tokens
+        current_decoder_state = decoder_state
         _, static_template_raw = self._compute_current_frame_recon_loss(
             current_recon_tokens,
             current_target,
@@ -3356,8 +3014,6 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        selected_decode_camera = self._resolve_current_decode_camera_name(preprocessed_observation)
-        teacher_observation = self._get_teacher_observation(preprocessed_observation)
         gaussian_inputs = None
         if self.gaussian_adapter.use_gaussian:
             gaussian_inputs = self._prepare_gaussian_inputs(
@@ -3366,7 +3022,6 @@ class PI0Pytorch(nn.Module):
                 actions.shape[0],
             )
 
-
         prefix_result = self.embed_prefix(
             images,
             img_masks,
@@ -3374,7 +3029,6 @@ class PI0Pytorch(nn.Module):
             lang_masks,
             gaussian_inputs=gaussian_inputs,
             return_segment_lengths=self.use_world_tokens_in_prefix,
-            motion_prior_observation=preprocessed_observation,
         )
         if self.use_world_tokens_in_prefix:
             prefix_embs, prefix_pad_masks, prefix_att_masks, segment_info = prefix_result
@@ -3410,48 +3064,15 @@ class PI0Pytorch(nn.Module):
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        output_hidden_states = self.use_current_vggt_teacher_align or self.enable_current_aligned_decode
-        if output_hidden_states:
-            (prefix_out, suffix_out), _, hidden_states_history = self._run_prefix_backbone(
-                prefix_embs,
-                suffix_embs,
-                att_2d_masks_4d,
-                position_ids,
-                adarms_cond,
-                output_hidden_states=True,
-            )
-        else:
-            (prefix_out, suffix_out), _ = self._apply_checkpoint(
-                self._run_prefix_backbone,
-                prefix_embs,
-                suffix_embs,
-                att_2d_masks_4d,
-                position_ids,
-                adarms_cond,
-                output_hidden_states=False,
-            )
-            hidden_states_history = None
-
-        align_loss = prefix_out.new_zeros((), dtype=torch.float32)
-        current_visual_geometry_tokens = None
-        current_align_debug: dict[str, object] = {}
-        if output_hidden_states and hidden_states_history is not None and len(hidden_states_history) > self.vla_layers_align:
-            prefix_hidden, _ = hidden_states_history[self.vla_layers_align]
-            align_loss, current_visual_geometry_tokens, current_align_debug = self._extract_current_aligned_tokens(
-                prefix_hidden,
-                preprocessed_observation,
-            )
-            if step is not None and step % 400 == 0:
-                student_shapes = current_align_debug.get("student_shapes", {})
-                teacher_shapes = current_align_debug.get("teacher_shapes", {})
-                logging.info(
-                    f"Step {step}: Current Align Debug | "
-                    f"selected_view={current_align_debug.get('selected_view')}, "
-                    f"selected_view_shape={current_align_debug.get('selected_view_shape')}, "
-                    f"selected_geometry_shape={current_align_debug.get('selected_geometry_shape')}, "
-                    f"student_shapes={student_shapes}, teacher_shapes={teacher_shapes}, "
-                    f"align_loss={align_loss.item():.6f}"
-                )
+        (prefix_out, suffix_out), _ = self._apply_checkpoint(
+            self._run_prefix_backbone,
+            prefix_embs,
+            suffix_embs,
+            att_2d_masks_4d,
+            position_ids,
+            adarms_cond,
+            output_hidden_states=False,
+        )
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -3470,18 +3091,9 @@ class PI0Pytorch(nn.Module):
                 f"warmup_steps={self.action_warmup_steps}, action_branch_trainable={self._action_loss_enabled}"
             )
 
-        if torch.isfinite(align_loss):
-            loss = loss + align_loss.to(loss.dtype)
-
-        z_current_static_tokens = None
         z_t1_pred_tokens = None
         z_future_pred_tokens = None
         per_step_delta = None
-        gaussian_slice = self._get_segment_slice(segment_info, "gaussian")
-        if self.use_world_tokens_in_prefix and gaussian_slice is not None:
-            gaussian_start, gaussian_end = gaussian_slice
-            if gaussian_end > gaussian_start:
-                z_current_static_tokens = prefix_out[:, gaussian_start:gaussian_end, :]
         future_slice = self._get_segment_slice(segment_info, "future")
         if self.use_world_tokens_in_prefix and future_slice is not None:
             future_start, future_end = future_slice
@@ -3522,18 +3134,12 @@ class PI0Pytorch(nn.Module):
             if current_target is None:
                 current_target = preprocessed_observation
 
-            current_recon_tokens = current_visual_geometry_tokens
-            current_recon_source = "aligned_current_tokens"
-            if current_recon_tokens is None and z_current_static_tokens is not None:
-                current_recon_tokens = z_current_static_tokens
-                current_recon_source = "current_gaussian_tokens_fallback"
-            elif current_recon_tokens is None:
-                current_recon_tokens = z_future_pred_tokens
-                current_recon_source = "future_tokens_fallback"
+            current_recon_tokens = z_future_pred_tokens
+            current_recon_source = "future_tokens_shared_latent"
 
             if current_recon_tokens is not None:
                 try:
-                    current_decoder_state = self._build_world_decoder_state(current_recon_tokens, step=step)
+                    current_decoder_state = decoder_state
                     current_template_loss, static_template_raw = self._compute_current_frame_recon_loss(
                         current_recon_tokens,
                         current_target,
@@ -3657,7 +3263,6 @@ class PI0Pytorch(nn.Module):
             lang_masks,
             gaussian_inputs=gaussian_inputs,
             return_segment_lengths=self.use_world_tokens_in_prefix,
-            motion_prior_observation=preprocessed_observation,
         )
         if self.use_world_tokens_in_prefix:
             prefix_embs, prefix_pad_masks, prefix_att_masks, segment_info = prefix_result
