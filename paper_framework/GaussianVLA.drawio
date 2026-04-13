@@ -1,6 +1,6 @@
 <mxfile host="app.diagrams.net">
   <diagram name="第 1 页" id="UAgL84E5A9tJlFbNLdiW">
-    <mxGraphModel dx="2102" dy="840" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+    <mxGraphModel dx="1658" dy="548" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
@@ -720,6 +720,9 @@
             <mxPoint x="1205.0749999999998" y="713.3671199999999" as="sourcePoint" />
             <mxPoint x="1256" y="713" as="targetPoint" />
           </mxGeometry>
+        </mxCell>
+        <mxCell id="Hqzfxjt4Sbn3zk4SqUtd-1" parent="1" style="text;whiteSpace=wrap;" value="View-Conditioned Gaussian Dynamics Tokens" vertex="1">
+          <mxGeometry height="30" width="265" x="855" y="1020" as="geometry" />
         </mxCell>
       </root>
     </mxGraphModel>
