@@ -119,7 +119,7 @@ def _compute_depth_range(depth_maps: list[np.ndarray]) -> tuple[float, float]:
 
 def _save_depth_png(depth: np.ndarray, out_path: Path, *, vmin: float, vmax: float) -> None:
     norm = np.clip((depth - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0)
-    rgba = colormaps["winter"](norm)
+    rgba = colormaps["viridis"](norm)
     rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
     invalid = ~np.isfinite(depth)
     if invalid.any():

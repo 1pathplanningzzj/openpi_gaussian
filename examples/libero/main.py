@@ -38,7 +38,7 @@ class Args:
     # Model server parameters
     #################################################################################################################
     host: str = "0.0.0.0"
-    port: int = 8020
+    port: int = 8021
     resize_size: int = 224
     replan_steps: int = 5  # Test with 1 for closed-loop control
 
@@ -46,7 +46,7 @@ class Args:
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = (
-        "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+        "libero_goal"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     task_id: list[int] | None = None  # Specific task ID(s) to evaluate (None = evaluate all tasks)
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize in sim
@@ -55,7 +55,7 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data_411/pi05_libero_spatial/videos"  # Path to save videos
+    video_out_path: str = "data_415/gaussian_vla_exp415_35000_goal_test_1/videos"  # Path to save videos
     # Gaussian_vla_exp315_12000_libero_10 这个实际上是goal
     save_videos: bool = True  # Whether to save rollout videos
     seed: int = 7  # Random Seed (for reproducibility)

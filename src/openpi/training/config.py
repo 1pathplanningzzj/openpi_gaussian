@@ -827,6 +827,77 @@ _CONFIGS = [
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
     ),
+    # Small-sample sanity configs for verifying the RoboCasa training pipeline on a tiny subset.
+    # They intentionally reuse the same RoboCasa norm stats as the main config.
+    TrainConfig(
+        name="pi05_robocasa_overfit",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            max_token_len=128,
+            action_dim=32,
+        ),
+        data=RobocasaDataConfig(
+            repo_id="DAVIAN-Robotics/robocasa-H50",
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_robocasa",
+                asset_id="DAVIAN-Robotics/robocasa-H50",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dataset_root="/home/yuqingjiang/openpi_shared/data/robocasa-H50-overfit-pnpcab",
+            ),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=50,
+            peak_lr=5e-5,
+            decay_steps=2_000,
+            decay_lr=5e-6,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        checkpoint_base_dir="/data/zijianzhang/train_ckpts",
+        batch_size=8,
+        num_workers=0,
+        num_train_steps=2_000,
+        log_interval=10,
+        save_interval=100,
+        keep_period=500,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_overfit_libero_init",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            max_token_len=128,
+            action_dim=32,
+        ),
+        data=RobocasaDataConfig(
+            repo_id="DAVIAN-Robotics/robocasa-H50",
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_robocasa",
+                asset_id="DAVIAN-Robotics/robocasa-H50",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dataset_root="/home/yuqingjiang/openpi_shared/data/robocasa-H50-overfit-pnpcab",
+            ),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=50,
+            peak_lr=5e-5,
+            decay_steps=2_000,
+            decay_lr=5e-6,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
+        checkpoint_base_dir="/data/zijianzhang/train_ckpts",
+        batch_size=8,
+        num_workers=0,
+        num_train_steps=2_000,
+        log_interval=10,
+        save_interval=100,
+        keep_period=500,
+        wandb_enabled=False,
+    ),
     TrainConfig(
         name="pi0_robocasa_depth",
         model=pi0_config.Pi0Config(

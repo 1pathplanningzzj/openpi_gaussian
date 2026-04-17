@@ -1,0 +1,115 @@
+nohup: ignoring input
+warning: The `tool.uv.dev-dependencies` field (used in `packages/openpi-client/pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+/home/zijianzhang/openpi/uv_venv/lib/python3.11/site-packages/transformers/utils/hub.py:111: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+INFO:root:Loading model...
+INFO:2026-04-11 21:22:58,579:jax._src.xla_bridge:925: Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+INFO:jax._src.xla_bridge:Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+INFO:2026-04-11 21:22:58,580:jax._src.xla_bridge:925: Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+INFO:jax._src.xla_bridge:Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+INFO:absl:orbax-checkpoint version: 0.11.13
+INFO:absl:Created BasePyTreeCheckpointHandler: use_ocdbt=True, use_zarr3=False, pytree_metadata_options=PyTreeMetadataOptions(support_rich_types=False), array_metadata_store=<orbax.checkpoint._src.metadata.array_metadata_store.Store object at 0x7f309bf1ee10>
+INFO:absl:Restoring checkpoint from /data/zijianzhang/official_ckpts/pi05_libero/params.
+INFO:absl:[thread=MainThread] Failed to get flag value for EXPERIMENTAL_ORBAX_USE_DISTRIBUTED_PROCESS_ID.
+INFO:absl:[process=0] /jax/checkpoint/read/bytes_per_sec: 1.9 GiB/s (total bytes: 6.2 GiB) (time elapsed: 3 seconds) (per-host)
+INFO:absl:Finished restoring checkpoint in 3.21 seconds from /data/zijianzhang/official_ckpts/pi05_libero/params.
+INFO:root:Loaded norm stats from /home/zijianzhang/openpi/assets/pi05_libero/physical-intelligence/libero
+INFO:root:Loaded norm stats from /data/zijianzhang/official_ckpts/pi05_libero/assets/physical-intelligence/libero
+INFO:root:Creating server (host: iv-yebmyyxb0gwh2yql116e, ip: 127.0.1.1)
+INFO:websockets.server:server listening on 0.0.0.0:8020
+INFO:websockets.server:connection open
+INFO:openpi.serving.websocket_policy_server:Connection from ('127.0.0.1', 42330) opened
+ERROR:websockets.server:connection handler failed
+Traceback (most recent call last):
+  File "/home/zijianzhang/openpi/uv_venv/lib/python3.11/site-packages/jaxtyping/_decorator.py", line 446, in wrapped_fn_impl
+    param_fn(*args, **kwargs)
+  File "<@beartype(openpi.models.model.Observation) at 0x7f2f6412d8a0>", line 191, in Observation
+beartype.roar.BeartypeCallHintParamViolation: Method openpi.models.model.Observation() parameter tokenized_prompt="Array([[     2,  18075,    908,    573,   2656,  14581,   1865,    573,
+          8811,   ...)" violates type hint typing.Union[jaxtyping.Int[Array, '*b l'], jaxtyping.Int[Tensor, '*b l'], jaxtyping.Int[ndarray, '*b l'], NoneType], as <protocol "jaxlib.xla_extension.ArrayImpl"> "Array([[     2,  18075,    908,    573,   2656,  14581,   1865,    573,
+          8811,   ...)" not <protocol "jaxtyping.Int[Array, '*b l']">, <protocol "jaxtyping.Int[Tensor, '*b l']">, <class "builtins.NoneType">, or <protocol "jaxtyping.Int[ndarray, '*b l']">.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/zijianzhang/openpi/uv_venv/lib/python3.11/site-packages/jaxtyping/_decorator.py", line 811, in _get_problem_arg
+    fn(*args, **kwargs)
+  File "<@beartype(openpi.models.model.check_single_arg) at 0x7f2f6412f1a0>", line 32, in check_single_arg
+beartype.roar.BeartypeCallHintParamViolation: Method openpi.models.model.check_single_arg() parameter tokenized_prompt="Array([[     2,  18075,    908,    573,   2656,  14581,   1865,    573,
+          8811,   ...)" violates type hint typing.Union[jaxtyping.Int[Array, '*b l'], jaxtyping.Int[Tensor, '*b l'], jaxtyping.Int[ndarray, '*b l'], NoneType], as <protocol "jaxlib.xla_extension.ArrayImpl"> "Array([[     2,  18075,    908,    573,   2656,  14581,   1865,    573,
+          8811,   ...)" not <protocol "jaxtyping.Int[Array, '*b l']">, <protocol "jaxtyping.Int[Tensor, '*b l']">, <class "builtins.NoneType">, or <protocol "jaxtyping.Int[ndarray, '*b l']">.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/zijianzhang/openpi/uv_venv/lib/python3.11/site-packages/jaxtyping/_decorator.py", line 451, in wrapped_fn_impl
+    argmsg = _get_problem_arg(
+             ^^^^^^^^^^^^^^^^^
+  File "/home/zijianzhang/openpi/uv_venv/lib/python3.11/site-packages/jaxtyping/_decorator.py", line 814, in _get_problem_arg
+    raise TypeCheckError(
+jaxtyping.TypeCheckError: 
+The problem arose whilst typechecking parameter 'tokenized_prompt'.
+Actual value: i32[1,200]
+Expected type: typing.Union[Int[Array, '*b l'], Int[Tensor, '*b l'], Int[ndarray, '*b l'], NoneType].
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/zijianzhang/openpi/uv_venv/lib/python3.11/site-packages/websockets/asyncio/server.py", line 376, in conn_handler
+    await self.handler(connection)
+  File "/home/zijianzhang/openpi/src/openpi/serving/websocket_policy_server.py", line 61, in _handler
+    action = self._policy.infer(obs)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zijianzhang/openpi/src/openpi/policies/policy.py", line 105, in infer
+    observation = _model.Observation.from_dict(inputs)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zijianzhang/openpi/src/openpi/models/model.py", line 286, in from_dict
+    return cls(
+           ^^^^
+  File "/home/zijianzhang/openpi/uv_venv/lib/python3.11/site-packages/jaxtyping/_decorator.py", line 317, in __init__
+    _check_dataclass_annotations(self, typechecker)
+  File "/home/zijianzhang/openpi/src/openpi/shared/array_typing.py", line 39, in _check_dataclass_annotations
+    return _original_check_dataclass_annotations(self, typechecker)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zijianzhang/openpi/uv_venv/lib/python3.11/site-packages/jaxtyping/_decorator.py", line 621, in _check_dataclass_annotations
+    f(self, **values)
+  File "/home/zijianzhang/openpi/uv_venv/lib/python3.11/site-packages/jaxtyping/_decorator.py", line 559, in wrapped_fn
+    return wrapped_fn_impl(args, kwargs, bound, memos)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zijianzhang/openpi/uv_venv/lib/python3.11/site-packages/jaxtyping/_decorator.py", line 480, in wrapped_fn_impl
+    raise TypeCheckError(msg) from e
+jaxtyping.TypeCheckError: Type-check error whilst checking the parameters of openpi.models.model.Observation.
+The problem arose whilst typechecking parameter 'tokenized_prompt'.
+Actual value: i32[1,200]
+Expected type: typing.Union[Int[Array, '*b l'], Int[Tensor, '*b l'], Int[ndarray, '*b l'], NoneType].
+----------------------
+Called with parameters: {
+  'self': Observation(...),
+  'images':
+  {
+    'base_0_rgb': f32[1,3,224,224,3],
+    'left_wrist_0_rgb': f32[1,3,224,224,3],
+    'right_wrist_0_rgb': f32[1,3,224,224,3]
+  },
+  'image_masks':
+  {
+    'base_0_rgb': bool[1,3],
+    'left_wrist_0_rgb': bool[1,3],
+    'right_wrist_0_rgb': bool[1,3]
+  },
+  'state': f32[1,3,32],
+  'depth': None,
+  'flow_3d': None,
+  'flow_valid_mask': None,
+  'tokenized_prompt': i32[1,200],
+  'tokenized_prompt_mask': bool[1,200],
+  'token_ar_mask': None,
+  'token_loss_mask': None
+}
+Parameter annotations: (self: Any, images: dict[str, Union[Float[Array, '*b h w c'], Float[Tensor, '*b h w c'], Float[ndarray, '*b h w c']]], image_masks: dict[str, Union[Bool[Array, '*b'], Bool[Tensor, '*b'], Bool[ndarray, '*b']]], state: Union[Float[Array, '*b s'], Float[Tensor, '*b s'], Float[ndarray, '*b s']], depth: Union[Float[Array, '*b 1 dh dw'], Float[Tensor, '*b 1 dh dw'], Float[ndarray, '*b 1 dh dw'], NoneType], flow_3d: Union[Float[Array, '... fh fw 3'], Float[Tensor, '... fh fw 3'], Float[ndarray, '... fh fw 3'], NoneType], flow_valid_mask: Union[Bool[Array, '... fh fw'], Bool[Tensor, '... fh fw'], Bool[ndarray, '... fh fw'], NoneType], tokenized_prompt: Union[Int[Array, '*b l'], Int[Tensor, '*b l'], Int[ndarray, '*b l'], NoneType], tokenized_prompt_mask: Union[Bool[Array, '*b l'], Bool[Tensor, '*b l'], Bool[ndarray, '*b l'], NoneType], token_ar_mask: Union[Int[Array, '*b l'], Int[Tensor, '*b l'], Int[ndarray, '*b l'], NoneType], token_loss_mask: Union[Bool[Array, '*b l'], Bool[Tensor, '*b l'], Bool[ndarray, '*b l'], NoneType]) -> Any.
+The current values for each jaxtyping axis annotation are as follows.
+h=224
+w=224
+c=3
+s=32
+l=200
+b=(1, 3)

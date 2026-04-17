@@ -98,32 +98,20 @@ class SharedGaussianBackbone(nn.Module):
         return fused
 
 
-class StaticGaussianHead(nn.Module):
-    """Decode shared features into static Gaussian parameters and absolute depth.
+class GeometryHead(nn.Module):
+    """Predict geometry-owned Gaussian parameters from shared geometry features."""
 
-    Geometry maps F_g from ``shared_features``; optional RGB is added only before the
-    Gaussian-parameter head. Depth is refined from F_g alone so appearance does not
-    leak into the depth branch.
-    """
-
-    def __init__(self, use_image_fusion: bool = True, img_dim: int = 3, predict_depth: bool = True):
+    def __init__(self, predict_depth: bool = True, feature_dim: int = 128):
         super().__init__()
-        self.use_image_fusion = use_image_fusion
         self.predict_depth = predict_depth
+        self.feature_dim = feature_dim
 
-        out_ch = 4 + 3 + 1 + 9  # rot(4) + scale(3) + opacity(1) + SH(9)
-
-        if use_image_fusion:
-            self.img_merger = nn.Sequential(
-                nn.Conv2d(img_dim, 128, 7, padding=3),
-                nn.GELU(),
-            )
-
-        self.head = nn.Conv2d(128, out_ch, 3, padding=1)
+        # rot(4) + scale(3) + opacity(1)
+        self.param_head = nn.Conv2d(feature_dim, 8, 3, padding=1)
 
         if predict_depth:
             self.depth_refine = nn.Sequential(
-                nn.Conv2d(128, 64, 3, padding=1),
+                nn.Conv2d(feature_dim, 64, 3, padding=1),
                 nn.GroupNorm(min(32, 64), 64),
                 nn.GELU(),
                 nn.Conv2d(64, 64, 3, padding=1),
@@ -131,14 +119,89 @@ class StaticGaussianHead(nn.Module):
                 nn.GELU(),
                 nn.Conv2d(64, 1, 3, padding=1),
             )
-            for m in self.depth_refine.modules():
-                if isinstance(m, nn.Conv2d):
-                    nn.init.xavier_uniform_(m.weight, gain=0.01)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
+            for module in self.depth_refine.modules():
+                if isinstance(module, nn.Conv2d):
+                    nn.init.xavier_uniform_(module.weight, gain=0.01)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
 
-        nn.init.xavier_uniform_(self.head.weight, gain=0.01)
-        nn.init.zeros_(self.head.bias)
+        nn.init.xavier_uniform_(self.param_head.weight, gain=0.01)
+        nn.init.zeros_(self.param_head.bias)
+
+    def forward(self, shared_features: torch.Tensor) -> dict[str, torch.Tensor]:
+        result = {"geom_params": self.param_head(shared_features)}
+        if self.predict_depth:
+            result["depth"] = self.depth_refine(shared_features)
+        return result
+
+
+class AppearanceHead(nn.Module):
+    """Predict appearance-only SH coefficients from geometry context and RGB."""
+
+    def __init__(
+        self,
+        use_image_fusion: bool = True,
+        img_dim: int = 3,
+        feature_dim: int = 128,
+        image_fusion_alpha: float = 1.0,
+        stop_grad_geometry: bool = True,
+    ):
+        super().__init__()
+        self.use_image_fusion = bool(use_image_fusion)
+        self.feature_dim = feature_dim
+        self.image_fusion_alpha = float(image_fusion_alpha)
+        self.stop_grad_geometry = bool(stop_grad_geometry)
+
+        if use_image_fusion:
+            self.img_merger = nn.Sequential(
+                nn.Conv2d(img_dim, feature_dim, 7, padding=3),
+                nn.GELU(),
+            )
+
+        self.sh_head = nn.Conv2d(feature_dim, 9, 3, padding=1)
+        nn.init.xavier_uniform_(self.sh_head.weight, gain=0.01)
+        nn.init.zeros_(self.sh_head.bias)
+
+    def set_image_fusion_enabled(self, enabled: bool) -> None:
+        self.use_image_fusion = bool(enabled)
+
+    def forward(self, shared_features: torch.Tensor, images: torch.Tensor | None = None) -> torch.Tensor:
+        geom_context = shared_features.detach() if self.stop_grad_geometry else shared_features
+        appearance_features = geom_context
+        if self.use_image_fusion and images is not None:
+            if images.shape[2:] != geom_context.shape[2:]:
+                images = F.interpolate(images, size=geom_context.shape[2:], mode="bilinear", align_corners=True)
+            appearance_features = appearance_features + self.image_fusion_alpha * self.img_merger(images)
+        return self.sh_head(appearance_features)
+
+
+class StaticGaussianHead(nn.Module):
+    """Decode geometry and appearance with separate heads.
+
+    Geometry-owned outputs are predicted only from ``shared_features``. Appearance
+    uses a separate SH branch so RGB fusion cannot backprop directly into geometry
+    features when ``stop_grad_geometry_for_appearance`` is enabled.
+    """
+
+    def __init__(
+        self,
+        use_image_fusion: bool = True,
+        img_dim: int = 3,
+        predict_depth: bool = True,
+        image_fusion_alpha: float = 1.0,
+        stop_grad_geometry_for_appearance: bool = True,
+    ):
+        super().__init__()
+        self.use_image_fusion = bool(use_image_fusion)
+        self.predict_depth = bool(predict_depth)
+
+        self.geometry_head = GeometryHead(predict_depth=predict_depth)
+        self.appearance_head = AppearanceHead(
+            use_image_fusion=use_image_fusion,
+            img_dim=img_dim,
+            image_fusion_alpha=image_fusion_alpha,
+            stop_grad_geometry=stop_grad_geometry_for_appearance,
+        )
 
         self.register_buffer(
             "sh_mask",
@@ -151,18 +214,16 @@ class StaticGaussianHead(nn.Module):
 
     def set_image_fusion_enabled(self, enabled: bool) -> None:
         self.use_image_fusion = bool(enabled)
+        self.appearance_head.set_image_fusion_enabled(enabled)
 
     def forward(self, shared_features: torch.Tensor, images: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
-        f_g = shared_features
-        g = f_g
-        if self.use_image_fusion and images is not None:
-            if images.shape[2:] != f_g.shape[2:]:
-                images = F.interpolate(images, size=f_g.shape[2:], mode="bilinear", align_corners=True)
-            g = f_g + self.img_merger(images)
-
-        result = {"gaussian_params": self.head(g)}
+        geometry_output = self.geometry_head(shared_features)
+        sh_logits = self.appearance_head(shared_features, images=images)
+        result = {
+            "gaussian_params": torch.cat([geometry_output["geom_params"], sh_logits], dim=1),
+        }
         if self.predict_depth:
-            result["depth"] = self.depth_refine(f_g)
+            result["depth"] = geometry_output["depth"]
         return result
 
 
