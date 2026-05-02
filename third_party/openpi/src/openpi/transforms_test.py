@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 import openpi.models.tokenizer as _tokenizer
+import openpi.shared.normalize as _normalize
 import openpi.transforms as _transforms
 
 
@@ -119,3 +120,17 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_unnormalize_quantile_shorter_input_than_stats():
+    stats = _normalize.NormStats(
+        mean=np.zeros(4, dtype=np.float32),
+        std=np.ones(4, dtype=np.float32),
+        q01=np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32),
+        q99=np.array([14.0, 24.0, 34.0, 44.0], dtype=np.float32),
+    )
+    transform = _transforms.Unnormalize({"state": stats}, use_quantiles=True)
+
+    output = transform({"state": np.array([0.0, 1.0], dtype=np.float32)})
+
+    assert np.allclose(output["state"], np.array([12.0000005, 24.000001], dtype=np.float32))

@@ -178,6 +178,7 @@ class Unnormalize(DataTransformFn):
         q01, q99 = stats.q01, stats.q99
         if (dim := q01.shape[-1]) < x.shape[-1]:
             return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
+        q01, q99 = q01[..., : x.shape[-1]], q99[..., : x.shape[-1]]
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
 
