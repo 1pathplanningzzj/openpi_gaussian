@@ -123,11 +123,18 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 class MotionAwareTemporalBlock(nn.Module):
-    """Implements DynamicVGGT-style temporal-only MTA over the frame axis."""
+    """Mix tokens within each frame, then model each token slot over time."""
 
     def __init__(self, embed_dim: int = 512, num_heads: int = 8, dropout: float = 0.1, max_temporal_frames: int = 8):
         super().__init__()
         self.max_temporal_frames = max_temporal_frames
+        self.token_norm = nn.LayerNorm(embed_dim)
+        self.token_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=dropout,
+        )
         self.norm1 = nn.LayerNorm(embed_dim)
         self.attn = nn.MultiheadAttention(
             embed_dim=embed_dim,
@@ -146,24 +153,52 @@ class MotionAwareTemporalBlock(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        """Apply self-attention independently for each token slot along time.
+        """Apply frame-wise joint self-attention followed by per-slot temporal self-attention.
 
         Args:
             x: [B, T, K, D]
         Returns:
             [B, T, K, D]
         """
+        if x.ndim != 4:
+            raise ValueError(f"Expected MTA tokens with shape [B, T, K, D], got {tuple(x.shape)}")
         bsz, num_frames, num_slots, dim = x.shape
         if num_frames > self.max_temporal_frames:
             raise ValueError(
                 f"MotionAwareTemporalBlock supports up to {self.max_temporal_frames} temporal frames, got {num_frames}"
             )
-        x_norm = self.norm1(x)
-        x_time = x_norm.permute(0, 2, 1, 3).reshape(bsz * num_slots, num_frames, dim)
-        temporal_bias = self.temporal_bias[:num_frames, :num_frames].to(device=x_time.device, dtype=x_time.dtype)
-        attn_out, _ = self.attn(x_time, x_time, x_time, attn_mask=temporal_bias, need_weights=False)
-        attn_out = attn_out.reshape(bsz, num_slots, num_frames, dim).permute(0, 2, 1, 3)
-        x = x + attn_out
+
+        token_input = self.token_norm(x).reshape(bsz * num_frames, num_slots, dim)
+        token_out, _ = self.token_attn(token_input, token_input, token_input, need_weights=False)
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(
+                "MTA token mixing shapes: input=%s output=%s",
+                tuple(token_input.shape),
+                tuple(token_out.shape),
+            )
+        token_out = token_out.reshape(bsz, num_frames, num_slots, dim)
+        x = x + token_out
+
+        temporal_input = self.norm1(x).permute(0, 2, 1, 3).reshape(bsz * num_slots, num_frames, dim)
+        temporal_bias = self.temporal_bias[:num_frames, :num_frames].to(
+            device=temporal_input.device,
+            dtype=temporal_input.dtype,
+        )
+        temporal_out, _ = self.attn(
+            temporal_input,
+            temporal_input,
+            temporal_input,
+            attn_mask=temporal_bias,
+            need_weights=False,
+        )
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(
+                "MTA temporal attention shapes: input=%s output=%s",
+                tuple(temporal_input.shape),
+                tuple(temporal_out.shape),
+            )
+        temporal_out = temporal_out.reshape(bsz, num_slots, num_frames, dim).permute(0, 2, 1, 3)
+        x = x + temporal_out
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -191,7 +226,7 @@ class MotionAwareTemporalEncoder(nn.Module):
         ])
 
     def forward(self, motion_tokens: Tensor, layer_features: list[Tensor]) -> Tensor:
-        """Run layer-wise MTA and return motion tokens from the final layer.
+        """Run layer-wise MTA and return updated motion tokens from the final layer.
 
         Args:
             motion_tokens: [B, T, M, D]
@@ -199,21 +234,57 @@ class MotionAwareTemporalEncoder(nn.Module):
         Returns:
             final motion tokens: [B, T, M, D]
         """
+        if motion_tokens.ndim != 4:
+            raise ValueError(f"Expected motion tokens with shape [B, T, M, D], got {tuple(motion_tokens.shape)}")
         if len(layer_features) != len(self.blocks):
             raise ValueError(f"Expected {len(self.blocks)} layer features, got {len(layer_features)}")
 
         prev_patch = None
         current_motion = motion_tokens
-        for block, patch_tokens in zip(self.blocks, layer_features, strict=True):
+        motion_dim = motion_tokens.shape[2]
+        for block_idx, (block, patch_tokens) in enumerate(zip(self.blocks, layer_features, strict=True)):
+            if patch_tokens.ndim != 4:
+                raise ValueError(f"Expected patch tokens with shape [B, T, N, D], got {tuple(patch_tokens.shape)}")
+            if patch_tokens.shape[:2] != current_motion.shape[:2] or patch_tokens.shape[-1] != current_motion.shape[-1]:
+                raise ValueError(
+                    "MTA motion/patch shape mismatch: "
+                    f"motion={tuple(current_motion.shape)}, patch={tuple(patch_tokens.shape)}"
+                )
             if prev_patch is not None:
+                if prev_patch.shape != patch_tokens.shape:
+                    raise ValueError(
+                        "MTA adjacent patch feature shape mismatch: "
+                        f"prev={tuple(prev_patch.shape)}, current={tuple(patch_tokens.shape)}"
+                    )
                 patch_input = patch_tokens + prev_patch
             else:
                 patch_input = patch_tokens
+
             block_input = torch.cat([current_motion, patch_input], dim=2)
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(
+                    "MTA block %d input shapes: motion=%s patch=%s concat=%s",
+                    block_idx,
+                    tuple(current_motion.shape),
+                    tuple(patch_input.shape),
+                    tuple(block_input.shape),
+                )
             block_output = block(block_input)
-            motion_dim = current_motion.shape[2]
             current_motion = block_output[:, :, :motion_dim, :]
-            prev_patch = patch_tokens
+            prev_patch = block_output[:, :, motion_dim:, :]
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(
+                    "MTA block %d output shapes: block=%s motion=%s patch=%s",
+                    block_idx,
+                    tuple(block_output.shape),
+                    tuple(current_motion.shape),
+                    tuple(prev_patch.shape),
+                )
+
+        if current_motion.shape != motion_tokens.shape:
+            raise RuntimeError(
+                f"MTA output shape changed unexpectedly: expected {tuple(motion_tokens.shape)}, got {tuple(current_motion.shape)}"
+            )
         return current_motion
 
 
@@ -253,7 +324,7 @@ class PI0Pytorch(nn.Module):
 
         # Can be set via VIS_SAVE_DIR environment variable, or defaults to ./visualizations/rendering
         import os
-        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0412_lpips_future_5_frame")
+        self.vis_save_dir = os.environ.get("VIS_SAVE_DIR", "./visualizations/rendering_independent_decoder_test0501_lpips_future_5_frame")
 
         # --- 3D Gaussian Integration ---
         use_gaussian = getattr(config, "use_gaussian", False)

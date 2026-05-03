@@ -1,10 +1,53 @@
 import dataclasses
+from unittest import mock
 
 import jax
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+
+
+def test_create_lerobot_dataset_aligns_state_timestamps_with_image_context():
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        use_gaussian=True,
+        use_world_model=True,
+        use_single_frame_mode=False,
+        temporal_context_offsets=(-10, -5, 0),
+        future_prediction_offsets=(1, 2, 3, 4, 5),
+    )
+    data_config = _config.DataConfig(repo_id="fake_libero", dataset_root="/tmp/fake")
+
+    class _FakeMeta:
+        fps = 10.0
+        features = {
+            "observation.images.agentview_rgb": object(),
+            "observation.state": object(),
+        }
+        tasks = {}
+
+    captured = {}
+
+    def _fake_dataset(repo_id, root=None, delta_timestamps=None):
+        captured["repo_id"] = repo_id
+        captured["root"] = root
+        captured["delta_timestamps"] = delta_timestamps
+        return object()
+
+    with (
+        mock.patch.object(_data_loader.lerobot_dataset, "LeRobotDatasetMetadata", return_value=_FakeMeta()),
+        mock.patch.object(_data_loader.lerobot_dataset, "LeRobotDataset", side_effect=_fake_dataset),
+    ):
+        _data_loader.create_lerobot_dataset(
+            data_config,
+            config,
+            action_horizon=10,
+            use_single_frame_mode=False,
+        )
+
+    assert captured["delta_timestamps"]["observation.images.agentview_rgb"] == [-1.0, -0.5, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+    assert captured["delta_timestamps"]["observation.state"] == [-1.0, -0.5, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
 
 
 def test_torch_data_loader():

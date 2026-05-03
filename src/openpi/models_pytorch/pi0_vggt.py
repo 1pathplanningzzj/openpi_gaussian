@@ -81,7 +81,7 @@ class TemporalConv3DEncoder(nn.Module):
 
         # Output: [B, 512, T, H/4, W/4]
         # For 37×37 input: [B, 512, 3, 9, 9]
-
+ 
     def forward(self, x):
         """
         Args:

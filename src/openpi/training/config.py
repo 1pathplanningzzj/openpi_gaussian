@@ -827,6 +827,77 @@ _CONFIGS = [
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=30_000,
     ),
+    # Small-sample sanity configs for verifying the RoboCasa training pipeline on a tiny subset.
+    # They intentionally reuse the same RoboCasa norm stats as the main config.
+    TrainConfig(
+        name="pi05_robocasa_overfit",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            max_token_len=128,
+            action_dim=32,
+        ),
+        data=RobocasaDataConfig(
+            repo_id="DAVIAN-Robotics/robocasa-H50",
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_robocasa",
+                asset_id="DAVIAN-Robotics/robocasa-H50",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dataset_root="/home/yuqingjiang/openpi_shared/data/robocasa-H50-overfit-pnpcab",
+            ),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=50,
+            peak_lr=5e-5,
+            decay_steps=2_000,
+            decay_lr=5e-6,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        checkpoint_base_dir="/data/zijianzhang/train_ckpts",
+        batch_size=8,
+        num_workers=0,
+        num_train_steps=2_000,
+        log_interval=10,
+        save_interval=100,
+        keep_period=500,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_overfit_libero_init",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            max_token_len=128,
+            action_dim=32,
+        ),
+        data=RobocasaDataConfig(
+            repo_id="DAVIAN-Robotics/robocasa-H50",
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_robocasa",
+                asset_id="DAVIAN-Robotics/robocasa-H50",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dataset_root="/home/yuqingjiang/openpi_shared/data/robocasa-H50-overfit-pnpcab",
+            ),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=50,
+            peak_lr=5e-5,
+            decay_steps=2_000,
+            decay_lr=5e-6,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
+        checkpoint_base_dir="/data/zijianzhang/train_ckpts",
+        batch_size=8,
+        num_workers=0,
+        num_train_steps=2_000,
+        log_interval=10,
+        save_interval=100,
+        keep_period=500,
+        wandb_enabled=False,
+    ),
     TrainConfig(
         name="pi0_robocasa_depth",
         model=pi0_config.Pi0Config(
@@ -963,6 +1034,7 @@ _CONFIGS = [
             lpips_weight=0.1,  # Weight for LPIPS loss
             future_horizon_curriculum_steps=5_000,
             future_horizon_early_min_weight=0.2,
+            action_warmup_steps=9_000,
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
@@ -977,7 +1049,7 @@ _CONFIGS = [
             extra_delta_transform=False,
         ),
         # batch_size=256,
-        batch_size=16,  # Reduced global batch size further to avoid stage-2 world-model OOM
+        batch_size=8,  # Reduced global batch size to avoid GPU 3 OOM during rendering/MTA training
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -990,7 +1062,7 @@ _CONFIGS = [
         pytorch_weight_path="/data/zijianzhang/official_ckpts/pi05_libero.safetensors",
         num_train_steps=60_000,
         save_interval=3000,  # Save every 3k steps to reduce checkpoint churn during long experiments
-        stage1_steps=15_000,  # Stage 1: world-model-only representation training until 15k
+        stage1_steps=9_000,  # Stage 1: world-model-only representation training until 9k
         stage2_steps=0,  # Unused in the simplified 2-stage schedule
         stage3_steps=0,  # Unused in the simplified 2-stage schedule
         stage1_render_weight=0.2,  # Keep world-model supervision on during stage1

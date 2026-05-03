@@ -235,17 +235,26 @@ def create_torch_dataset(
         print(f"DEBUG: Using image_fps={image_fps} (dataset_meta.fps={dataset_meta.fps})")
 
     # Also request temporal state - try both possible key formats.
-    # State uses [t, t+1, ..., t+H] for future supervision.
+    # Multi-frame mode: match image packing so state aligns with [ctx..., future...].
+    # Single-frame mode: [t, future...].
     state_fps = 10.0  # Use standard 10 fps for state timestamps
+    context_state_offsets = _resolve_temporal_context_offsets(model_config, state_fps)
     future_state_offsets = _resolve_future_prediction_offsets(model_config, state_fps)
     state_keys_to_try = ["observation.state", "observation/state", "state"]
     for state_key in state_keys_to_try:
         if state_key in dataset_meta.features:
-            delta_timestamps[state_key] = [0.0, *future_state_offsets]
-            print(
-                f"DEBUG: Added temporal state with key: {state_key} "
-                f"(for World Model: [t, {future_offset_labels}])"
-            )
+            if use_single_frame_mode:
+                delta_timestamps[state_key] = [0.0, *future_state_offsets]
+                print(
+                    f"DEBUG: Added temporal state with key: {state_key} "
+                    f"(for World Model: [t, {future_offset_labels}])"
+                )
+            else:
+                delta_timestamps[state_key] = [*context_state_offsets, *future_state_offsets]
+                print(
+                    f"DEBUG: Added temporal state with key: {state_key} "
+                    f"(aligned with images: [{context_offset_labels}, {future_offset_labels}])"
+                )
             print(f"DEBUG: Using state_fps={state_fps} (dataset_meta.fps={dataset_meta.fps})")
             break
     else:
