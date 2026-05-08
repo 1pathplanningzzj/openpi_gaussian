@@ -47,7 +47,7 @@ class Args:
     default_prompt: str | None = None
 
     # Port to serve the policy on.
-    port: int = 8020
+    port: int = 8045
     # Record the policy's behavior for debugging.
     record: bool = False
 
